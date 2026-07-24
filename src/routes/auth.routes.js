@@ -39,5 +39,6 @@ router.patch('/landlord/payment-method', verifyToken, requireRole('landlord', 'm
 // Protected: either role - used both for the forced first-login
 // change and for a voluntary change later from the account menu.
 router.post('/change-password', verifyToken, requireRole('landlord', 'tenant', 'manager', 'scout'), authController.changePassword);
+router.post('/dismiss-onboarding', verifyToken, requireRole('landlord', 'tenant', 'manager', 'scout'), authController.dismissOnboarding);
 
 module.exports = router;

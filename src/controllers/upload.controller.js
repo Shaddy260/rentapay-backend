@@ -16,6 +16,7 @@
 
 const supabase = require('../config/supabase');
 const { logActivity } = require('../services/activityLog.service');
+const { effectiveLandlordId } = require('../middleware/auth.middleware');
 const sharp = require('sharp');
 
 const BUCKET_NAME = 'profile-photos';
@@ -134,4 +135,126 @@ async function removeProfilePhoto(req, res) {
   }
 }
 
-module.exports = { uploadProfilePhoto, removeProfilePhoto };
+// ---------------------------------------------------------------------
+// Unit photos (direct request: "features to improve appearance and
+// functionality" -> a vacant-unit listing scouts browse had no photos
+// at all, text-only). Same resize/re-upload approach as profile
+// photos, just a wider crop (4:3, landscape) since these are room/
+// property shots, not avatars, and a separate public bucket
+// ("unit-photos") so permissions/lifecycle can differ from profile
+// photos if needed later.
+//
+// ONE-TIME SETUP REQUIRED: create a public Storage bucket named
+// "unit-photos" in the Supabase dashboard, same as "profile-photos"
+// above.
+// ---------------------------------------------------------------------
+const UNIT_PHOTOS_BUCKET = 'unit-photos';
+
+async function processUnitPhoto(buffer) {
+  return sharp(buffer)
+    .rotate()
+    .resize(1024, 768, { fit: 'cover' })
+    .webp({ quality: 80 })
+    .toBuffer();
+}
+
+async function uploadUnitPhotos(req, res) {
+  try {
+    const { unitId } = req.params;
+    const { id: landlordId, role } = req.user; // landlord, manager (with edit rights), or caretaker
+
+    // Ownership check: only confirm the unit belongs to this landlord
+    // account (effectiveLandlordId handles manager/caretaker accounts
+    // resolving to the landlord account they act on behalf of) before
+    // letting anyone attach photos to it - otherwise any authenticated
+    // landlord could upload photos onto someone else's unit by
+    // guessing its id.
+    const ownerLandlordId = effectiveLandlordId(req);
+    const { data: unit, error: unitErr } = await supabase
+      .from('units')
+      .select('id, landlord_id, photo_urls')
+      .eq('id', unitId)
+      .eq('landlord_id', ownerLandlordId)
+      .maybeSingle();
+    if (unitErr) throw unitErr;
+    if (!unit) return res.status(404).json({ error: 'Unit not found.' });
+
+    const existing = Array.isArray(unit.photo_urls) ? unit.photo_urls : [];
+    const files = req.files || [];
+    const newUrls = [];
+
+    for (let i = 0; i < files.length; i += 1) {
+      let processedBuffer;
+      try {
+        processedBuffer = await processUnitPhoto(files[i].buffer);
+      } catch (sharpErr) {
+        console.error('[upload] unit photo processing failed, skipping one file:', sharpErr.message);
+        continue; // skip just this file rather than failing the whole batch
+      }
+
+      const path = `${unitId}/${Date.now()}-${i}.webp`;
+      const { error: uploadError } = await supabase.storage
+        .from(UNIT_PHOTOS_BUCKET)
+        .upload(path, processedBuffer, { contentType: 'image/webp' });
+
+      if (uploadError) {
+        if (/bucket not found/i.test(uploadError.message)) {
+          return res.status(500).json({
+            error: 'Photo storage isn\'t set up yet. In Supabase: Storage -> New bucket -> name it "unit-photos" -> make it public.',
+          });
+        }
+        console.error('[upload] uploadUnitPhotos storage error for one file:', uploadError.message);
+        continue;
+      }
+
+      const { data: publicUrlData } = supabase.storage.from(UNIT_PHOTOS_BUCKET).getPublicUrl(path);
+      newUrls.push(publicUrlData.publicUrl);
+    }
+
+    if (newUrls.length === 0) {
+      return res.status(500).json({ error: 'None of the photos could be processed. Please try different files.' });
+    }
+
+    // Cap at 5 total, keeping the newest if a landlord re-uploads past
+    // the limit rather than silently growing the array forever.
+    const combined = [...existing, ...newUrls].slice(-5);
+
+    const { error: updateError } = await supabase.from('units').update({ photo_urls: combined }).eq('id', unitId);
+    if (updateError) throw updateError;
+
+    logActivity({ actorType: role, actorId: landlordId, action: 'unit_photos_updated', targetType: 'unit', targetId: unitId });
+
+    return res.json({ photoUrls: combined });
+  } catch (err) {
+    console.error('[upload] uploadUnitPhotos error:', err.message);
+    return res.status(500).json({ error: 'Failed to upload unit photos.' });
+  }
+}
+
+async function removeUnitPhoto(req, res) {
+  try {
+    const { unitId } = req.params;
+    const { photoUrl } = req.body;
+    const ownerLandlordId = effectiveLandlordId(req);
+
+    const { data: unit, error: unitErr } = await supabase
+      .from('units')
+      .select('id, photo_urls')
+      .eq('id', unitId)
+      .eq('landlord_id', ownerLandlordId)
+      .maybeSingle();
+    if (unitErr) throw unitErr;
+    if (!unit) return res.status(404).json({ error: 'Unit not found.' });
+
+    const remaining = (Array.isArray(unit.photo_urls) ? unit.photo_urls : []).filter((u) => u !== photoUrl);
+    const { error: updateError } = await supabase.from('units').update({ photo_urls: remaining }).eq('id', unitId);
+    if (updateError) throw updateError;
+
+    return res.json({ photoUrls: remaining });
+  } catch (err) {
+    console.error('[upload] removeUnitPhoto error:', err.message);
+    return res.status(500).json({ error: 'Failed to remove photo.' });
+  }
+}
+
+module.exports = { uploadProfilePhoto, removeProfilePhoto, uploadUnitPhotos, removeUnitPhoto };

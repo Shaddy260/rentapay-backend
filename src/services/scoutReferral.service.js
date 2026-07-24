@@ -239,7 +239,13 @@ async function creditPlacementIfEligible(unitId) {
 
     await supabase
       .from('scout_referrals')
-      .update({ status: 'placed', placed_at: new Date().toISOString() })
+      // FEATURE (scout referral payout tracking): the moment a
+      // referral is actually credited as the reason a unit got rented,
+      // it becomes something a scout may be owed money for - flip
+      // payout_status to 'pending' here so it surfaces in the admin's
+      // payout queue instead of silently staying 'not_applicable'
+      // forever with no record anyone owes the scout anything.
+      .update({ status: 'placed', placed_at: new Date().toISOString(), payout_status: 'pending' })
       .eq('id', referral.id);
   } catch (err) {
     console.error('[scoutReferral] creditPlacementIfEligible error:', err.message);

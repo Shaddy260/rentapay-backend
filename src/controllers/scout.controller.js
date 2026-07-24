@@ -545,7 +545,7 @@ async function getMyProfile(req, res) {
 
     const { data: scout, error } = await supabase
       .from('scouts')
-      .select('id, full_name, phone, email, photo_url, bio, is_verified, created_at')
+      .select('id, full_name, phone, email, photo_url, bio, is_verified, created_at, onboarding_dismissed_at')
       .eq('id', scoutId)
       .maybeSingle();
 
@@ -701,7 +701,7 @@ async function getVacancies(req, res) {
 
     let propertyUnitsQuery = supabase
       .from('units')
-      .select('id, unit_name, unit_type, rent_amount, status, updated_at, last_verified_at, landlord_id, ' +
+      .select('id, unit_name, unit_type, rent_amount, status, updated_at, last_verified_at, landlord_id, photo_urls, ' +
         'properties!inner(name, county, constituency, location, caretaker_name, caretaker_phone, landlord_id), ' +
         'landlords(full_name, phone, county, constituency, location)')
       .in('properties.county', countyList)
@@ -711,7 +711,7 @@ async function getVacancies(req, res) {
 
     let landlordUnitsQuery = supabase
       .from('units')
-      .select('id, unit_name, unit_type, rent_amount, status, updated_at, last_verified_at, landlord_id, ' +
+      .select('id, unit_name, unit_type, rent_amount, status, updated_at, last_verified_at, landlord_id, photo_urls, ' +
         'properties(name, county, constituency, location, caretaker_name, caretaker_phone, landlord_id), ' +
         'landlords!inner(full_name, phone, county, constituency, location)')
       .is('property_id', null)
@@ -746,6 +746,7 @@ async function getVacancies(req, res) {
           updatedAt: u.updated_at,
           lastVerifiedAt: u.last_verified_at,
           propertyName: u.properties?.name || null,
+          photoUrls: Array.isArray(u.photo_urls) ? u.photo_urls : [],
           county,
           constituency,
           area,
@@ -850,7 +851,7 @@ async function getMyReferrals(req, res) {
 
     const { data, error } = await supabase
       .from('scout_referrals')
-      .select('id, status, shared_at, viewed_at, placed_at, units(unit_name)')
+      .select('id, status, shared_at, viewed_at, placed_at, payout_status, payout_amount, payout_paid_at, units(unit_name)')
       .eq('scout_id', scoutId)
       .order('shared_at', { ascending: false })
       .limit(200);
@@ -863,9 +864,14 @@ async function getMyReferrals(req, res) {
     const sharedThisMonth = rows.filter((r) => new Date(r.shared_at) >= startOfMonth).length;
     const landlordViews = rows.filter((r) => r.viewed_at).length;
     const placements = rows.filter((r) => r.status === 'placed').length;
+    // FEATURE (scout referral payout tracking): lets a scout see at a
+    // glance what's owed vs. already paid, instead of the platform
+    // going silent the moment a placement is credited.
+    const totalOwed = rows.filter((r) => r.payout_status === 'pending').reduce((sum, r) => sum + Number(r.payout_amount || 0), 0);
+    const totalPaid = rows.filter((r) => r.payout_status === 'paid').reduce((sum, r) => sum + Number(r.payout_amount || 0), 0);
 
     return res.json({
-      stats: { sharedThisMonth, landlordViews, placements },
+      stats: { sharedThisMonth, landlordViews, placements, totalOwed, totalPaid },
       referrals: rows.map((r) => ({
         id: r.id,
         unitName: r.units?.unit_name || null,
@@ -873,6 +879,9 @@ async function getMyReferrals(req, res) {
         sharedAt: r.shared_at,
         viewedAt: r.viewed_at,
         placedAt: r.placed_at,
+        payoutStatus: r.payout_status,
+        payoutAmount: r.payout_amount,
+        payoutPaidAt: r.payout_paid_at,
       })),
     });
   } catch (err) {

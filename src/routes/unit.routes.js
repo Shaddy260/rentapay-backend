@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const unitController = require('../controllers/unit.controller');
+const uploadController = require('../controllers/upload.controller');
+const { handleUnitPhotosUpload } = require('../middleware/upload.middleware');
 const { verifyToken, requireRole, requireNotCaretaker } = require('../middleware/auth.middleware');
 
 router.use(verifyToken);
@@ -29,5 +31,19 @@ router.patch('/:unitId/status', requireRole('landlord', 'manager', 'admin'), uni
 router.patch('/:unitId/verify', requireRole('landlord', 'manager', 'admin'), unitController.verifyUnit);
 router.delete('/:unitId', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot remove units. Contact the landlord or property manager.'), unitController.removeUnit);
 router.post('/:unitId/extra-charges', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot add extra charges. Contact the landlord or property manager.'), unitController.addExtraCharge);
+
+router.post(
+  '/:unitId/photos',
+  requireRole('landlord', 'manager'),
+  requireNotCaretaker('Caretakers cannot add unit photos. Contact the landlord or property manager.'),
+  handleUnitPhotosUpload,
+  uploadController.uploadUnitPhotos
+);
+router.delete(
+  '/:unitId/photos',
+  requireRole('landlord', 'manager'),
+  requireNotCaretaker('Caretakers cannot remove unit photos. Contact the landlord or property manager.'),
+  uploadController.removeUnitPhoto
+);
 
 module.exports = router;

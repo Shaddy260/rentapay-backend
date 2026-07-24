@@ -901,6 +901,72 @@ async function getGrowthStatistics(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// FEATURE (direct request: scout referral payout tracking). Scouts get
+// attribution credit (scout_referrals.status = 'placed') when a unit
+// they shared gets rented, but there was previously no in-app record
+// of whether that scout was ever actually paid for it - the money
+// side happened entirely off-platform. This surfaces every 'pending'
+// payout (owed, not yet paid) so an admin has a real queue to work
+// from instead of relying on scouts to chase it up individually.
+// ---------------------------------------------------------------------
+async function listPendingScoutPayouts(req, res) {
+  try {
+    const { data, error } = await supabase
+      .from('scout_referrals')
+      .select('id, placed_at, payout_status, payout_amount, payout_note, scouts(id, full_name, phone), units(unit_name, rent_amount), landlords(full_name)')
+      .eq('payout_status', 'pending')
+      .order('placed_at', { ascending: true });
+    if (error) throw error;
+    return res.json(data || []);
+  } catch (err) {
+    console.error('[admin] listPendingScoutPayouts error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch pending scout payouts.' });
+  }
+}
+
+// Marks a specific referral as paid out. Amount/note are informational
+// only (whatever the admin actually paid, however it was paid) - this
+// never touches M-Pesa or moves real money itself, it just records
+// that the payout happened so the "owed to scouts" queue clears and
+// the scout can see it reflected in their own portal.
+async function markScoutPayoutPaid(req, res) {
+  try {
+    const { referralId } = req.params;
+    const { amount, note } = req.body;
+
+    if (amount === undefined || amount === null || Number.isNaN(Number(amount)) || Number(amount) <= 0) {
+      return res.status(400).json({ error: 'A positive payout amount is required.' });
+    }
+
+    const { data: referral, error: fetchErr } = await supabase
+      .from('scout_referrals')
+      .select('id, payout_status')
+      .eq('id', referralId)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!referral) return res.status(404).json({ error: 'Referral not found.' });
+    if (referral.payout_status === 'paid') {
+      return res.status(400).json({ error: 'This referral has already been marked as paid.' });
+    }
+
+    const { data: updated, error } = await supabase
+      .from('scout_referrals')
+      .update({ payout_status: 'paid', payout_amount: Number(amount), payout_note: note || null, payout_paid_at: new Date().toISOString() })
+      .eq('id', referralId)
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'scout_payout_marked_paid', targetType: 'scout_referral', targetId: referralId, ipAddress: req.ip });
+
+    return res.json(updated);
+  } catch (err) {
+    console.error('[admin] markScoutPayoutPaid error:', err.message);
+    return res.status(500).json({ error: 'Failed to mark payout as paid.' });
+  }
+}
+
 module.exports = {
   getDashboardMetrics,
   listAllLandlords,
@@ -923,4 +989,6 @@ module.exports = {
   emergencyLockdown,
   resumeFromLockdown,
   getLockdownStatus,
+  listPendingScoutPayouts,
+  markScoutPayoutPaid,
 };

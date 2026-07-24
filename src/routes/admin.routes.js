@@ -13,6 +13,8 @@ router.get('/dashboard', adminController.getDashboardMetrics);
 router.get('/landlords', adminController.listAllLandlords);
 router.get('/scouts', adminController.listAllScouts);
 router.patch('/scouts/:scoutId/status', adminController.setScoutStatus);
+router.get('/scout-payouts/pending', adminController.listPendingScoutPayouts);
+router.patch('/scout-payouts/:referralId/mark-paid', adminController.markScoutPayoutPaid);
 router.get('/tenants', adminController.listAllTenants);
 router.get('/units', adminController.listAllUnits);
 router.get('/revenue', adminController.getRevenueBreakdown);

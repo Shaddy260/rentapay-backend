@@ -85,7 +85,7 @@ async function getLandlordDashboard(req, res) {
       propertiesQuery,
       supabase
         .from('landlords')
-        .select('full_name, photo_url, gender, subscription_plan, subscription_status, subscription_expires_at, unit_limit')
+        .select('full_name, photo_url, gender, subscription_plan, subscription_status, subscription_expires_at, unit_limit, onboarding_dismissed_at')
         .eq('id', landlordId)
         .single(),
     ]);
@@ -214,6 +214,7 @@ async function getLandlordDashboard(req, res) {
     return res.json({
       landlordName: landlord.full_name,
       landlordPhotoUrl: landlord.photo_url,
+      onboardingDismissedAt: landlord.onboarding_dismissed_at,
       viewerName,
       viewerPhotoUrl,
       viewerRoleLevel,

@@ -113,8 +113,37 @@ function handleDocumentUpload(req, res, next) {
   });
 }
 
+// ---------------------------------------------------------------------
+// Unit/vacancy photos (direct request: scouts browsing vacancies had
+// no way to see what a unit actually looks like - text-only listings
+// on a rental marketplace are a real trust/click-through gap). Up to
+// 5 photos per unit, same memory-storage + re-upload-to-Supabase
+// approach as everything else here.
+// ---------------------------------------------------------------------
+const MAX_UNIT_PHOTOS = 5;
+
+const uploadUnitPhotosMiddleware = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_SIZE, files: MAX_UNIT_PHOTOS },
+  fileFilter,
+}).array('photos', MAX_UNIT_PHOTOS); // frontend sends files under field name "photos"
+
+function handleUnitPhotosUpload(req, res, next) {
+  uploadUnitPhotosMiddleware(req, res, (err) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'Each photo must be smaller than 5MB.' });
+      if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: `You can upload up to ${MAX_UNIT_PHOTOS} photos at once.` });
+      return res.status(400).json({ error: err.message });
+    }
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No photos were uploaded. Attach files under the field name "photos".' });
+    next();
+  });
+}
+
 module.exports = {
   handleProfilePhotoUpload,
   handleExpenseReceiptUpload,
   handleDocumentUpload,
+  handleUnitPhotosUpload,
 };

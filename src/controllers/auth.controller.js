@@ -23,6 +23,8 @@ const { KENYA_CONSTITUENCIES } = require('../constants/kenyaConstituencies');
 
 const MAX_LOGIN_ATTEMPTS = 3;
 const LOCKOUT_MINUTES = 30;
+const OTP_MAX_ATTEMPTS = 5;
+const OTP_LOCKOUT_MINUTES = 15;
 
 // Maps an accountType to its table + the column that stores its phone
 // number. Centralized here so adding the 'manager' (and now 'scout')
@@ -33,6 +35,25 @@ function accountTable(accountType) {
   if (accountType === 'manager') return { table: 'property_managers', phoneField: 'phone' };
   if (accountType === 'scout') return { table: 'scouts', phoneField: 'phone' };
   return { table: 'tenants', phoneField: 'primary_phone' };
+}
+
+// ---------------------------------------------------------------------
+// FEATURE (direct request: onboarding checklist for every role). One
+// generic endpoint rather than four near-identical ones - which table
+// to update is resolved from the caller's own authenticated role via
+// accountTable() above, so this can't be used to dismiss anyone else's
+// checklist.
+// ---------------------------------------------------------------------
+async function dismissOnboarding(req, res) {
+  try {
+    const { table } = accountTable(req.user.role);
+    const { error } = await supabase.from(table).update({ onboarding_dismissed_at: new Date().toISOString() }).eq('id', req.user.id);
+    if (error) throw error;
+    return res.json({ message: 'Onboarding checklist dismissed.' });
+  } catch (err) {
+    console.error('[auth] dismissOnboarding error:', err.message);
+    return res.status(500).json({ error: 'Failed to dismiss onboarding checklist.' });
+  }
 }
 
 const ALL_ACCOUNT_TYPES = ['landlord', 'manager', 'tenant', 'scout'];
@@ -384,7 +405,26 @@ async function verifyOTP(req, res) {
       return res.status(404).json({ error: 'Account not found.' });
     }
 
+    // SECURITY FIX: OTP verification previously had no brute-force
+    // protection at all - unlike login (which already locks out after
+    // repeated failures), someone could script-guess a 6-digit OTP
+    // against this endpoint with no limit. Same lockout shape as
+    // login, tracked in separate otp_* columns since this is a
+    // different risk window (right after signup, before the account
+    // is verified) and shouldn't share a counter with login attempts.
+    if (account.otp_locked_until && new Date(account.otp_locked_until) > new Date()) {
+      return res.status(423).json({ error: `Too many incorrect codes. Try again after ${account.otp_locked_until}, or request a new OTP.` });
+    }
+
     if (!account.otp_code || account.otp_code !== otp) {
+      const newAttempts = (account.otp_failed_attempts || 0) + 1;
+      const updateFields = { otp_failed_attempts: newAttempts };
+      if (newAttempts >= OTP_MAX_ATTEMPTS) {
+        const lockUntil = new Date();
+        lockUntil.setMinutes(lockUntil.getMinutes() + OTP_LOCKOUT_MINUTES);
+        updateFields.otp_locked_until = lockUntil.toISOString();
+      }
+      await supabase.from(table).update(updateFields).eq('id', accountId);
       return res.status(400).json({ error: 'Invalid OTP.' });
     }
 
@@ -392,7 +432,7 @@ async function verifyOTP(req, res) {
       return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
     }
 
-    const updateFields = { is_verified: true, otp_code: null, otp_expires_at: null };
+    const updateFields = { is_verified: true, otp_code: null, otp_expires_at: null, otp_failed_attempts: 0, otp_locked_until: null };
     const { error: updateError } = await supabase.from(table).update(updateFields).eq('id', accountId);
 
     if (updateError) throw updateError;
@@ -959,7 +999,7 @@ async function getMyLandlordProfile(req, res) {
     const landlordId = req.user.id;
     const { data: landlord, error } = await supabase
       .from('landlords')
-      .select('id, full_name, phone, email, photo_url, payment_method, paybill_number, paybill_account_number, till_number, gender, notification_style')
+      .select('id, full_name, phone, email, photo_url, payment_method, paybill_number, paybill_account_number, till_number, gender, notification_style, onboarding_dismissed_at')
       .eq('id', landlordId)
       .single();
     if (error || !landlord) return res.status(404).json({ error: 'Account not found.' });
@@ -1590,6 +1630,7 @@ module.exports = {
   adminVerifyOTP,
   completeSetupWizard,
   getMyLandlordProfile,
+  dismissOnboarding,
   getPaymentMethodForViewer,
   updatePropertyDetails,
   updateMyContact,
