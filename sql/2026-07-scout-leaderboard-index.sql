@@ -1,0 +1,11 @@
+-- =====================================================================
+-- PERFORMANCE: supports the scout leaderboard's GET /scout/leaderboard
+-- (scout.controller.js getLeaderboard), which aggregates
+-- scout_referrals by scout_id filtered by status - a query shape none
+-- of the existing scout_referrals indexes cover (they're all
+-- unit_id/landlord_id-first). Without this, that query does a
+-- sequential scan across every referral ever created as the table
+-- grows, which is exactly the kind of thing that turns a "quick
+-- leaderboard glance" into a multi-second load.
+-- =====================================================================
+create index if not exists idx_scout_referrals_scout_status on scout_referrals(scout_id, status);
