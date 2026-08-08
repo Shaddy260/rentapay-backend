@@ -1,0 +1,12 @@
+-- SEO (direct request: "richer listing page content" - real, unique
+-- text per unit so Google has something to index/match search terms
+-- against, and so schema.org Product descriptions on the public
+-- listings page aren't just "location, constituency, county" repeated
+-- for every card). Free-text, optional - a landlord/manager/caretaker
+-- fills this in themselves (see updateListingDescription in
+-- unit.controller.js) since only they actually know real details like
+-- nearby landmarks, water reliability, security setup etc. Nullable:
+-- existing units simply have no description until someone adds one,
+-- and the public listings page/schema markup already handle a missing
+-- description gracefully by falling back to location fields.
+alter table units add column if not exists listing_description text;
