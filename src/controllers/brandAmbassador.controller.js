@@ -58,6 +58,122 @@ function generateVerificationToken() {
   return crypto.randomBytes(24).toString('hex');
 }
 
+const BA_ONBOARDING_LINK_TTL_HOURS = 24;
+
+function generateOnboardingLinkToken() {
+  return crypto.randomBytes(20).toString('hex');
+}
+
+// ---------------------------------------------------------------------
+// Shared helper - the current live link is always just the most
+// recently generated row. Nothing marks old rows inactive; a new
+// generation simply makes itself the newest row, which is what both
+// "regenerate early kills the old one" and "expires after 24h" mean
+// in practice once we always look at only the latest row.
+// ---------------------------------------------------------------------
+async function getCurrentBaOnboardingLink() {
+  const { data, error } = await supabase
+    .from('ba_onboarding_links')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+function isLinkExpired(link) {
+  return !link || new Date(link.expires_at) <= new Date();
+}
+
+// Shared gate for both public onboarding steps - the applicant's
+// frontend must echo back whichever token it read from the URL. If no
+// link has ever been generated, if the token doesn't match the
+// current one (e.g. an old copy-pasted link after a regenerate), or
+// if it's past its 24h expiry, the applicant is turned away with the
+// same "request a new one" message rather than being let through.
+async function checkOnboardingLinkToken(token) {
+  if (!token) {
+    return { ok: false, error: 'This onboarding link is invalid. Please request a new one from RentaPay.' };
+  }
+  const current = await getCurrentBaOnboardingLink();
+  if (isLinkExpired(current) || current.token !== String(token)) {
+    return { ok: false, error: 'This onboarding link has expired. Please request a new one from RentaPay.' };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------
+// PUBLIC - lets the /become-a-ba page check, on load, whether the
+// ?token= it was opened with is still good, so it can show the
+// "expired, request another" message before the applicant even starts
+// filling in the form (rather than only finding out at submit time).
+// ---------------------------------------------------------------------
+async function validateBaOnboardingLinkToken(req, res) {
+  try {
+    const { token } = req.query;
+    const result = await checkOnboardingLinkToken(token);
+    if (!result.ok) return res.status(410).json({ valid: false, error: result.error });
+    return res.json({ valid: true });
+  } catch (err) {
+    logger.error('[brandAmbassador] validateBaOnboardingLinkToken error:', err.message);
+    captureException(err);
+    return res.status(500).json({ valid: false, error: 'Failed to validate link.' });
+  }
+}
+
+// ---------------------------------------------------------------------
+// ADMIN - current link status, for the admin portal's "Onboard a new
+// Brand Ambassador" card to show the live link + a countdown/expired
+// state without generating a new one just to look at it.
+// ---------------------------------------------------------------------
+async function getBaOnboardingLinkStatus(req, res) {
+  try {
+    const current = await getCurrentBaOnboardingLink();
+    const expired = isLinkExpired(current);
+    return res.json({
+      link: current && !expired ? `${FRONTEND_URL}/become-a-ba?token=${current.token}` : null,
+      expiresAt: current?.expires_at || null,
+      expired,
+    });
+  } catch (err) {
+    logger.error('[brandAmbassador] getBaOnboardingLinkStatus error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load the onboarding link.' });
+  }
+}
+
+// ---------------------------------------------------------------------
+// ADMIN - generate (or regenerate) the onboarding link. Always inserts
+// a fresh row and fresh token, so regenerating early immediately
+// invalidates whatever link was live before - there's no window where
+// two tokens both work. Expires 24h from generation.
+// ---------------------------------------------------------------------
+async function generateBaOnboardingLink(req, res) {
+  try {
+    const token = generateOnboardingLinkToken();
+    const expiresAt = new Date(Date.now() + BA_ONBOARDING_LINK_TTL_HOURS * 60 * 60 * 1000);
+
+    const { data, error } = await supabase
+      .from('ba_onboarding_links')
+      .insert({ token, generated_by: req.user?.id || null, expires_at: expiresAt.toISOString() })
+      .select()
+      .single();
+    if (error) throw error;
+
+    logActivity({ actorType: 'admin', actorId: req.user.id, action: 'ba_onboarding_link_generated', targetType: 'ba_onboarding_link', targetId: data.id });
+
+    return res.status(201).json({
+      link: `${FRONTEND_URL}/become-a-ba?token=${token}`,
+      expiresAt: data.expires_at,
+    });
+  } catch (err) {
+    logger.error('[brandAmbassador] generateBaOnboardingLink error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to generate a new onboarding link.' });
+  }
+}
+
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://rentapay.co.ke';
 
 // ---------------------------------------------------------------------
@@ -68,7 +184,10 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://rentapay.co.ke';
 // ---------------------------------------------------------------------
 async function requestBaEmailVerification(req, res) {
   try {
-    const { email } = req.body;
+    const { email, onboardingToken } = req.body;
+    const linkCheck = await checkOnboardingLinkToken(onboardingToken);
+    if (!linkCheck.ok) return res.status(410).json({ error: linkCheck.error, linkExpired: true });
+
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
@@ -173,8 +292,11 @@ async function confirmBaEmailVerification(req, res) {
 // ---------------------------------------------------------------------
 async function submitBaOnboarding(req, res) {
   try {
-    const { fullName, emailVerification, termsAccepted } = req.body;
+    const { fullName, emailVerification, termsAccepted, onboardingToken } = req.body;
     let { phone, email } = req.body;
+
+    const linkCheck = await checkOnboardingLinkToken(onboardingToken);
+    if (!linkCheck.ok) return res.status(410).json({ error: linkCheck.error, linkExpired: true });
 
     const required = { fullName, phone, email };
     const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
@@ -1512,6 +1634,9 @@ module.exports = {
   requestBaEmailVerification,
   confirmBaEmailVerification,
   submitBaOnboarding,
+  validateBaOnboardingLinkToken,
+  getBaOnboardingLinkStatus,
+  generateBaOnboardingLink,
   listPendingBaApplications,
   listBrandAmbassadors,
   approveBaApplication,

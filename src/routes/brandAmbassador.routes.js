@@ -10,6 +10,10 @@ const { verifyToken, requireRole } = require('../middleware/auth.middleware');
 router.post('/email/send-otp', ctrl.requestBaEmailVerification);
 router.post('/email/verify-otp', ctrl.confirmBaEmailVerification);
 router.post('/apply', ctrl.submitBaOnboarding);
+// PUBLIC - the /become-a-ba page calls this on load to check whether
+// its ?token= is still good before letting the applicant start
+// filling in the form (24h-rotating link, see brandAmbassador.controller.js).
+router.get('/onboarding-link/validate', ctrl.validateBaOnboardingLinkToken);
 // PHASE 4 - public referral-code resolution for the landlord signup form.
 router.get('/referral/:code', ctrl.resolveReferralCode);
 
@@ -46,6 +50,12 @@ router.get('/me/earnings-statement.pdf', verifyToken, requireRole('brand_ambassa
 router.get('/me/earnings-statement.csv', verifyToken, requireRole('brand_ambassador'), baAdminPayoutCtrl.downloadBaEarningsStatementCsv);
 
 // ADMIN-ONLY - everything else.
+// The rotating 24h onboarding link - admin generates/regenerates it
+// here and shares it manually (copy/WhatsApp); the old token dies the
+// instant a new one is generated, and it also dies 24h after
+// generation on its own either way.
+router.get('/onboarding-link', verifyToken, requireRole('admin'), ctrl.getBaOnboardingLinkStatus);
+router.post('/onboarding-link/generate', verifyToken, requireRole('admin'), ctrl.generateBaOnboardingLink);
 router.get('/applications', verifyToken, requireRole('admin'), ctrl.listPendingBaApplications);
 router.post('/applications/:id/approve', verifyToken, requireRole('admin'), ctrl.approveBaApplication);
 router.post('/applications/:id/reject', verifyToken, requireRole('admin'), ctrl.rejectBaApplication);
