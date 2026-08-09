@@ -1,0 +1,23 @@
+-- =====================================================================
+-- Migration: allow the super admin to change their own password in-app
+-- =====================================================================
+-- DIRECT REQUEST: "now that the admin password is hardcoded... there
+-- should be a way for an admin to secretly change the password."
+--
+-- Before this, the admin password only ever lived in the
+-- SUPER_ADMIN_PASSWORD_HASH environment variable - changing it meant
+-- editing .env and redeploying, which isn't something the actual
+-- human running the platform can do themselves day to day.
+--
+-- This adds one nullable column to the existing platform_settings
+-- singleton row. When set, adminLogin() checks THIS hash instead of
+-- the env var - so changing the password from inside the admin panel
+-- (via the new hidden "Change admin password" action, authenticated,
+-- current-password-required) takes effect immediately, with no
+-- redeploy. Leave it null/unset and the env var keeps working exactly
+-- as before - nothing breaks for anyone who never uses the new
+-- feature.
+--
+-- Run once in the Supabase SQL Editor.
+
+alter table platform_settings add column if not exists admin_password_hash text;
