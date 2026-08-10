@@ -415,7 +415,7 @@ async function fetchEarningsStatementData(baId, range) {
   const { data: claims, error: claimsErr } = await supabase
     .from('ba_landlord_claims')
     .select(
-      'id, submitted_name, submitted_location, qualification_status, qualified_at, payout_amount, commission_bonus_amount, commission_tier_id, marked_paid_at, marked_paid_by, landlords(full_name, location)'
+      'id, submitted_name, submitted_location, qualification_status, qualified_at, payout_amount, commission_bonus_amount, commission_tier_id, unit_pricing_tier_id, qualified_unit_count, marked_paid_at, marked_paid_by, landlords(full_name, location)'
     )
     .eq('ba_id', baId)
     .in('qualification_status', ['qualified', 'paid'])
@@ -424,18 +424,50 @@ async function fetchEarningsStatementData(baId, range) {
     .order('qualified_at', { ascending: true });
   if (claimsErr) throw claimsErr;
 
-  const rows = (claims || []).map((c) => ({
-    id: c.id,
-    landlordName: c.landlords?.full_name || c.submitted_name || 'Unknown',
-    landlordLocation: c.landlords?.location || c.submitted_location || '',
-    qualifiedAt: c.qualified_at,
-    payoutAmount: Number(c.payout_amount || 0),
-    commissionBonusAmount: Number(c.commission_bonus_amount || 0),
-    commissionTierId: c.commission_tier_id || null,
-    status: c.qualification_status, // 'qualified' | 'paid'
-    markedPaidAt: c.marked_paid_at,
-    markedPaidBy: c.marked_paid_by,
-  }));
+  // Item 10 - transparency: batch-fetch the specific unit-volume
+  // bracket and commission-tier rows this period's claims actually
+  // snapshotted at qualification time, so the statement can show
+  // "why was I paid this" (which bracket, which tier) instead of just
+  // a final number. Never re-resolves against CURRENT payout_rules /
+  // ladders - always reads the exact row the claim pointed at.
+  const unitTierIds = [...new Set((claims || []).map((c) => c.unit_pricing_tier_id).filter(Boolean))];
+  const commissionTierIds = [...new Set((claims || []).map((c) => c.commission_tier_id).filter(Boolean))];
+  const [unitTiersRes, commissionTiersRes] = await Promise.all([
+    unitTierIds.length
+      ? supabase.from('unit_pricing_tiers').select('id, min_units, max_units, amount').in('id', unitTierIds)
+      : Promise.resolve({ data: [] }),
+    commissionTierIds.length
+      ? supabase.from('commission_tiers').select('id, target_qualified_landlords, commission_percent').in('id', commissionTierIds)
+      : Promise.resolve({ data: [] }),
+  ]);
+  const unitTierById = new Map((unitTiersRes.data || []).map((t) => [t.id, t]));
+  const commissionTierById = new Map((commissionTiersRes.data || []).map((t) => [t.id, t]));
+
+  const rows = (claims || []).map((c) => {
+    const unitTier = c.unit_pricing_tier_id ? unitTierById.get(c.unit_pricing_tier_id) : null;
+    const commissionTier = c.commission_tier_id ? commissionTierById.get(c.commission_tier_id) : null;
+    return {
+      id: c.id,
+      landlordName: c.landlords?.full_name || c.submitted_name || 'Unknown',
+      landlordLocation: c.landlords?.location || c.submitted_location || '',
+      qualifiedAt: c.qualified_at,
+      payoutAmount: Number(c.payout_amount || 0),
+      commissionBonusAmount: Number(c.commission_bonus_amount || 0),
+      commissionTierId: c.commission_tier_id || null,
+      status: c.qualification_status, // 'qualified' | 'paid'
+      markedPaidAt: c.marked_paid_at,
+      markedPaidBy: c.marked_paid_by,
+      // Item 10 breakdown - null fields mean "flat rate / no tier
+      // crossed for this claim", not an error.
+      breakdown: {
+        unitCount: c.qualified_unit_count ?? null,
+        unitBracket: unitTier ? { minUnits: unitTier.min_units, maxUnits: unitTier.max_units, amount: Number(unitTier.amount) } : null,
+        commissionTier: commissionTier
+          ? { targetQualifiedLandlords: commissionTier.target_qualified_landlords, commissionPercent: Number(commissionTier.commission_percent) }
+          : null,
+      },
+    };
+  });
 
   const totals = {
     baseTotal: 0,
@@ -467,12 +499,31 @@ async function fetchEarningsStatementData(baId, range) {
 }
 
 function buildEarningsStatementCsv(ba, claims, totals, periodLabel) {
-  const lines = [['Landlord', 'Location', 'Qualified At', 'Base Payout (KES)', 'Commission Bonus (KES)', 'Status', 'Paid At'].join(',')];
+  const lines = [
+    ['Landlord', 'Location', 'Units', 'Unit Bracket Applied', 'Qualified At', 'Base Payout (KES)', 'Commission Tier', 'Commission Bonus (KES)', 'Status', 'Paid At'].join(','),
+  ];
   for (const c of claims) {
     const name = String(c.landlordName || '').replace(/"/g, '""');
     const location = String(c.landlordLocation || '').replace(/"/g, '""');
+    const unitBracket = c.breakdown?.unitBracket
+      ? `${c.breakdown.unitBracket.minUnits}-${c.breakdown.unitBracket.maxUnits ?? '+'} units @ KES ${Number(c.breakdown.unitBracket.amount).toFixed(2)}`
+      : 'Flat rate';
+    const commissionTier = c.breakdown?.commissionTier
+      ? `${c.breakdown.commissionTier.commissionPercent}% (at ${c.breakdown.commissionTier.targetQualifiedLandlords} qualified)`
+      : 'None';
     lines.push(
-      [`"${name}"`, `"${location}"`, c.qualifiedAt || '', c.payoutAmount.toFixed(2), c.commissionBonusAmount.toFixed(2), c.status, c.markedPaidAt || ''].join(',')
+      [
+        `"${name}"`,
+        `"${location}"`,
+        c.breakdown?.unitCount ?? '',
+        `"${unitBracket}"`,
+        c.qualifiedAt || '',
+        c.payoutAmount.toFixed(2),
+        `"${commissionTier}"`,
+        c.commissionBonusAmount.toFixed(2),
+        c.status,
+        c.markedPaidAt || '',
+      ].join(',')
     );
   }
   lines.push('');

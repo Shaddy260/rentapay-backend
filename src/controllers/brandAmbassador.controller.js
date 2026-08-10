@@ -293,12 +293,14 @@ async function confirmBaEmailVerification(req, res) {
 async function submitBaOnboarding(req, res) {
   try {
     const { fullName, emailVerification, termsAccepted, onboardingToken } = req.body;
-    let { phone, email } = req.body;
+    let { phone, email, nationalId } = req.body;
 
     const linkCheck = await checkOnboardingLinkToken(onboardingToken);
     if (!linkCheck.ok) return res.status(410).json({ error: linkCheck.error, linkExpired: true });
 
-    const required = { fullName, phone, email };
+    // (item 6) national ID is now required alongside name/phone/email -
+    // needed for identity verification and payouts.
+    const required = { fullName, phone, email, nationalId };
     const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
     if (missing.length) return res.status(400).json({ error: `Please fill in: ${missing.join(', ')}` });
 
@@ -309,6 +311,11 @@ async function submitBaOnboarding(req, res) {
       phone = normalizePhoneOrThrow(phone, 'Phone number');
     } catch (phoneErr) {
       return res.status(400).json({ error: phoneErr.message });
+    }
+
+    nationalId = String(nationalId).trim();
+    if (nationalId.length < 4 || nationalId.length > 20 || !/^[A-Za-z0-9-]+$/.test(nationalId)) {
+      return res.status(400).json({ error: 'Please enter a valid national ID number.' });
     }
 
     // (b) terms gate - server-side, not just a client checkbox.
@@ -360,6 +367,7 @@ async function submitBaOnboarding(req, res) {
           full_name: fullName,
           email,
           phone,
+          national_id: nationalId,
           status: 'pending_approval',
           email_verified: true,
           terms_accepted_at: new Date().toISOString(),
@@ -378,7 +386,7 @@ async function submitBaOnboarding(req, res) {
       // race. The applicant doesn't need to know which layer caught it.
       if (insertErr.code === '23505') {
         return res.status(409).json({
-          error: 'This phone number or email address was just registered by another application. Please check your details.',
+          error: 'This phone number, email address, or national ID was just registered by another application. Please check your details.',
         });
       }
       throw insertErr;
@@ -390,7 +398,7 @@ async function submitBaOnboarding(req, res) {
         SUPPORT_EMAIL,
         'New Brand Ambassador application awaiting review',
         wrapEmailHtml(
-          `${fullName} applied to become a Brand Ambassador.\n\nPhone: ${phone}\nEmail: ${email}\n\nReview it in the admin portal under Brand Ambassador Applications.`
+          `${fullName} applied to become a Brand Ambassador.\n\nPhone: ${phone}\nEmail: ${email}\nNational ID: ${nationalId}\n\nReview it in the admin portal under Brand Ambassador Applications.`
         )
       ).catch((notifyErr) => {
         logger.error('[brandAmbassador] admin notify failed:', notifyErr.message);
@@ -430,7 +438,7 @@ async function listPendingBaApplications(req, res) {
 
     const { data, error, count } = await supabase
       .from('brand_ambassadors')
-      .select('id, full_name, email, phone, status, created_at, reminder_sent_at', { count: 'exact' })
+      .select('id, full_name, email, phone, national_id, status, created_at, reminder_sent_at', { count: 'exact' })
       .eq('status', 'pending_approval')
       .order('created_at', { ascending: true })
       .range(from, to);
@@ -491,7 +499,11 @@ async function listBrandAmbassadors(req, res) {
       }, {});
     }
 
-    const referralBase = `${FRONTEND_URL}/signup`;
+    // BUG FIX: '/signup' is not a real frontend route (only '/register'
+    // is - see App.jsx) - anyone using the old link fell through the
+    // catch-all straight to /login instead of the signup form. '/register'
+    // already reads ?ref=CODE, auto-resolves it, and shows the referral banner.
+    const referralBase = `${FRONTEND_URL}/register`;
     const brandAmbassadors = (bas || []).map((b) => ({
       ...b,
       referralLink: b.referral_code ? `${referralBase}?ref=${b.referral_code}` : null,
@@ -681,7 +693,8 @@ async function approveBaApplication(req, res) {
       .single();
     if (updateErr) throw updateErr;
 
-    const referralLink = `${FRONTEND_URL}/signup?ref=${baCode}`;
+    // Same '/signup' -> '/register' fix as referralBase above.
+    const referralLink = `${FRONTEND_URL}/register?ref=${baCode}`;
 
     // Best-effort delivery - a failed SMS/email must never roll back
     // the approval itself (Money & Data Integrity Rules), so this is
@@ -819,20 +832,23 @@ async function getMyBaProfile(req, res) {
 // ---------------------------------------------------------------------
 // PHASE 6 - BA Portal: Settings & Profile.
 //
-// Contact-detail editing for the logged-in BA - same validation shape
-// already used for tenant contact-detail edits (tenant.controller.js):
-// normalize the phone, only run the GLOBAL phone/email uniqueness
-// check (findPhoneConflict/findEmailConflict, extended in Phase 2 to
-// cover brand_ambassadors) when the value is actually changing, since
-// otherwise a BA saving their own unchanged phone/email would trip a
-// false "already registered" conflict against their own row. Scoped
-// to req.user.id only, same as every other BA-authenticated endpoint.
+// Contact-detail editing for the logged-in BA. Full name is editable
+// here; phone/email are NOT (item 5 fix) - the portal form now shows
+// them pre-filled and read-only, and this endpoint enforces that same
+// rule server-side rather than trusting the frontend alone, since a
+// direct API call could otherwise still slip a phone/email change
+// through with none of the identity verification that's supposed to
+// gate it. There is no self-service verified-change flow yet; a BA
+// who genuinely needs their phone/email changed goes through Support
+// (see the "Contact Support" hint next to this form and the new Help
+// section), who can update it via an admin-side tool once identity is
+// confirmed. Scoped to req.user.id only, same as every other
+// BA-authenticated endpoint.
 // ---------------------------------------------------------------------
 async function updateMyProfile(req, res) {
   try {
     const baId = req.user.id;
-    const { fullName } = req.body;
-    let { phone, email } = req.body;
+    const { fullName, phone, email } = req.body;
 
     const { data: ba, error: findErr } = await supabase
       .from('brand_ambassadors')
@@ -842,34 +858,34 @@ async function updateMyProfile(req, res) {
     if (findErr) throw findErr;
     if (!ba) return res.status(404).json({ error: 'Brand Ambassador profile not found.' });
 
-    const updates = {};
-
-    if (fullName !== undefined && fullName !== ba.full_name) {
-      if (!String(fullName).trim()) return res.status(400).json({ error: 'Full name cannot be empty.' });
-      updates.full_name = String(fullName).trim();
-    }
-
+    // Reject an actual change to phone/email outright (not just
+    // ignore it) so a caller gets a clear, honest error instead of a
+    // silent no-op that looks like it might have worked.
     if (phone !== undefined) {
+      let normalizedPhone;
       try {
-        phone = normalizePhoneOrThrow(phone, 'Phone number');
+        normalizedPhone = normalizePhoneOrThrow(phone, 'Phone number');
       } catch (phoneErr) {
         return res.status(400).json({ error: phoneErr.message });
       }
-      if (phone !== ba.phone) {
-        const phoneConflict = await findPhoneConflict(phone, 'brand_ambassador');
-        if (phoneConflict) return res.status(409).json({ error: phoneConflict });
-        updates.phone = phone;
+      if (normalizedPhone !== ba.phone) {
+        return res.status(400).json({ error: 'Phone number can\'t be changed here. Please contact Support to update it.' });
       }
     }
 
     if (email !== undefined) {
       if (!isValidEmail(email)) return res.status(400).json({ error: 'Please enter a valid email address.' });
-      email = String(email).trim().toLowerCase();
-      if (email !== ba.email) {
-        const emailConflict = await findEmailConflict(email, 'brand_ambassador');
-        if (emailConflict) return res.status(409).json({ error: emailConflict });
-        updates.email = email;
+      const normalizedEmail = String(email).trim().toLowerCase();
+      if (normalizedEmail !== ba.email) {
+        return res.status(400).json({ error: 'Email address can\'t be changed here. Please contact Support to update it.' });
       }
+    }
+
+    const updates = {};
+
+    if (fullName !== undefined && fullName !== ba.full_name) {
+      if (!String(fullName).trim()) return res.status(400).json({ error: 'Full name cannot be empty.' });
+      updates.full_name = String(fullName).trim();
     }
 
     if (Object.keys(updates).length === 0) {
@@ -947,7 +963,7 @@ async function resolveReferralCode(req, res) {
 async function submitLandlordClaim(req, res) {
   try {
     const baId = req.user.id;
-    let { fullName, phone, location } = req.body;
+    let { fullName, phone, email, location } = req.body;
 
     if (!fullName || !phone) {
       return res.status(400).json({ error: 'fullName and phone are required.' });
@@ -961,14 +977,30 @@ async function submitLandlordClaim(req, res) {
       return res.status(400).json({ error: phoneErr.message });
     }
 
-    // Authoritative match: an active, real landlord account with this
-    // exact normalized phone number.
-    const { data: landlord, error: landlordErr } = await supabase
+    // (item 7) email is optional but, when given, must be a real
+    // address - it's a second matching key alongside phone, not a
+    // replacement for it (phone stays required, matching the rest of
+    // this flow's "phone is authoritative" design).
+    if (email) {
+      email = String(email).trim().toLowerCase();
+      if (!isValidEmail(email)) {
+        return res.status(400).json({ error: 'Please enter a valid email address.' });
+      }
+    } else {
+      email = null;
+    }
+
+    // Authoritative match: an active, real landlord account matching
+    // this exact normalized phone number OR (if given) this email -
+    // either one is enough to find the account, so a BA who only has
+    // one of the two correct still gets a match.
+    let landlordQuery = supabase
       .from('landlords')
-      .select('id, full_name, phone, location, county, subscription_status, ba_id')
-      .eq('phone', phone)
-      .maybeSingle();
+      .select('id, full_name, phone, email, location, county, subscription_status, ba_id, created_at');
+    landlordQuery = email ? landlordQuery.or(`phone.eq.${phone},email.eq.${email}`) : landlordQuery.eq('phone', phone);
+    const { data: landlordMatches, error: landlordErr } = await landlordQuery.limit(1);
     if (landlordErr) throw landlordErr;
+    const landlord = landlordMatches?.[0] || null;
 
     if (!landlord) {
       // PHASE 15 - two read-only checks purely to pick the clearest of
@@ -1010,6 +1042,50 @@ async function submitLandlordClaim(req, res) {
       return res.status(200).json({ matched: false, message });
     }
 
+    // (loop-prevention fix) A landlord whose account was created more
+    // than a week ago is no longer a fresh field onboarding - referral
+    // is optional, so plenty of landlords join on their own with no BA
+    // involved at all, and an old account showing up in this form is
+    // far more likely to be a stale/incorrect submission (or an
+    // attempt to backdate credit for someone the BA didn't actually
+    // just onboard) than a legitimate same-week claim. Reject outright
+    // rather than silently matching.
+    const CLAIM_MAX_ACCOUNT_AGE_DAYS = 7;
+    const accountAgeMs = Date.now() - new Date(landlord.created_at).getTime();
+    if (accountAgeMs > CLAIM_MAX_ACCOUNT_AGE_DAYS * 24 * 60 * 60 * 1000) {
+      return res.status(409).json({
+        matched: false,
+        tooOld: true,
+        message: `This landlord's account was created more than ${CLAIM_MAX_ACCOUNT_AGE_DAYS} days ago, so it can no longer be logged here. Only landlords onboarded in the last week are eligible for manual logging.`,
+      });
+    }
+
+    // (loop-prevention fix) A landlord already confirmed/matched to
+    // THIS BA (either via the referral link at signup, or a prior
+    // manual log) must not be re-submittable through this form again -
+    // without this check a BA could keep re-logging the same landlord
+    // and generate a fresh 'matched' claim row every time. Only the
+    // first confirmation for a given landlord+BA pair is allowed;
+    // anything after that is rejected as a duplicate.
+    if (landlord.ba_id === baId) {
+      const { data: existingMatch, error: existingMatchErr } = await supabase
+        .from('ba_landlord_claims')
+        .select('id')
+        .eq('matched_landlord_id', landlord.id)
+        .eq('ba_id', baId)
+        .eq('match_status', 'matched')
+        .limit(1)
+        .maybeSingle();
+      if (existingMatchErr) throw existingMatchErr;
+      if (existingMatch) {
+        return res.status(409).json({
+          matched: false,
+          alreadyConfirmed: true,
+          message: 'This landlord has already been confirmed to you - no need to log them again.',
+        });
+      }
+    }
+
     // A real account exists. If it's already tied to a DIFFERENT BA,
     // surface a clear conflict instead of silently reassigning credit.
     // PHASE 11 - this attempt is still logged as a claim row (match_
@@ -1024,6 +1100,7 @@ async function submitLandlordClaim(req, res) {
           ba_id: baId,
           submitted_name: fullName,
           submitted_phone: phone,
+          submitted_email: email,
           submitted_location: location,
           match_status: 'conflict',
           matched_landlord_id: landlord.id,
@@ -1071,6 +1148,7 @@ async function submitLandlordClaim(req, res) {
         ba_id: baId,
         submitted_name: fullName,
         submitted_phone: phone,
+        submitted_email: email,
         submitted_location: location,
         match_status: 'matched',
         matched_landlord_id: landlord.id,
@@ -1282,7 +1360,7 @@ async function editMyClaim(req, res) {
   try {
     const baId = req.user.id;
     const { id } = req.params;
-    const { fullName, phone, location } = req.body;
+    const { fullName, phone, email, location } = req.body;
 
     const { data: claim, error: findErr } = await supabase
       .from('ba_landlord_claims')
@@ -1311,6 +1389,16 @@ async function editMyClaim(req, res) {
       if (normalizedPhone !== claim.submitted_phone) {
         editHistory.push({ editedAt, editedField: 'submitted_phone', oldValue: claim.submitted_phone, newValue: normalizedPhone });
         updates.submitted_phone = normalizedPhone;
+      }
+    }
+    if (email !== undefined) {
+      const normalizedEmail = email ? String(email).trim().toLowerCase() : null;
+      if (normalizedEmail && !isValidEmail(normalizedEmail)) {
+        return res.status(400).json({ error: 'Please enter a valid email address.' });
+      }
+      if (normalizedEmail !== claim.submitted_email) {
+        editHistory.push({ editedAt, editedField: 'submitted_email', oldValue: claim.submitted_email, newValue: normalizedEmail });
+        updates.submitted_email = normalizedEmail;
       }
     }
     if (location !== undefined && location !== claim.submitted_location) {

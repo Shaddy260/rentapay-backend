@@ -83,6 +83,30 @@ describe('findPhoneConflict', () => {
     expect(conflict).toMatch(/property manager with this phone number already exists/i);
   });
 
+  test('PRIVACY FIX: a landlord phone conflict against a BA signup does not disclose the other role', async () => {
+    setupSupabaseMock(supabase, {
+      landlords: { data: { id: 'L1' }, error: null },
+      property_managers: FREE,
+      tenants: FREE,
+      brand_ambassadors: FREE,
+    });
+    const conflict = await findPhoneConflict(PHONE, 'brand_ambassador');
+    expect(conflict).toMatch(/already in use/i);
+    expect(conflict).not.toMatch(/landlord/i);
+  });
+
+  test('PRIVACY FIX: an active-tenant phone conflict against a BA signup does not disclose the other role', async () => {
+    setupSupabaseMock(supabase, {
+      landlords: FREE,
+      property_managers: FREE,
+      tenants: { data: { id: 'T1', is_active: true, landlord_id: 'L9' }, error: null },
+      brand_ambassadors: FREE,
+    });
+    const conflict = await findPhoneConflict(PHONE, 'brand_ambassador');
+    expect(conflict).toMatch(/already in use/i);
+    expect(conflict).not.toMatch(/tenant/i);
+  });
+
   test('checks landlords before managers before tenants (landlord conflict wins even if role is manager)', async () => {
     setupSupabaseMock(supabase, {
       landlords: { data: { id: 'L1' }, error: null },

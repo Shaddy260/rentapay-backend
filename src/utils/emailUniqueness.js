@@ -42,19 +42,29 @@ async function findEmailConflict(email, forRole) {
     supabase.from('brand_ambassadors').select('id, status').ilike('email', normalized).neq('status', 'rejected').maybeSingle(),
   ]);
 
+  // PRIVACY FIX: see phoneUniqueness.js - when forRole is
+  // 'brand_ambassador' we never reveal which other role a conflicting
+  // email belongs to. Every branch collapses to the same generic
+  // message in that case; other roles' existing role-specific
+  // messages are unchanged.
+  const GENERIC_BA_CONFLICT = 'This email address is already in use. Please use a different email.';
+
   if (landlord) {
+    if (forRole === 'brand_ambassador') return GENERIC_BA_CONFLICT;
     return forRole === 'landlord'
       ? 'An account with this email address already exists.'
       : 'This email address is already registered to a landlord account. Please use a different email.';
   }
 
   if (activeManager) {
+    if (forRole === 'brand_ambassador') return GENERIC_BA_CONFLICT;
     return forRole === 'manager'
       ? 'A property manager with this email address already exists.'
       : 'This email address is already registered to a property manager/caretaker account. Please use a different email.';
   }
 
   if (activeTenant) {
+    if (forRole === 'brand_ambassador') return GENERIC_BA_CONFLICT;
     if (forRole === 'tenant') {
       return 'This email address is already registered to an active tenant account. Ask them to use a different email, or have their current landlord remove/archive them first.';
     }
@@ -63,7 +73,7 @@ async function findEmailConflict(email, forRole) {
 
   if (activeBa) {
     return forRole === 'brand_ambassador'
-      ? 'A Brand Ambassador application with this email address already exists.'
+      ? GENERIC_BA_CONFLICT
       : 'This email address is already registered to a Brand Ambassador account. Please use a different email.';
   }
 

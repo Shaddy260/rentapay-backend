@@ -102,6 +102,30 @@ async function resolveCommissionLadder(baId, globalLadder, overrideLaddersByBaId
   return globalLadder;
 }
 
+// Item 10 - unit-volume pricing. Resolves which ladder applies (BA's
+// own override if they have one, else the global ladder) and picks
+// the bracket whose [min_units, max_units] range contains unitsCount
+// (max_units === null means "and up" - unbounded top bracket). Falls
+// back to null (caller then uses payout_rules.amount) when no ladder
+// is configured at all or none of its brackets match, so a site that
+// hasn't set this up yet behaves exactly as before this feature
+// existed.
+function resolveUnitPricingLadder(baId, globalLadder, overrideLaddersByBaId) {
+  const override = overrideLaddersByBaId.get(baId);
+  if (override && override.length > 0) return override;
+  return globalLadder;
+}
+
+function pickUnitPricingBracket(ladder, unitsCount) {
+  if (!ladder || ladder.length === 0) return null;
+  // Highest-matching bracket wins in the (should-never-happen, since
+  // brackets are validated non-overlapping at write time) case of
+  // ambiguity.
+  const matches = ladder.filter((t) => unitsCount >= t.min_units && (t.max_units == null || unitsCount <= t.max_units));
+  if (matches.length === 0) return null;
+  return matches.reduce((best, t) => (t.min_units > best.min_units ? t : best));
+}
+
 async function runBaQualificationCheck(options = {}) {
   const startedAt = Date.now();
   // options.forceDryRun lets an admin-triggered manual run (Phase 19)
@@ -122,6 +146,8 @@ async function runBaQualificationCheck(options = {}) {
       { data: overrideRules, error: overrideRulesErr },
       { data: globalTiers, error: globalTiersErr },
       { data: overrideTiers, error: overrideTiersErr },
+      { data: globalUnitTiers, error: globalUnitTiersErr },
+      { data: overrideUnitTiers, error: overrideUnitTiersErr },
     ] = await Promise.all([
       supabase
         .from('ba_landlord_claims')
@@ -132,12 +158,16 @@ async function runBaQualificationCheck(options = {}) {
       supabase.from('payout_rules').select('*').eq('scope', 'ba_override'),
       supabase.from('commission_tiers').select('*').eq('scope', 'global').order('target_qualified_landlords', { ascending: true }),
       supabase.from('commission_tiers').select('*').eq('scope', 'ba_override').order('target_qualified_landlords', { ascending: true }),
+      supabase.from('unit_pricing_tiers').select('*').eq('scope', 'global').order('min_units', { ascending: true }),
+      supabase.from('unit_pricing_tiers').select('*').eq('scope', 'ba_override').order('min_units', { ascending: true }),
     ]);
     if (claimsErr) throw claimsErr;
     if (globalRuleErr) throw globalRuleErr;
     if (overrideRulesErr) throw overrideRulesErr;
     if (globalTiersErr) throw globalTiersErr;
     if (overrideTiersErr) throw overrideTiersErr;
+    if (globalUnitTiersErr) throw globalUnitTiersErr;
+    if (overrideUnitTiersErr) throw overrideUnitTiersErr;
 
     const claims = pendingClaims || [];
     summary.checked = claims.length;
@@ -153,6 +183,12 @@ async function runBaQualificationCheck(options = {}) {
       const list = overrideLaddersByBaId.get(t.ba_id) || [];
       list.push(t);
       overrideLaddersByBaId.set(t.ba_id, list);
+    }
+    const overrideUnitLaddersByBaId = new Map();
+    for (const t of overrideUnitTiers || []) {
+      const list = overrideUnitLaddersByBaId.get(t.ba_id) || [];
+      list.push(t);
+      overrideUnitLaddersByBaId.set(t.ba_id, list);
     }
 
     // Confirm BA status for every distinct ba_id up front (skip
@@ -227,7 +263,15 @@ async function runBaQualificationCheck(options = {}) {
         if (!meetsMonths || !meetsUnits) return;
 
         const qualifiedAt = new Date().toISOString();
-        const payoutAmount = Number(rule.amount);
+
+        // Item 10 - resolve the BASE payout from the unit-volume
+        // bracket the landlord's unit count falls into, if any ladder
+        // is configured; otherwise fall back to the flat
+        // payout_rules.amount exactly as before this feature existed.
+        const unitLadder = resolveUnitPricingLadder(claim.ba_id, globalUnitTiers || [], overrideUnitLaddersByBaId);
+        const unitBracket = pickUnitPricingBracket(unitLadder, unitsCount);
+        const payoutAmount = unitBracket ? Number(unitBracket.amount) : Number(rule.amount);
+        const unitPricingTierId = unitBracket ? unitBracket.id : null;
 
         if (dryRun) {
           summary.qualified += 1;
@@ -274,12 +318,15 @@ async function runBaQualificationCheck(options = {}) {
             baName: ba.full_name,
             landlordSnapshotName: claim.submitted_name || 'Unknown',
             wouldBePayoutAmount: payoutAmount,
+            wouldBeUnitBracket: unitBracket
+              ? { minUnits: unitBracket.min_units, maxUnits: unitBracket.max_units, amount: Number(unitBracket.amount) }
+              : null,
             wouldBeCommissionBonusAmount,
             wouldBeTierChange,
           });
 
           logger.info(
-            `[cron] baQualification DRY RUN: claim ${claim.id} (BA ${claim.ba_id}) would qualify - months=${consecutiveMonths}/${rule.required_consecutive_months}, units=${unitsCount}/${rule.min_units}, payoutAmount=${payoutAmount}`
+            `[cron] baQualification DRY RUN: claim ${claim.id} (BA ${claim.ba_id}) would qualify - months=${consecutiveMonths}/${rule.required_consecutive_months}, units=${unitsCount}/${rule.min_units}, payoutAmount=${payoutAmount}${unitBracket ? ` (unit bracket ${unitBracket.min_units}-${unitBracket.max_units ?? '+'})` : ' (flat rate, no bracket configured/matched)'}`
           );
           return;
         }
@@ -290,6 +337,8 @@ async function runBaQualificationCheck(options = {}) {
             qualification_status: 'qualified',
             qualified_at: qualifiedAt,
             payout_amount: payoutAmount,
+            unit_pricing_tier_id: unitPricingTierId,
+            qualified_unit_count: unitsCount,
             updated_at: qualifiedAt,
           })
           .eq('id', claim.id)
@@ -301,7 +350,7 @@ async function runBaQualificationCheck(options = {}) {
           action: 'ba_claim_qualified',
           targetType: 'ba_landlord_claims',
           targetId: claim.id,
-          metadata: { baId: claim.ba_id, landlordId: claim.matched_landlord_id, consecutiveMonths, payoutAmount },
+          metadata: { baId: claim.ba_id, landlordId: claim.matched_landlord_id, consecutiveMonths, payoutAmount, unitsCount, unitPricingTierId },
         });
 
         summary.qualified += 1;

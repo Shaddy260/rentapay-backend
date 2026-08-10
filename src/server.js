@@ -40,6 +40,8 @@ const publicRoutes = require('./routes/public.routes');
 const tenantOnboardingRoutes = require('./routes/tenantOnboarding.routes');
 const brandAmbassadorRoutes = require('./routes/brandAmbassador.routes');
 const assistantRoutes = require('./routes/assistant.routes');
+const settingsRoutes = require('./routes/settings.routes');
+const baPayoutQualificationReportRoutes = require('./routes/baPayoutQualificationReport.routes');
 
 const { startSubscriptionReminderJob } = require('./jobs/subscriptionReminders.job');
 const { startRentReminderJob } = require('./jobs/rentReminders.job');
@@ -193,6 +195,17 @@ app.use('/api/tenant-onboarding', tenantOnboardingRoutes);
 app.use('/api/brand-ambassadors', brandAmbassadorRoutes);
 app.use('/api/reviews', require('./routes/platformReview.routes'));
 app.use('/api/support-chat', require('./routes/supportChat.routes'));
+
+// Public "Help & Contact Details" (read by every portal's Help modal,
+// including the logged-out login screen) + its admin-editable
+// counterpart under the existing /api/admin mount point.
+app.use('/api/settings', settingsRoutes.publicRouter);
+app.use('/api/admin/settings', settingsRoutes.adminRouter);
+
+// BA Regions & Payout Qualification Report - lives under the existing
+// /api/brand-ambassadors mount, alongside payout-review,
+// reconciliation, qualification dry-run, etc.
+app.use('/api/brand-ambassadors', baPayoutQualificationReportRoutes);
 
 // DEV-ONLY: lets MOCK_DARAJA=true testing complete the payment flow
 // without a real Safaricom callback ever arriving. Hard-gated so this

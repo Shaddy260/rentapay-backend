@@ -79,6 +79,12 @@ router.get('/commission-tiers', verifyToken, requireRole('admin'), payoutRulesCt
 router.patch('/commission-tiers/global', verifyToken, requireRole('admin'), payoutRulesCtrl.updateCommissionTiers);
 router.patch('/:baId/commission-tiers-override', verifyToken, requireRole('admin'), payoutRulesCtrl.setBaCommissionTierOverride);
 
+// BA Portal fixes, item 10 - unit-volume pricing brackets (global +
+// per-BA override), same pattern as commission tiers directly above.
+router.get('/unit-pricing-tiers', verifyToken, requireRole('admin'), payoutRulesCtrl.getUnitPricingTiers);
+router.patch('/unit-pricing-tiers/global', verifyToken, requireRole('admin'), payoutRulesCtrl.updateUnitPricingTiers);
+router.patch('/:baId/unit-pricing-tiers-override', verifyToken, requireRole('admin'), payoutRulesCtrl.setBaUnitPricingTierOverride);
+
 // PHASE 19 - Qualification Job Dry-Run Mode. Admin-triggered manual
 // run, alongside the Phase 10 Payout Rules screen - side-effect-free,
 // safe to call as often as needed (e.g. right after a rate/tier

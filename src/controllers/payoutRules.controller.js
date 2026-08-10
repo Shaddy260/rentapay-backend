@@ -356,6 +356,183 @@ async function setBaCommissionTierOverride(req, res) {
 }
 
 // ---------------------------------------------------------------------
+// Unit-volume pricing tiers (item 10) - bracket-based BASE payout by
+// how many subscribed units the referred landlord has. Same
+// global/ba_override scope pattern as commission_tiers above; the
+// admin UI reuses the same "editing: global vs a specific BA" picker.
+// ---------------------------------------------------------------------
+
+function validateUnitLadder(tiers) {
+  if (!Array.isArray(tiers) || tiers.length === 0) {
+    return 'At least one unit-volume bracket is required.';
+  }
+  const rows = tiers.map((t) => ({
+    minUnits: parseInt(t.minUnits, 10),
+    maxUnits: t.maxUnits === '' || t.maxUnits == null ? null : parseInt(t.maxUnits, 10),
+    amount: Number(t.amount),
+  }));
+  for (const r of rows) {
+    if (!Number.isInteger(r.minUnits) || r.minUnits < 1) return 'Each bracket needs a positive whole-number minimum unit count.';
+    if (r.maxUnits != null && (!Number.isInteger(r.maxUnits) || r.maxUnits < r.minUnits)) {
+      return 'A bracket\'s maximum units must be blank (unbounded) or a whole number >= its minimum.';
+    }
+    if (Number.isNaN(r.amount) || r.amount < 0) return 'Each bracket needs a valid, non-negative amount.';
+  }
+  // Overlap check: sort by minUnits, ensure each bracket's range
+  // doesn't overlap the next one. An unbounded bracket (maxUnits ===
+  // null) must be the last one, since it swallows everything above it.
+  const sorted = [...rows].sort((a, b) => a.minUnits - b.minUnits);
+  for (let i = 0; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const next = sorted[i + 1];
+    if (cur.maxUnits == null && next) return 'Only the highest bracket may be left unbounded (blank maximum) - it must be last.';
+    if (next && cur.maxUnits != null && next.minUnits <= cur.maxUnits) {
+      return `Overlapping brackets: ${cur.minUnits}-${cur.maxUnits} overlaps ${next.minUnits}-${next.maxUnits ?? '+'}.`;
+    }
+    if (next && cur.minUnits === next.minUnits) return `Duplicate bracket starting at ${cur.minUnits} units.`;
+  }
+  return null;
+}
+
+async function getUnitPricingTiers(req, res) {
+  try {
+    const { baId } = req.query;
+
+    const { data: global, error: globalErr } = await supabase
+      .from('unit_pricing_tiers')
+      .select('*')
+      .eq('scope', 'global')
+      .order('min_units', { ascending: true });
+    if (globalErr) throw globalErr;
+
+    let override = null;
+    if (baId) {
+      const { data, error } = await supabase
+        .from('unit_pricing_tiers')
+        .select('*')
+        .eq('scope', 'ba_override')
+        .eq('ba_id', baId)
+        .order('min_units', { ascending: true });
+      if (error) throw error;
+      override = data && data.length > 0 ? data : null;
+    }
+
+    return res.json({ global: global || [], override });
+  } catch (err) {
+    logger.error('[payoutRules] getUnitPricingTiers error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load unit-volume pricing tiers.' });
+  }
+}
+
+async function updateUnitPricingTiers(req, res) {
+  try {
+    const { tiers } = req.body;
+    const validationError = validateUnitLadder(tiers);
+    if (validationError) return res.status(400).json({ error: validationError });
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from('unit_pricing_tiers')
+      .select('*')
+      .eq('scope', 'global');
+    if (fetchErr) throw fetchErr;
+
+    const { error: deleteErr } = await supabase.from('unit_pricing_tiers').delete().eq('scope', 'global');
+    if (deleteErr) throw deleteErr;
+
+    const rows = tiers.map((t) => ({
+      scope: 'global',
+      ba_id: null,
+      min_units: parseInt(t.minUnits, 10),
+      max_units: t.maxUnits === '' || t.maxUnits == null ? null : parseInt(t.maxUnits, 10),
+      amount: Number(t.amount),
+    }));
+    const { data: inserted, error: insertErr } = await supabase.from('unit_pricing_tiers').insert(rows).select();
+    if (insertErr) throw insertErr;
+
+    logActivity({
+      actorType: 'admin',
+      actorId: ADMIN_ACTOR_ID,
+      action: 'unit_pricing_tiers_global_updated',
+      targetType: 'unit_pricing_tiers',
+      ipAddress: req.ip,
+      metadata: { before: existing || [], after: inserted },
+    });
+
+    return res.json({ tiers: inserted });
+  } catch (err) {
+    logger.error('[payoutRules] updateUnitPricingTiers error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to update unit-volume pricing tiers.' });
+  }
+}
+
+async function setBaUnitPricingTierOverride(req, res) {
+  try {
+    const { baId } = req.params;
+    const { tiers, clear } = req.body;
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from('unit_pricing_tiers')
+      .select('*')
+      .eq('scope', 'ba_override')
+      .eq('ba_id', baId);
+    if (fetchErr) throw fetchErr;
+
+    if (clear) {
+      if (existing && existing.length > 0) {
+        const { error } = await supabase.from('unit_pricing_tiers').delete().eq('scope', 'ba_override').eq('ba_id', baId);
+        if (error) throw error;
+      }
+      logActivity({
+        actorType: 'admin',
+        actorId: ADMIN_ACTOR_ID,
+        action: 'unit_pricing_tiers_ba_override_cleared',
+        targetType: 'brand_ambassador',
+        targetId: baId,
+        ipAddress: req.ip,
+        metadata: { before: existing || [], after: [] },
+      });
+      return res.json({ override: null });
+    }
+
+    const validationError = validateUnitLadder(tiers);
+    if (validationError) return res.status(400).json({ error: validationError });
+
+    if (existing && existing.length > 0) {
+      const { error } = await supabase.from('unit_pricing_tiers').delete().eq('scope', 'ba_override').eq('ba_id', baId);
+      if (error) throw error;
+    }
+
+    const rows = tiers.map((t) => ({
+      scope: 'ba_override',
+      ba_id: baId,
+      min_units: parseInt(t.minUnits, 10),
+      max_units: t.maxUnits === '' || t.maxUnits == null ? null : parseInt(t.maxUnits, 10),
+      amount: Number(t.amount),
+    }));
+    const { data: inserted, error: insertErr } = await supabase.from('unit_pricing_tiers').insert(rows).select();
+    if (insertErr) throw insertErr;
+
+    logActivity({
+      actorType: 'admin',
+      actorId: ADMIN_ACTOR_ID,
+      action: 'unit_pricing_tiers_ba_override_set',
+      targetType: 'brand_ambassador',
+      targetId: baId,
+      ipAddress: req.ip,
+      metadata: { before: existing || [], after: inserted },
+    });
+
+    return res.json({ override: inserted });
+  } catch (err) {
+    logger.error('[payoutRules] setBaUnitPricingTierOverride error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to update this BA\'s unit-volume pricing override.' });
+  }
+}
+
+// ---------------------------------------------------------------------
 // PHASE 19 - Qualification Job Dry-Run Mode.
 //
 // Admin-triggered manual run, distinct from the always-on
@@ -395,17 +572,23 @@ async function downloadQualificationDryRunCsv(req, res) {
     const result = await runBaQualificationCheck({ forceDryRun: true });
     const rows = result.report || [];
 
-    const lines = [['Claim ID', 'BA Code', 'BA Name', 'Landlord (snapshot name)', 'Would-be Base Payout (KES)', 'Would-be Commission Bonus (KES)', 'Would-be Tier Change'].join(',')];
+    const lines = [
+      ['Claim ID', 'BA Code', 'BA Name', 'Landlord (snapshot name)', 'Unit Bracket Applied', 'Would-be Base Payout (KES)', 'Would-be Commission Bonus (KES)', 'Would-be Tier Change'].join(','),
+    ];
     for (const r of rows) {
       const tierChange = r.wouldBeTierChange
         ? `${r.wouldBeTierChange.fromPercent}% -> ${r.wouldBeTierChange.toPercent}% (at ${r.wouldBeTierChange.targetQualifiedLandlords} qualified)`
         : '';
+      const unitBracket = r.wouldBeUnitBracket
+        ? `${r.wouldBeUnitBracket.minUnits}-${r.wouldBeUnitBracket.maxUnits ?? '+'} units`
+        : 'flat rate';
       lines.push(
         [
           csvEscape(r.claimId),
           csvEscape(r.baCode),
           csvEscape(r.baName),
           csvEscape(r.landlordSnapshotName),
+          csvEscape(unitBracket),
           Number(r.wouldBePayoutAmount || 0).toFixed(2),
           Number(r.wouldBeCommissionBonusAmount || 0).toFixed(2),
           csvEscape(tierChange),
@@ -435,6 +618,9 @@ module.exports = {
   getCommissionTiers,
   updateCommissionTiers,
   setBaCommissionTierOverride,
+  getUnitPricingTiers,
+  updateUnitPricingTiers,
+  setBaUnitPricingTierOverride,
   runQualificationDryRun,
   downloadQualificationDryRunCsv,
 };

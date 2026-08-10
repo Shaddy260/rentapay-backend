@@ -415,6 +415,20 @@ function generateEarningsStatementPdf(res, { ba, claims, totals, periodLabel, ge
     doc.text(KES(c.commissionBonusAmount), colX.commission, rowY, { width: 75 });
     doc.text(c.status === 'paid' ? 'Paid' : 'Qualified', colX.status, rowY);
     doc.moveDown(0.9);
+
+    // Item 10 - transparency: a small grey line under the row naming
+    // which unit bracket / commission tier (if any) produced the
+    // amounts above, so this isn't just a final number.
+    const bracket = c.breakdown?.unitBracket;
+    const tier = c.breakdown?.commissionTier;
+    if (bracket || tier) {
+      const parts = [];
+      if (bracket) parts.push(`Base: ${bracket.minUnits}-${bracket.maxUnits ?? '+'} units bracket (KES ${Number(bracket.amount).toLocaleString()})`);
+      if (tier) parts.push(`Commission: ${tier.commissionPercent}% tier (crossed at ${tier.targetQualifiedLandlords} qualified)`);
+      doc.fontSize(7.5).fillColor('#999').text(parts.join('  ·  '), colX.landlord, doc.y, { width: 495 });
+      doc.fontSize(9).fillColor('#333');
+      doc.moveDown(0.4);
+    }
   });
 
   doc.moveDown(1);

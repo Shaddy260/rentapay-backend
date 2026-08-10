@@ -46,19 +46,32 @@ async function findPhoneConflict(phone, forRole) {
     supabase.from('brand_ambassadors').select('id, status').eq('phone', phone).neq('status', 'rejected').maybeSingle(),
   ]);
 
+  // PRIVACY FIX: when the account being registered is a Brand
+  // Ambassador, never disclose WHICH other role a conflicting
+  // phone number belongs to (landlord/manager/tenant/BA) - that
+  // leaks account-role information about a stranger to whoever is
+  // filling out the BA onboarding form. Every branch below collapses
+  // to the same generic "already in use" message for forRole ===
+  // 'brand_ambassador'. Other roles keep their existing role-specific
+  // messages unchanged (relied on elsewhere/by existing tests).
+  const GENERIC_BA_CONFLICT = 'This phone number is already in use. Please use a different number.';
+
   if (landlord) {
+    if (forRole === 'brand_ambassador') return GENERIC_BA_CONFLICT;
     return forRole === 'landlord'
       ? 'An account with this phone number already exists.'
       : 'This phone number is already registered to a landlord account. Please use a different number.';
   }
 
   if (activeManager) {
+    if (forRole === 'brand_ambassador') return GENERIC_BA_CONFLICT;
     return forRole === 'manager'
       ? 'A property manager with this phone number already exists.'
       : 'This phone number is already registered to a property manager/caretaker account. Please use a different number.';
   }
 
   if (activeTenant) {
+    if (forRole === 'brand_ambassador') return GENERIC_BA_CONFLICT;
     if (forRole === 'tenant') {
       // The one deliberate exception: an ARCHIVED tenant's number is
       // free to reuse under a new landlord - is_active=true above
@@ -71,7 +84,7 @@ async function findPhoneConflict(phone, forRole) {
 
   if (activeBa) {
     return forRole === 'brand_ambassador'
-      ? 'A Brand Ambassador application with this phone number already exists.'
+      ? GENERIC_BA_CONFLICT
       : 'This phone number is already registered to a Brand Ambassador account. Please use a different number.';
   }
 
