@@ -55,10 +55,25 @@ function mockReq(overrides = {}) {
       fullName: 'Jane Applicant',
       phone: '0700111222',
       email: 'jane@example.com',
+      nationalId: '12345678',
       termsAccepted: true,
       emailVerification: 'TOKEN123',
+      onboardingToken: 'LINK_TOKEN_ABC',
       ...overrides,
     },
+  };
+}
+
+// checkOnboardingLinkToken() runs before any of the logic these tests
+// actually exercise (see brandAmbassador.controller.js) - it reads the
+// most recent row in ba_onboarding_links and requires its token to
+// match and not be expired. Every test in this file needs this to
+// pass so execution actually reaches the duplicate-application race
+// logic under test, not the earlier link-validity gate.
+function validOnboardingLink() {
+  return {
+    data: { token: 'LINK_TOKEN_ABC', expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString() },
+    error: null,
   };
 }
 
@@ -75,6 +90,7 @@ describe('submitBaOnboarding - duplicate-application race condition', () => {
     findEmailConflict.mockResolvedValue(null);
 
     const builders = setupSupabaseMock(supabase, {
+      ba_onboarding_links: validOnboardingLink(),
       ba_email_otps: { data: { verified: true, verification_token: 'TOKEN123' }, error: null },
       brand_ambassadors: { data: null, error: null },
     });
@@ -102,6 +118,7 @@ describe('submitBaOnboarding - duplicate-application race condition', () => {
     findEmailConflict.mockResolvedValue(null);
 
     const builders = setupSupabaseMock(supabase, {
+      ba_onboarding_links: validOnboardingLink(),
       ba_email_otps: { data: { verified: true, verification_token: 'TOKEN123' }, error: null },
       brand_ambassadors: { data: null, error: null },
     });
@@ -125,6 +142,7 @@ describe('submitBaOnboarding - duplicate-application race condition', () => {
     findEmailConflict.mockResolvedValue(null);
 
     const builders = setupSupabaseMock(supabase, {
+      ba_onboarding_links: validOnboardingLink(),
       ba_email_otps: { data: { verified: true, verification_token: 'TOKEN123' }, error: null },
       brand_ambassadors: { data: null, error: null },
     });
@@ -144,6 +162,7 @@ describe('submitBaOnboarding - duplicate-application race condition', () => {
     findEmailConflict.mockResolvedValue(null);
 
     const builders = setupSupabaseMock(supabase, {
+      ba_onboarding_links: validOnboardingLink(),
       ba_email_otps: { data: { verified: true, verification_token: 'TOKEN123' }, error: null },
       brand_ambassadors: { data: null, error: null },
     });

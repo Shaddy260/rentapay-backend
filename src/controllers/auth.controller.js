@@ -401,12 +401,12 @@ async function registerLandlord(req, res) {
 
     // PHASE 4 (BA referral-link signup): if a ?ref=BA-XXXX code rode
     // along with this registration, tag the new landlord with that
-    // BA's id at creation time - no separate matching step needed
-    // since this is a brand-new account, not an existing one being
-    // searched for later (see submitLandlordClaim below for that
-    // other path). Fails SILENTLY on a bad/expired/inactive code -
-    // per the spec, a typo'd ref code must never block or error out
-    // the landlord's own registration.
+    // BA's id at creation time - this is the ONLY way a landlord ever
+    // gets attached to a BA (Section A of the consolidated change
+    // instructions - manual claim logging/fallback has been removed
+    // entirely). Fails SILENTLY on a bad/expired/inactive code - per
+    // the spec, a typo'd ref code must never block or error out the
+    // landlord's own registration.
     let referredByBaId = null;
     if (refCode && typeof refCode === 'string' && refCode.trim()) {
       try {
@@ -443,6 +443,12 @@ async function registerLandlord(req, res) {
 
     if (error) throw error;
     insertedLandlordId = landlord.id;
+
+    // SECTION C: no separate claim/event row to log anymore. The
+    // daily BA-qualification cron job (src/jobs/baQualification.job.js)
+    // now scans `landlords` directly (ba_id is not null AND
+    // ba_qualification_status = 'pending') - landlords.ba_id, set
+    // above, is all it needs to pick this signup up on its next run.
 
     // PHASE 9 - marketing self-fill lead auto-conversion: if this
     // phone matches a still-open landlord_leads row, mark it
@@ -1696,6 +1702,103 @@ async function adminVerifyOTP(req, res) {
 }
 
 // ---------------------------------------------------------------------
+// ADMIN FORGOT PASSWORD (logged-out recovery path)
+//
+// DIRECT REQUEST: "there should be a way an admin changes lol password
+// from the admin login page... currently it's only in-app... when
+// requesting to change password just send the reset code, don't ask
+// admin to enter email, just send it already, and move to the next
+// page entering otp and new password and confirmation."
+//
+// There is exactly one super-admin account (see the "SUPER ADMIN
+// LOGIN" block above - hardcoded single account), so there's nothing
+// to ask the admin to identify themselves with. The instant this is
+// called, a reset code goes to the one known admin address
+// (SUPER_ADMIN_EMAIL / SUPPORT_EMAIL, same target adminLogin's OTP
+// alert already uses) - no email input field, no "check if this
+// account exists" step.
+// ---------------------------------------------------------------------
+async function adminForgotPassword(req, res) {
+  try {
+    const adminEmail = process.env.SUPER_ADMIN_EMAIL || SUPPORT_EMAIL;
+    const otp = generateOTP();
+    global.__adminPasswordResetOtpStore = { otp, expiresAt: getPasswordResetOTPExpiry() };
+
+    try {
+      await sendEmail(adminEmail, 'Your RentaPay admin password reset code', wrapEmailHtml(templates.adminOtpMessage(otp)));
+    } catch (emailErr) {
+      // Same reasoning as the login-OTP email failure below: the OTP
+      // was already generated and stored, so a broken email provider
+      // must not strand the admin with no way to see it - log it
+      // loudly rather than 500ing the request.
+      logger.error('[auth] adminForgotPassword: reset code email failed to send. Code is still valid - check here:', otp, '| Error:', emailErr.message);
+      captureException(emailErr);
+    }
+
+    // Deliberately vague on delivery specifics in the response itself
+    // (no email address echoed back) - the point of this endpoint is
+    // that the admin doesn't need to know or provide it.
+    return res.json({ message: 'A reset code has been sent. Enter it on the next screen along with your new password.' });
+  } catch (err) {
+    logger.error('[auth] adminForgotPassword error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to send a reset code. Please try again.' });
+  }
+}
+
+async function adminResetPassword(req, res) {
+  try {
+    const { otp, newPassword, confirmPassword } = req.body;
+    if (!otp || !newPassword || !confirmPassword) {
+      return res.status(400).json({ error: 'The code, new password, and confirmation are all required.' });
+    }
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'New password and confirmation do not match.' });
+    }
+
+    const strength = validatePasswordStrength(newPassword);
+    if (!strength.isValid) {
+      return res.status(400).json({ error: strength.errors.join(' ') });
+    }
+
+    const store = global.__adminPasswordResetOtpStore;
+    if (!store || store.otp !== otp) {
+      return res.status(400).json({ error: 'Invalid reset code.' });
+    }
+    if (isOTPExpired(store.expiresAt)) {
+      global.__adminPasswordResetOtpStore = null;
+      return res.status(400).json({ error: 'This reset code has expired. Request a new one.' });
+    }
+
+    const newHash = await hashPassword(newPassword);
+    const { error } = await supabase
+      .from('platform_settings')
+      .update({ admin_password_hash: newHash })
+      .eq('id', 1);
+    if (error) throw error;
+
+    global.__adminPasswordResetOtpStore = null;
+    global.__adminOtpStore = null; // also invalidate any in-flight login-2FA OTP, since the password just changed
+
+    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'admin_password_reset', ipAddress: req.ip });
+
+    const adminEmail = process.env.SUPER_ADMIN_EMAIL || SUPPORT_EMAIL;
+    try {
+      await sendEmail(adminEmail, 'RentaPay Admin Alert', wrapEmailHtml('The admin password was just reset via the "Forgot password?" flow. If this was not you, contact the platform developer immediately.'));
+    } catch (emailErr) {
+      logger.warn('[auth] adminResetPassword: confirmation alert email failed (non-fatal):', emailErr.message);
+      captureException(emailErr);
+    }
+
+    return res.json({ message: 'Password reset. You can now log in with your new password.' });
+  } catch (err) {
+    logger.error('[auth] adminResetPassword error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to reset the password.' });
+  }
+}
+
+// ---------------------------------------------------------------------
 // CHANGE ADMIN PASSWORD (direct request: "there should be a way for
 // an admin to secretly change the password" now that it isn't just a
 // plain env var edit anymore). Deliberately not linked from any nav -
@@ -2632,6 +2735,8 @@ module.exports = {
   loginWithGoogle,
   adminLogin,
   adminVerifyOTP,
+  adminForgotPassword,
+  adminResetPassword,
   changeAdminPassword,
   completeSetupWizard,
   getMyLandlordProfile,

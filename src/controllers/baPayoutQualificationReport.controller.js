@@ -1,14 +1,23 @@
 // src/controllers/baPayoutQualificationReport.controller.js
 const service = require('../services/baPayoutQualificationReport.service');
+const {
+  generateSingleBaPayoutQualificationPdf,
+  generateCombinedPayoutQualificationPdf,
+} = require('../services/baPayoutQualificationReportPdf.service');
 const logger = require('../utils/logger');
 const { captureException } = require('../services/sentry.service');
 
 // POST /api/brand-ambassadors/payout-qualification-reports/generate
+//
+// Section F: a Payout Run is generated for one billing cycle
+// (periodKey = 'YYYY-MM', e.g. '2026-08') - periodType is no longer
+// accepted from the client (weekly runs don't map to a billing cycle);
+// an invalid/missing periodKey falls back to the current month inside
+// the service.
 async function generate(req, res) {
   try {
-    const { periodType, periodKey } = req.body || {};
+    const { periodKey } = req.body || {};
     const report = await service.buildAndPersistReport({
-      periodType: periodType || 'month',
       periodKey,
       // This project has no `admins` table - admin auth is a single
       // credential and req.user.id is the literal string 'super-admin'
@@ -66,4 +75,39 @@ async function downloadCsv(req, res) {
   }
 }
 
-module.exports = { generate, list, getOne, downloadCsv };
+// GET /api/brand-ambassadors/payout-qualification-reports/:id/pdf
+// ITEM 12 - the combined/complete PDF: every BA's block one after
+// another, color-coded green (qualifies) / orange (doesn't), ending
+// with the grand total for the run.
+async function downloadCombinedPdf(req, res) {
+  try {
+    const report = await service.getReportById(req.params.id);
+    if (!report) return res.status(404).json({ error: 'Report not found.' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="ba-payout-qualification-report-${report.periodKey}.pdf"`);
+    generateCombinedPayoutQualificationPdf(res, report);
+  } catch (err) {
+    logger.error('[baPayoutQualificationReport] downloadCombinedPdf failed', err);
+    captureException(err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to download the combined PDF.' });
+  }
+}
+
+// GET /api/brand-ambassadors/payout-qualification-reports/:id/ba/:baId/pdf
+// ITEM 12 - a single BA's own color-coded PDF, downloadable on its
+// own without paging through the others.
+async function downloadBaPdf(req, res) {
+  try {
+    const report = await service.getReportById(req.params.id);
+    if (!report) return res.status(404).json({ error: 'Report not found.' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="ba-payout-qualification-${req.params.baId}-${report.periodKey}.pdf"`);
+    generateSingleBaPayoutQualificationPdf(res, report, req.params.baId);
+  } catch (err) {
+    logger.error('[baPayoutQualificationReport] downloadBaPdf failed', err);
+    captureException(err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to download the PDF.' });
+  }
+}
+
+module.exports = { generate, list, getOne, downloadCsv, downloadCombinedPdf, downloadBaPdf };

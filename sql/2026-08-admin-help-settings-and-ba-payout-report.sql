@@ -114,3 +114,45 @@ create index if not exists idx_ba_payout_qual_entries_region
   on ba_payout_qualification_report_entries (report_id, region);
 create index if not exists idx_ba_payout_qual_entries_ba
   on ba_payout_qualification_report_entries (report_id, ba_id);
+
+-- =====================================================================
+-- 3) Pre-existing schema gaps found while diagnosing production
+--    errors on 2026-08-10 - unrelated to the two features above, but
+--    bundled here so there's one file to run. All three are
+--    idempotent and safe to re-run.
+-- =====================================================================
+
+-- 3a) This migration already existed in the repo
+--    (sql/add-brand-ambassador-profile-photo-and-push.sql) but had
+--    never been run against this environment, causing every
+--    GET/PATCH /api/brand-ambassadors/me and the BA profile-photo
+--    upload to 500 with "column brand_ambassadors.photo_url does not
+--    exist", and every BA push-notification subscribe to fail with
+--    "violates check constraint push_subscriptions_recipient_type_check".
+alter table brand_ambassadors add column if not exists photo_url text;
+
+alter table push_subscriptions drop constraint if exists push_subscriptions_recipient_type_check;
+alter table push_subscriptions add constraint push_subscriptions_recipient_type_check
+  check (recipient_type in ('landlord', 'manager', 'tenant', 'brand_ambassador'));
+
+-- 3b) Also already existed in the repo (sql/add-admin-password-change.sql)
+--    but had never been run - meaning any attempt to change the admin
+--    password from inside the admin panel would fail (the UPDATE
+--    targets a column that doesn't exist yet), silently leaving the
+--    env var SUPER_ADMIN_PASSWORD_HASH as the real password in effect.
+alter table platform_settings add column if not exists admin_password_hash text;
+
+-- 3c) GENUINE bug, not just an unapplied migration: activity_logs'
+--    original check constraint only ever allowed
+--    ('admin','landlord','tenant','system'), but the app has always
+--    logged 'manager' and 'brand_ambassador' actors too (every BA
+--    login, every manager action - see auth.controller.js's
+--    logActivity calls using req.user.role directly). Every such
+--    write has been silently failing since those roles were
+--    introduced (activityLog.service.js swallows the DB error so it
+--    never took down the actual request, but the log itself is
+--    empty/incomplete for every manager and brand_ambassador action
+--    until this runs).
+alter table activity_logs drop constraint if exists activity_logs_actor_type_check;
+alter table activity_logs add constraint activity_logs_actor_type_check
+  check (actor_type in ('admin', 'landlord', 'tenant', 'manager', 'brand_ambassador', 'system'));

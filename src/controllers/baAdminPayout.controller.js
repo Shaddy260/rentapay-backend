@@ -33,6 +33,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { captureException } = require('../services/sentry.service');
 const { normalizePhoneOrThrow } = require('../utils/phone');
 const { generateEarningsStatementPdf } = require('../services/pdfReport.service');
+const { notify } = require('../services/notify.service');
 const logger = require('../utils/logger');
 
 const ADMIN_ACTOR_ID = 'super-admin';
@@ -122,12 +123,65 @@ async function getPayoutReview(req, res) {
       claimsByBa.get(c.ba_id).push(c);
     }
 
+    // Item 10 - "Payout Run" view needs, per BA: total landlords that
+    // qualify, total that do NOT qualify, and their commission rate -
+    // not just the period-scoped $ owed above. Qualification here
+    // uses the same live definition as
+    // baPayoutQualificationReport.service.js (latest matched claim's
+    // qualification_status in 'qualified'/'paid') so the two screens
+    // can never disagree, and is NOT period-scoped - it reflects the
+    // BA's full onboarded roster, not just this run's owed amounts.
+    const baIds = (bas || []).map((b) => b.id);
+    const rosterCountByBa = new Map();
+    const qualifyingCountByBa = new Map();
+    if (baIds.length > 0) {
+      const { data: rosterLandlords, error: rosterErr } = await supabase
+        .from('landlords')
+        .select('id, ba_id')
+        .in('ba_id', baIds);
+      if (rosterErr) throw rosterErr;
+
+      for (const l of rosterLandlords || []) {
+        rosterCountByBa.set(l.ba_id, (rosterCountByBa.get(l.ba_id) || 0) + 1);
+      }
+
+      const rosterLandlordIds = (rosterLandlords || []).map((l) => l.id);
+      if (rosterLandlordIds.length > 0) {
+        const { data: allClaims, error: allClaimsErr } = await supabase
+          .from('ba_landlord_claims')
+          .select('ba_id, matched_landlord_id, qualification_status, created_at')
+          .in('matched_landlord_id', rosterLandlordIds)
+          .order('created_at', { ascending: false });
+        if (allClaimsErr) throw allClaimsErr;
+
+        const latestByPair = new Map();
+        for (const c of allClaims || []) {
+          const key = `${c.ba_id}:${c.matched_landlord_id}`;
+          if (!latestByPair.has(key)) latestByPair.set(key, c);
+        }
+        const qualifyingLandlordIdsByBa = new Map();
+        for (const c of latestByPair.values()) {
+          if (['qualified', 'paid'].includes(c.qualification_status)) {
+            const set = qualifyingLandlordIdsByBa.get(c.ba_id) || new Set();
+            set.add(c.matched_landlord_id);
+            qualifyingLandlordIdsByBa.set(c.ba_id, set);
+          }
+        }
+        for (const [baId, set] of qualifyingLandlordIdsByBa.entries()) {
+          qualifyingCountByBa.set(baId, set.size);
+        }
+      }
+    }
+
     const rows = (bas || [])
       .map((ba) => {
         const baClaims = claimsByBa.get(ba.id) || [];
         const baseTotal = baClaims.reduce((sum, c) => sum + Number(c.payout_amount || 0), 0);
         const commissionTotal = baClaims.reduce((sum, c) => sum + Number(c.commission_bonus_amount || 0), 0);
         const periodMark = markByBa.get(ba.id) || null;
+        const totalLandlordsOnboarded = rosterCountByBa.get(ba.id) || 0;
+        const qualifyingLandlords = qualifyingCountByBa.get(ba.id) || 0;
+        const notQualifyingLandlords = Math.max(0, totalLandlordsOnboarded - qualifyingLandlords);
 
         return {
           ba: {
@@ -156,13 +210,33 @@ async function getPayoutReview(req, res) {
           commissionTotal,
           grandTotal: baseTotal + commissionTotal,
           periodMarkedStatus: periodMark ? periodMark.status : null,
+          // Item 10 - richer per-BA totals for the admin Payout Run
+          // view: landlord counts are the BA's full roster (not
+          // period-scoped), commission rate is their current percent.
+          totalLandlordsOnboarded,
+          qualifyingLandlords,
+          notQualifyingLandlords,
+          commissionRatePercent: Number(ba.current_commission_percent) || 0,
         };
       })
-      // Only surface BAs with actual activity this period - an empty
-      // row for every never-active BA would swamp the screen.
-      .filter((row) => row.claims.length > 0);
+      // Item 10 - a "Payout Run" should surface every BA who has ever
+      // onboarded someone, even if nothing qualified THIS period (so
+      // the not-qualifying count is visible) - only a BA with an
+      // entirely empty roster and no claims this period is skipped,
+      // since there's nothing at all to show for them.
+      .filter((row) => row.claims.length > 0 || row.totalLandlordsOnboarded > 0);
 
-    return res.json({ periodType, periodKey, bas: rows });
+    const runTotals = rows.reduce(
+      (acc, row) => ({
+        landlordsOnboarded: acc.landlordsOnboarded + row.totalLandlordsOnboarded,
+        qualifying: acc.qualifying + row.qualifyingLandlords,
+        notQualifying: acc.notQualifying + row.notQualifyingLandlords,
+        amountOwed: acc.amountOwed + row.grandTotal,
+      }),
+      { landlordsOnboarded: 0, qualifying: 0, notQualifying: 0, amountOwed: 0 }
+    );
+
+    return res.json({ periodType, periodKey, bas: rows, runTotals });
   } catch (err) {
     logger.error('[baAdminPayout] getPayoutReview error:', err.message);
     captureException(err);
@@ -284,6 +358,29 @@ async function markBaPeriod(req, res, targetStatus) {
       ipAddress: req.ip,
       metadata: { periodType, periodKey, claimIds, baseTotal, commissionTotal },
     });
+
+    // Item 11 - the moment admin marks a BA as paid, send them an
+    // in-app notification (existing notifications system - no email/
+    // SMS) with their payment stats for this run: how many landlords
+    // it covered and the total amount paid. Best-effort/non-fatal -
+    // a notify() failure must never undo or fail the payout mark
+    // itself, which has already been committed above.
+    if (targetStatus === 'paid') {
+      const grandTotal = baseTotal + commissionTotal;
+      const count = claims.length;
+      try {
+        await notify(
+          'brand_ambassador',
+          baId,
+          null,
+          `You've been paid KES ${grandTotal.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} for ${count} qualifying landlord${count === 1 ? '' : 's'} this ${periodType === 'week' ? 'week' : 'month'}.`,
+          { category: 'account', title: 'You have been paid' }
+        );
+      } catch (notifyErr) {
+        logger.error('[baAdminPayout] markBaPeriod: paid notification failed:', notifyErr.message);
+        captureException(notifyErr);
+      }
+    }
 
     return res.json({ mark });
   } catch (err) {
@@ -415,7 +512,7 @@ async function fetchEarningsStatementData(baId, range) {
   const { data: claims, error: claimsErr } = await supabase
     .from('ba_landlord_claims')
     .select(
-      'id, submitted_name, submitted_location, qualification_status, qualified_at, payout_amount, commission_bonus_amount, commission_tier_id, unit_pricing_tier_id, qualified_unit_count, marked_paid_at, marked_paid_by, landlords(full_name, location)'
+      'id, submitted_name, submitted_location, qualification_status, qualified_at, payout_amount, commission_bonus_amount, commission_tier_id, unit_pricing_tier_id, qualified_unit_count, payout_commission_model, payout_percentage_rate, payout_basis_amount, marked_paid_at, marked_paid_by, landlords(full_name, location)'
     )
     .eq('ba_id', baId)
     .in('qualification_status', ['qualified', 'paid'])
@@ -457,11 +554,16 @@ async function fetchEarningsStatementData(baId, range) {
       status: c.qualification_status, // 'qualified' | 'paid'
       markedPaidAt: c.marked_paid_at,
       markedPaidBy: c.marked_paid_by,
-      // Item 10 breakdown - null fields mean "flat rate / no tier
-      // crossed for this claim", not an error.
+      // Item 10 / ITEM 13 breakdown - null fields mean "flat rate / no
+      // tier crossed" (or, for percentage, "this claim used the fixed
+      // model") - not an error.
       breakdown: {
         unitCount: c.qualified_unit_count ?? null,
         unitBracket: unitTier ? { minUnits: unitTier.min_units, maxUnits: unitTier.max_units, amount: Number(unitTier.amount) } : null,
+        percentage:
+          c.payout_commission_model === 'percentage'
+            ? { rate: Number(c.payout_percentage_rate || 0), basisAmount: Number(c.payout_basis_amount || 0) }
+            : null,
         commissionTier: commissionTier
           ? { targetQualifiedLandlords: commissionTier.target_qualified_landlords, commissionPercent: Number(commissionTier.commission_percent) }
           : null,
@@ -500,14 +602,16 @@ async function fetchEarningsStatementData(baId, range) {
 
 function buildEarningsStatementCsv(ba, claims, totals, periodLabel) {
   const lines = [
-    ['Landlord', 'Location', 'Units', 'Unit Bracket Applied', 'Qualified At', 'Base Payout (KES)', 'Commission Tier', 'Commission Bonus (KES)', 'Status', 'Paid At'].join(','),
+    ['Landlord', 'Location', 'Units', 'Base Payout Basis', 'Qualified At', 'Base Payout (KES)', 'Commission Tier', 'Commission Bonus (KES)', 'Status', 'Paid At'].join(','),
   ];
   for (const c of claims) {
     const name = String(c.landlordName || '').replace(/"/g, '""');
     const location = String(c.landlordLocation || '').replace(/"/g, '""');
-    const unitBracket = c.breakdown?.unitBracket
-      ? `${c.breakdown.unitBracket.minUnits}-${c.breakdown.unitBracket.maxUnits ?? '+'} units @ KES ${Number(c.breakdown.unitBracket.amount).toFixed(2)}`
-      : 'Flat rate';
+    const payoutBasis = c.breakdown?.percentage
+      ? `${c.breakdown.percentage.rate}% of KES ${Number(c.breakdown.percentage.basisAmount).toFixed(2)} qualifying payment`
+      : c.breakdown?.unitBracket
+        ? `${c.breakdown.unitBracket.minUnits}-${c.breakdown.unitBracket.maxUnits ?? '+'} units @ KES ${Number(c.breakdown.unitBracket.amount).toFixed(2)}`
+        : 'Flat rate';
     const commissionTier = c.breakdown?.commissionTier
       ? `${c.breakdown.commissionTier.commissionPercent}% (at ${c.breakdown.commissionTier.targetQualifiedLandlords} qualified)`
       : 'None';
@@ -516,7 +620,7 @@ function buildEarningsStatementCsv(ba, claims, totals, periodLabel) {
         `"${name}"`,
         `"${location}"`,
         c.breakdown?.unitCount ?? '',
-        `"${unitBracket}"`,
+        `"${payoutBasis}"`,
         c.qualifiedAt || '',
         c.payoutAmount.toFixed(2),
         `"${commissionTier}"`,

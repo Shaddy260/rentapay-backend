@@ -27,17 +27,23 @@ router.get('/me', verifyToken, requireRole('brand_ambassador'), ctrl.getMyBaProf
 // reuses the existing generic /api/upload/profile-photo route below.
 router.patch('/me', verifyToken, requireRole('brand_ambassador'), ctrl.updateMyProfile);
 router.patch('/me/leaderboard-opt-in', verifyToken, requireRole('brand_ambassador'), ctrl.updateLeaderboardOptIn);
-// PHASE 4 - BA logs/edits/lists their own landlord claims.
-router.post('/claims', verifyToken, requireRole('brand_ambassador'), ctrl.submitLandlordClaim);
-router.get('/claims/mine', verifyToken, requireRole('brand_ambassador'), ctrl.listMyClaims);
-router.patch('/claims/:id', verifyToken, requireRole('brand_ambassador'), ctrl.editMyClaim);
-// PHASE 7 - "Share with admin": builds the claims-report summary and
-// posts it to the admin notifications inbox; returns the same text so
-// the frontend can also open a wa.me deep link with it.
-router.post('/claims/share', verifyToken, requireRole('brand_ambassador'), ctrl.shareClaimsReport);
+// SECTION A/B: manual claim logging (submit/list/edit) has been
+// removed entirely - a landlord is attached to a BA only via the
+// referral link/code at signup. "My Onboarded Landlords" is now the
+// ONE single live list, sourced directly from landlords.ba_id.
+router.get('/landlords/mine', verifyToken, requireRole('brand_ambassador'), ctrl.listMyOnboardedLandlords);
+// PHASE 7 - "Share with admin": builds a report summary from the live
+// onboarded-landlords list and posts it to the admin notifications
+// inbox; returns the same text so the frontend can also open a wa.me
+// deep link with it.
+router.post('/landlords/mine/share', verifyToken, requireRole('brand_ambassador'), ctrl.shareClaimsReport);
 // PHASE 5 - BA dashboard/stats aggregates. Scoped server-side to
 // req.user.id, never a client-supplied BA id.
 router.get('/stats/mine', verifyToken, requireRole('brand_ambassador'), ctrl.getBaStats);
+// SECTION E - the BA's own recurring commission earnings list
+// (ba_commission_earnings), one row per completed landlord
+// subscription payment. Scoped server-side to req.user.id.
+router.get('/earnings/mine', verifyToken, requireRole('brand_ambassador'), ctrl.getMyCommissionEarnings);
 // PHASE 18 - Optional BA Leaderboard. BA-authenticated; opt-in filter
 // and the caller's own exact rank are both computed server-side, see
 // getLeaderboard for exactly what is and isn't exposed.
@@ -68,22 +74,18 @@ router.post('/:id/suspend', verifyToken, requireRole('admin'), ctrl.suspendBrand
 router.post('/:id/reactivate', verifyToken, requireRole('admin'), ctrl.reactivateBrandAmbassador);
 router.post('/:id/offboard', verifyToken, requireRole('admin'), ctrl.offboardBrandAmbassador);
 
-// PHASE 10 - payout rules & commission tiers (global + per-BA override).
-// Nested under /brand-ambassadors since payout_rules/commission_tiers
-// are always scoped to this feature, mirroring how claims/stats above
-// are nested rather than living at the API root.
+// SECTION E - percentage commission rate (global + per-BA override),
+// each an append-only history (setting a new rate inserts a new row
+// rather than overwriting the current one). Nested under
+// /brand-ambassadors since payout_rules is always scoped to this
+// feature, mirroring how claims/stats above are nested rather than
+// living at the API root. The old commission-tiers / unit-pricing-tiers
+// endpoints that used to live here are gone - hard cutover, those
+// tables no longer exist.
 router.get('/payout-rules', verifyToken, requireRole('admin'), payoutRulesCtrl.getPayoutRules);
 router.patch('/payout-rules/global', verifyToken, requireRole('admin'), payoutRulesCtrl.updateGlobalPayoutRule);
 router.patch('/:baId/payout-rule-override', verifyToken, requireRole('admin'), payoutRulesCtrl.setBaPayoutOverride);
-router.get('/commission-tiers', verifyToken, requireRole('admin'), payoutRulesCtrl.getCommissionTiers);
-router.patch('/commission-tiers/global', verifyToken, requireRole('admin'), payoutRulesCtrl.updateCommissionTiers);
-router.patch('/:baId/commission-tiers-override', verifyToken, requireRole('admin'), payoutRulesCtrl.setBaCommissionTierOverride);
-
-// BA Portal fixes, item 10 - unit-volume pricing brackets (global +
-// per-BA override), same pattern as commission tiers directly above.
-router.get('/unit-pricing-tiers', verifyToken, requireRole('admin'), payoutRulesCtrl.getUnitPricingTiers);
-router.patch('/unit-pricing-tiers/global', verifyToken, requireRole('admin'), payoutRulesCtrl.updateUnitPricingTiers);
-router.patch('/:baId/unit-pricing-tiers-override', verifyToken, requireRole('admin'), payoutRulesCtrl.setBaUnitPricingTierOverride);
+router.get('/payout-rules/history', verifyToken, requireRole('admin'), payoutRulesCtrl.getPayoutRuleHistory);
 
 // PHASE 19 - Qualification Job Dry-Run Mode. Admin-triggered manual
 // run, alongside the Phase 10 Payout Rules screen - side-effect-free,

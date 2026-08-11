@@ -2,13 +2,11 @@
 //
 // BUILD SPEC PHASE 9 - Marketing Self-Fill Landlord Link.
 //
-// Distinct from Phase 4 (a BA logging a claim about a landlord they
-// personally onboarded): this is a public, no-login form a landlord
-// fills in themselves after seeing it shared by the marketing team.
-// It stays an unverified lead (landlord_leads, added in Phase 1)
-// until it's separately converted or manually marked contacted - it
-// deliberately never touches ba_landlord_claims or the BA
-// verification loop.
+// This is a public, no-login form a landlord fills in themselves
+// after seeing it shared by the marketing team. It stays an
+// unverified lead (landlord_leads, added in Phase 1) until it's
+// separately converted or manually marked contacted - it deliberately
+// never touches the BA attribution/qualification flow.
 
 const supabase = require('../config/supabase');
 const { normalizePhoneOrThrow } = require('../utils/phone');

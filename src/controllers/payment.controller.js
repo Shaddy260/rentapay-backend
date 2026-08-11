@@ -60,6 +60,7 @@ const { validatePositiveAmount } = require('../utils/validateAmount');
 const { applyUnitLimitChange } = require('../utils/unitLimitEnforcement');
 const { captureException } = require('../services/sentry.service');
 const tenantRatingReminderService = require('../services/tenantRatingReminder.service');
+const { recordCommissionForPayment } = require('../services/baCommission.service');
 const logger = require('../utils/logger');
 
 // ---------------------------------------------------------------------
@@ -467,6 +468,7 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
 
   const mpesaReceiptNumber = extractMetadataValue(callbackMetadata, 'MpesaReceiptNumber');
   const phoneNumber = extractMetadataValue(callbackMetadata, 'PhoneNumber');
+  const paidAtIso = new Date().toISOString();
 
   await supabase
     .from('subscription_payments')
@@ -474,9 +476,16 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
       status: 'completed',
       mpesa_transaction_id: mpesaReceiptNumber,
       mpesa_phone: phoneNumber ? String(phoneNumber) : null,
-      paid_at: new Date().toISOString(),
+      paid_at: paidAtIso,
     })
     .eq('id', subPayment.id);
+
+  // SECTION E: every completed landlord subscription payment
+  // independently computes and records BA commission (percentage of
+  // this payment, not a one-off amount at qualification) - a no-op if
+  // this landlord has no BA or isn't qualified yet. Never blocks
+  // activation/renewal below on a bookkeeping failure.
+  await recordCommissionForPayment({ id: subPayment.id, landlord_id: subPayment.landlord_id, amount: subPayment.amount, paid_at: paidAtIso });
 
   const landlord = subPayment.landlords;
   if (!landlord) {

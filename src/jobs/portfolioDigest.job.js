@@ -3,26 +3,56 @@
 // FEATURE (direct request #5 - portfolio health digest): a scheduled
 // per-landlord summary - occupancy rate, collection rate this period,
 // top 3 late payers, and vacant units with no photos (ties into #1,
-// the missing-photos nudge). Starts with email only, reusing the
-// existing Resend-backed email.service.js/notify infrastructure -
-// same reasoning as the rest of this codebase's "route everything
-// through the one shared sender" convention. WhatsApp is a documented
-// fast-follow, not built here, since WhatsApp sending is currently
-// disabled platform-wide (see notify.service.js).
+// the missing-photos nudge).
 //
-// Two schedules:
-//   - monthly: the full digest, 06:00 on the 1st of each month.
-//   - weekly: a lighter version (just the two headline rates + missing
-//     photos count, no late-payer breakdown), 06:00 every Monday, so a
-//     landlord isn't waiting a whole month to notice something's off.
+// UPDATED (requirements spec item #14 - "monthly cadence, in-app only,
+// no email"): this job used to run on two schedules (monthly full
+// digest + a lighter weekly version) and delivered by email via
+// email.service.js. Per the direct request:
+//   - the weekly schedule is removed entirely - monthly (06:00 on the
+//     1st of each month) is now the only cadence.
+//   - delivery no longer emails the landlord at all. It now routes
+//     through the shared notify.service.js helper instead, the same
+//     one every other in-app notification in the codebase uses, which
+//     writes a row into the landlord's notifications inbox (and fires
+//     a push notification) and does NOT send an email unless a caller
+//     explicitly opts in with `allowEmail: true` - this call site
+//     deliberately does not, so the summary is in-app only.
+//
+// Registers every run (success or failure) with system_heartbeats -
+// same convention as the other cron jobs in this codebase (see
+// baStaleApplicationReminder.job.js) - so a silent failure here is
+// discoverable rather than found a month later when a landlord asks
+// why they never got a summary.
 
 const cron = require('node-cron');
 const supabase = require('../config/supabase');
-const { sendEmail, wrapEmailHtml } = require('../services/email.service');
+const { notify } = require('../services/notify.service');
 const templates = require('../services/notificationTemplates');
 const { runInBatches } = require('../utils/concurrency');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
+
+const JOB_NAME = 'portfolio_digest';
+
+async function recordHeartbeat(status, errorMessage, startedAt) {
+  try {
+    await supabase.from('system_heartbeats').upsert(
+      {
+        job_name: JOB_NAME,
+        last_run_at: new Date().toISOString(),
+        last_status: status,
+        last_error: errorMessage || null,
+        last_duration_ms: Date.now() - startedAt,
+      },
+      { onConflict: 'job_name' }
+    );
+  } catch (hbErr) {
+    // Heartbeat itself failing is logged but never allowed to mask
+    // or interrupt the actual digest run.
+    logger.error('[cron] portfolioDigest: heartbeat write failed:', hbErr.message);
+  }
+}
 
 /** Builds the digest numbers for a single landlord. */
 async function buildLandlordDigest(landlordId) {
@@ -104,8 +134,10 @@ async function buildLandlordDigest(landlordId) {
   };
 }
 
-async function runDigest(period) {
-  logger.info(`[cron] Running portfolio ${period} digest...`, new Date().toISOString());
+async function runDigest() {
+  const startedAt = Date.now();
+  const period = 'monthly';
+  logger.info('[cron] Running portfolio monthly digest...', new Date().toISOString());
 
   const { data: landlords, error } = await supabase
     .from('landlords')
@@ -115,16 +147,18 @@ async function runDigest(period) {
     // FEATURE (direct request - strict subscription tiers): "services"
     // like the portfolio digest are blocked while a landlord's
     // subscription is lapsed. They can still log in and use the app;
-    // they just stop receiving proactive email/WhatsApp updates until
-    // any of the landlord/manager/caretaker renews.
-    .neq('subscription_status', 'expired')
-    .not('email', 'is', null);
+    // they just stop receiving proactive updates until any of the
+    // landlord/manager/caretaker renews.
+    .neq('subscription_status', 'expired');
 
   if (error) {
-    logger.error(`[cron] portfolioDigest (${period}): failed to fetch landlords:`, error.message);
+    logger.error('[cron] portfolioDigest: failed to fetch landlords:', error.message);
     captureException(error);
+    await recordHeartbeat('error', error.message, startedAt);
     return;
   }
+
+  let failureCount = 0;
 
   await runInBatches(
     landlords || [],
@@ -135,26 +169,35 @@ async function runDigest(period) {
       if (stats.totalUnits === 0) return;
 
       const { subject, body } = templates.portfolioDigestEmail(landlord.full_name, stats, period);
-      await sendEmail(landlord.email, subject, wrapEmailHtml(body));
+      // In-app only (requirements spec item #14): notify() writes to
+      // the landlord's notifications inbox + push, and - because
+      // allowEmail is left unset (defaults to false) - never emails
+      // the summary.
+      await notify('landlord', landlord.id, null, body, {
+        title: subject,
+        category: 'account',
+        urgent: false,
+      });
     },
     {
       concurrency: 5,
       onError: (err, landlord) => {
-        logger.error(`[cron] portfolioDigest (${period}): failed for landlord ${landlord.id}:`, err.message);
+        failureCount += 1;
+        logger.error(`[cron] portfolioDigest: failed for landlord ${landlord.id}:`, err.message);
         captureException(err);
       },
     }
   );
 
-  logger.info(`[cron] Portfolio ${period} digest complete.`);
+  logger.info('[cron] Portfolio monthly digest complete.');
+  await recordHeartbeat(failureCount === 0 ? 'ok' : 'error', failureCount ? `${failureCount} landlord(s) failed` : null, startedAt);
 }
 
 function startPortfolioDigestJob() {
-  // Monthly: full digest, 06:00 on the 1st.
-  cron.schedule('0 6 1 * *', () => runDigest('monthly'));
-  // Weekly: lighter digest, 06:00 every Monday.
-  cron.schedule('0 6 * * 1', () => runDigest('weekly'));
-  logger.info('[cron] Portfolio digest jobs scheduled (monthly 1st 06:00, weekly Mon 06:00).');
+  // Monthly only (requirements spec item #14 - the weekly cadence has
+  // been removed): full digest, 06:00 on the 1st of each month.
+  cron.schedule('0 6 1 * *', () => runDigest());
+  logger.info('[cron] Portfolio digest job scheduled (monthly 1st 06:00, in-app only).');
 }
 
 module.exports = { startPortfolioDigestJob, runDigest, buildLandlordDigest };

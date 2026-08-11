@@ -1042,10 +1042,9 @@ async function getGrowthStatistics(req, res) {
 // PHASE 8 - Admin: Today's Onboarded Landlords (System Panel).
 //
 // Pure system-of-record data: REAL landlord signups (landlords.
-// created_at), not BA claims (ba_landlord_claims - those are the BA's
-// own self-reported log, reviewed separately in the BA tab) and not
-// marketing leads (landlord_leads, Phase 9 - those never become a
-// landlords row until someone actually registers). Defaults to today
+// created_at) and not marketing leads (landlord_leads, Phase 9 -
+// those never become a landlords row until someone actually
+// registers). Defaults to today
 // (server's UTC "today", same convention as the rest of the admin
 // dashboard's date-scoped panels) when no range is given.
 //

@@ -1,0 +1,225 @@
+// src/services/baCommission.service.js
+//
+// Consolidated Change Instructions - Section E (percentage commission,
+// hard cutover replacing the fixed-price model).
+//
+// Two responsibilities:
+//   1. resolveApplicableRate(baId, atDate) - the rate lookup Section E
+//      specifies: "whichever rate row has the latest effective_from at
+//      or before that payment's paid_at" - a BA override, if one
+//      exists and has a row at-or-before atDate, wins outright over
+//      the global rate (same override-fully-replaces-global precedence
+//      already used elsewhere in this codebase for payout_rules /
+//      commission_tiers). If the BA has no override at all (or none
+//      effective yet as of atDate), the global rate is used instead.
+//   2. recordCommissionForPayment(payment) - called from the
+//      payment-processing path (payment.controller.js,
+//      processSubscriptionPaymentCallback) the moment a landlord's
+//      subscription payment completes. Computes
+//      commission = payment_amount x applicable_percentage and writes
+//      one ba_commission_earnings row, ONLY for landlords that are (a)
+//      attached to a BA and (b) already qualified (Section C's gate -
+//      unaffected by this payment itself; qualification is a one-time
+//      flip, this function never sets it). Idempotent: a unique index
+//      on subscription_payment_id means a re-invocation for the same
+//      payment (webhook retry, etc.) is a harmless no-op.
+
+const supabase = require('../config/supabase');
+const { notify } = require('./notify.service');
+const { logActivity } = require('./activityLog.service');
+const { captureException } = require('./sentry.service');
+const logger = require('../utils/logger');
+
+function billingCycleFor(date) {
+  const d = new Date(date);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
+ * Resolves the percentage rate that applies to a BA at a given moment,
+ * per Section E's lookup: latest effective_from at or before atDate,
+ * BA override taking full precedence over global whenever one exists
+ * at that point in time.
+ *
+ * @param {string} baId
+ * @param {Date|string} atDate - normally a payment's paid_at
+ * @returns {Promise<{ percentage: number, payoutRuleId: string } | null>}
+ */
+async function resolveApplicableRate(baId, atDate) {
+  const asOf = new Date(atDate).toISOString();
+
+  const { data: overrideRows, error: overrideErr } = await supabase
+    .from('payout_rules')
+    .select('id, percentage, effective_from')
+    .eq('scope', 'ba_override')
+    .eq('ba_id', baId)
+    .lte('effective_from', asOf)
+    .order('effective_from', { ascending: false })
+    .limit(1);
+  if (overrideErr) throw overrideErr;
+
+  if (overrideRows && overrideRows.length > 0) {
+    return { percentage: Number(overrideRows[0].percentage), payoutRuleId: overrideRows[0].id };
+  }
+
+  const { data: globalRows, error: globalErr } = await supabase
+    .from('payout_rules')
+    .select('id, percentage, effective_from')
+    .eq('scope', 'global')
+    .lte('effective_from', asOf)
+    .order('effective_from', { ascending: false })
+    .limit(1);
+  if (globalErr) throw globalErr;
+
+  if (globalRows && globalRows.length > 0) {
+    return { percentage: Number(globalRows[0].percentage), payoutRuleId: globalRows[0].id };
+  }
+
+  return null; // no rate has ever been set as of this date - nothing to compute against
+}
+
+/**
+ * Computes and records commission for one completed landlord
+ * subscription payment. Safe/idempotent to call more than once for
+ * the same payment. Never throws out to the caller - a commission
+ * bookkeeping failure must never block the payment-completion flow
+ * that triggered it; errors are logged/captured and swallowed, same
+ * convention as the notify() calls right next to this call site.
+ *
+ * @param {object} subPayment - a subscription_payments row, must
+ *   include: id, landlord_id, amount, paid_at
+ */
+async function recordCommissionForPayment(subPayment) {
+  try {
+    const { data: landlord, error: landlordErr } = await supabase
+      .from('landlords')
+      .select('id, ba_id, ba_qualification_status, full_name')
+      .eq('id', subPayment.landlord_id)
+      .maybeSingle();
+    if (landlordErr) throw landlordErr;
+
+    // Section E: "percentage commission only applies to landlords
+    // that have already qualified" - Section C's gate, read here, not
+    // re-derived.
+    if (!landlord || !landlord.ba_id || landlord.ba_qualification_status !== 'qualified') return null;
+
+    const paidAt = subPayment.paid_at || new Date().toISOString();
+    const rate = await resolveApplicableRate(landlord.ba_id, paidAt);
+    if (!rate) {
+      logger.warn(`[baCommission] no payout_rules rate resolvable for BA ${landlord.ba_id} as of ${paidAt} - skipping commission for payment ${subPayment.id}.`);
+      return null;
+    }
+
+    const paymentAmount = Number(subPayment.amount || 0);
+    const commissionAmount = Math.round(paymentAmount * (rate.percentage / 100) * 100) / 100;
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from('ba_commission_earnings')
+      .insert({
+        ba_id: landlord.ba_id,
+        landlord_id: landlord.id,
+        subscription_payment_id: subPayment.id,
+        payment_amount: paymentAmount,
+        percentage_applied: rate.percentage,
+        commission_amount: commissionAmount,
+        payout_rule_id: rate.payoutRuleId,
+        billing_cycle: billingCycleFor(paidAt),
+        paid_at: paidAt,
+      })
+      .select()
+      .maybeSingle();
+
+    if (insertErr) {
+      // Unique violation on subscription_payment_id = this payment's
+      // commission was already recorded (retry/duplicate callback) -
+      // not a real error, nothing further to do.
+      if (insertErr.code === '23505') return null;
+      throw insertErr;
+    }
+
+    logActivity({
+      actorType: 'system',
+      action: 'ba_commission_recorded',
+      targetType: 'brand_ambassador',
+      targetId: landlord.ba_id,
+      metadata: {
+        landlordId: landlord.id,
+        subscriptionPaymentId: subPayment.id,
+        paymentAmount,
+        percentageApplied: rate.percentage,
+        commissionAmount,
+      },
+    });
+
+    return inserted;
+  } catch (err) {
+    logger.error(`[baCommission] recordCommissionForPayment failed for payment ${subPayment?.id}:`, err.message);
+    captureException(err);
+    return null;
+  }
+}
+
+/**
+ * Notifies every BA affected by a rate change - the BA an override was
+ * just set/cleared for, or, for a global change, every active/
+ * suspended BA who does NOT currently have their own override (an
+ * override fully replaces the global rate for that BA, so a global
+ * change doesn't affect them). Both in-app and push, per Section E.
+ */
+async function notifyRateChange({ scope, baId, oldPercentage, newPercentage, effectiveFrom }) {
+  const effectiveLabel = new Date(effectiveFrom) <= new Date()
+    ? 'immediately'
+    : `from ${new Date(effectiveFrom).toLocaleDateString('en-GB')}`;
+  const oldLabel = oldPercentage == null ? 'no rate previously set' : `${oldPercentage}%`;
+  const message = `Your commission rate is changing from ${oldLabel} to ${newPercentage}%, effective ${effectiveLabel}.`;
+
+  async function sendTo(id) {
+    try {
+      await notify('brand_ambassador', id, null, message, {
+        category: 'commission_rate_changed',
+        title: 'Commission rate updated',
+      });
+    } catch (err) {
+      logger.error(`[baCommission] rate-change notify failed for BA ${id}:`, err.message);
+      captureException(err);
+    }
+  }
+
+  if (scope === 'ba_override') {
+    await sendTo(baId);
+    return;
+  }
+
+  // Global change: every active/suspended BA without their own
+  // override is affected.
+  const { data: bas, error: basErr } = await supabase
+    .from('brand_ambassadors')
+    .select('id')
+    .in('status', ['active', 'suspended']);
+  if (basErr) {
+    logger.error('[baCommission] rate-change notify: failed to list BAs:', basErr.message);
+    captureException(basErr);
+    return;
+  }
+
+  const { data: overriddenRows, error: overriddenErr } = await supabase
+    .from('payout_rules')
+    .select('ba_id')
+    .eq('scope', 'ba_override');
+  if (overriddenErr) {
+    logger.error('[baCommission] rate-change notify: failed to list overrides:', overriddenErr.message);
+    captureException(overriddenErr);
+    return;
+  }
+  const overriddenBaIds = new Set((overriddenRows || []).map((r) => r.ba_id));
+
+  const targets = (bas || []).filter((b) => !overriddenBaIds.has(b.id));
+  await Promise.all(targets.map((b) => sendTo(b.id)));
+}
+
+module.exports = {
+  resolveApplicableRate,
+  recordCommissionForPayment,
+  notifyRateChange,
+  billingCycleFor,
+};

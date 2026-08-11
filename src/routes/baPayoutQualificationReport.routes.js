@@ -15,6 +15,11 @@ router.get('/payout-qualification-reports', verifyToken, requireRole('admin'), c
 // for GET /payout-qualification-reports/:id and never reach the CSV
 // handler.
 router.get('/payout-qualification-reports/:id.csv', verifyToken, requireRole('admin'), ctrl.downloadCsv);
+// ITEM 12 - combined PDF (every BA, color-coded) and per-BA PDF.
+// Both have more path segments than the plain `:id` route below, so
+// there's no ambiguity with it the way there was with `.csv`.
+router.get('/payout-qualification-reports/:id/pdf', verifyToken, requireRole('admin'), ctrl.downloadCombinedPdf);
+router.get('/payout-qualification-reports/:id/ba/:baId/pdf', verifyToken, requireRole('admin'), ctrl.downloadBaPdf);
 router.get('/payout-qualification-reports/:id', verifyToken, requireRole('admin'), ctrl.getOne);
 
 module.exports = router;

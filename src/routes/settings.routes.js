@@ -13,4 +13,11 @@ const adminRouter = express.Router();
 adminRouter.get('/', verifyToken, requireRole('admin'), ctrl.getAdminSettings);
 adminRouter.patch('/help-contacts', verifyToken, requireRole('admin'), ctrl.updateHelpContacts);
 
+// Item 3: multiple call/WhatsApp numbers - list/add/edit/remove,
+// rather than overwriting one fixed field.
+adminRouter.get('/help-contacts/numbers', verifyToken, requireRole('admin'), ctrl.listHelpContactNumbers);
+adminRouter.post('/help-contacts/numbers', verifyToken, requireRole('admin'), ctrl.createHelpContactNumber);
+adminRouter.patch('/help-contacts/numbers/:id', verifyToken, requireRole('admin'), ctrl.updateHelpContactNumber);
+adminRouter.delete('/help-contacts/numbers/:id', verifyToken, requireRole('admin'), ctrl.deleteHelpContactNumber);
+
 module.exports = { publicRouter, adminRouter };

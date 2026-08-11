@@ -153,9 +153,14 @@ const templates = {
     `Hi ${managerName}, your property manager access on RentaPay has been removed.`,
 
   // --- Portfolio health digest (direct request #5) ---
-  // Returns { subject, body } - body is plain text/newlines, wrapped
-  // into HTML by wrapEmailHtml() at the call site, same convention as
-  // every other email in this file.
+  // Returns { subject, body } - body is plain text/newlines. Used to
+  // be wrapped into HTML by wrapEmailHtml() for an email; per
+  // requirements spec item #14 ("monthly cadence, in-app only, no
+  // email") this now feeds the in-app notifications inbox instead
+  // (see portfolioDigest.job.js), so `body` is rendered as plain
+  // text there. `period` is always 'monthly' now (the weekly cadence
+  // was removed) - the parameter is kept so the call site doesn't
+  // need to change and in case a lighter cadence is reintroduced later.
   portfolioDigestEmail: (landlordName, stats, period) => {
     const periodLabel = period === 'monthly' ? 'Monthly' : 'Weekly';
     const lines = [];
@@ -168,17 +173,15 @@ const templates = {
         : `Collection rate this period: ${stats.collectionRate}% (KES ${stats.collectedThisMonth.toLocaleString()} of KES ${stats.expectedThisMonth.toLocaleString()} expected)`
     );
 
-    if (period === 'monthly') {
-      if (stats.topLatePayers.length) {
-        lines.push('');
-        lines.push('Top late payers this period:');
-        stats.topLatePayers.forEach((p, i) => {
-          lines.push(`  ${i + 1}. ${p.tenantName} (${p.unitName}) - KES ${p.balanceDue.toLocaleString()} outstanding`);
-        });
-      } else {
-        lines.push('');
-        lines.push('No tenants currently owe a balance - nice work.');
-      }
+    if (stats.topLatePayers.length) {
+      lines.push('');
+      lines.push('Top late payers this period:');
+      stats.topLatePayers.forEach((p, i) => {
+        lines.push(`  ${i + 1}. ${p.tenantName} (${p.unitName}) - KES ${p.balanceDue.toLocaleString()} outstanding`);
+      });
+    } else {
+      lines.push('');
+      lines.push('No tenants currently owe a balance - nice work.');
     }
 
     if (stats.vacantNoPhotoCount > 0) {
@@ -194,7 +197,7 @@ const templates = {
     lines.push('View the full breakdown any time from your RentaPay dashboard.');
 
     return {
-      subject: `Your ${periodLabel} RentaPay Portfolio Summary`,
+      subject: `Your ${periodLabel} Portfolio Summary`,
       body: lines.join('\n'),
     };
   },

@@ -16,6 +16,8 @@ router.post('/forgot-password/request', authController.requestPasswordReset);
 router.post('/forgot-password/reset', authController.resetPassword);
 router.post('/admin/login', authController.adminLogin);
 router.post('/admin/verify-otp', authController.adminVerifyOTP);
+router.post('/admin/forgot-password', authController.adminForgotPassword);
+router.post('/admin/reset-password', authController.adminResetPassword);
 router.post('/admin/change-password', verifyToken, requireRole('admin'), authController.changeAdminPassword);
 
 // FIX ("fingerprint login flickers back to the login screen after a

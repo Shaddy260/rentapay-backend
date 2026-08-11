@@ -28,9 +28,12 @@ const crypto = require('crypto');
 const supabase = require('../config/supabase');
 const { hashPassword } = require('../utils/password');
 const { generateOTP, getEmailVerificationOTPExpiry, isOTPExpired } = require('../utils/otp');
-const { normalizePhoneOrThrow } = require('../utils/phone');
+const { resolveApplicableRate } = require('../services/baCommission.service');
+const { maskPhoneMiddle } = require('../utils/maskPhone');
+
 const { isValidEmail } = require('../utils/email');
 const { findPhoneConflict } = require('../utils/phoneUniqueness');
+const { normalizePhoneOrThrow } = require('../utils/phone');
 const { findEmailConflict } = require('../utils/emailUniqueness');
 const { sendEmail, wrapEmailHtml, SUPPORT_EMAIL } = require('../services/email.service');
 const { sendSMS } = require('../services/sms.service');
@@ -480,21 +483,21 @@ async function listBrandAmbassadors(req, res) {
     if (error) throw error;
 
     // Summary counts per BA (landlords onboarded, qualified-pending
-    // payout) - only meaningful for active/suspended/inactive BAs
-    // (i.e. anyone with an id claims could actually be tied to); a
+    // payout) - SECTION B/C: sourced directly from `landlords` (ba_id
+    // + ba_qualification_status) now, not ba_landlord_claims. A
     // single grouped query rather than N+1 per row.
     const ids = (bas || []).map((b) => b.id);
     let claimCounts = {};
     if (ids.length) {
-      const { data: claims, error: claimsErr } = await supabase
-        .from('ba_landlord_claims')
-        .select('ba_id, match_status, qualification_status')
+      const { data: landlordRows, error: landlordsErr } = await supabase
+        .from('landlords')
+        .select('ba_id, ba_qualification_status')
         .in('ba_id', ids);
-      if (claimsErr) throw claimsErr;
-      claimCounts = (claims || []).reduce((acc, c) => {
-        acc[c.ba_id] = acc[c.ba_id] || { landlordsOnboarded: 0, qualifiedPendingPayout: 0 };
-        if (c.match_status === 'matched') acc[c.ba_id].landlordsOnboarded += 1;
-        if (c.qualification_status === 'qualified') acc[c.ba_id].qualifiedPendingPayout += 1;
+      if (landlordsErr) throw landlordsErr;
+      claimCounts = (landlordRows || []).reduce((acc, l) => {
+        acc[l.ba_id] = acc[l.ba_id] || { landlordsOnboarded: 0, qualifiedPendingPayout: 0 };
+        acc[l.ba_id].landlordsOnboarded += 1;
+        if (l.ba_qualification_status === 'qualified') acc[l.ba_id].qualifiedPendingPayout += 1;
         return acc;
       }, {});
     }
@@ -638,23 +641,61 @@ async function offboardBrandAmbassador(req, res) {
 }
 
 /**
- * Next sequential "BA-0001" code - same simple max+1 lookup pattern
- * used for unit payment codes (unit.controller.js) - gapless because
- * a code is only ever assigned here, at approval, never pre-reserved.
+ * SECTION D (consolidated instructions) - referral code format.
+ * Old scheme: sequential "BA-0001", "BA-0002", ... - trivially
+ * guessable/enumerable. New scheme: `<NAME-SLUG>-<RANDOM5>`, e.g.
+ * "JASRAH-4KLT7". The slug is derived from the BA's own registered
+ * name (not attacker-controlled - it's set by admin approval of an
+ * application the BA already submitted), so it doubles as a
+ * human-readable "whose link is this" hint without being predictable,
+ * since the random suffix still has to be guessed.
  */
-async function getNextBaCode() {
-  const { data, error } = await supabase
-    .from('brand_ambassadors')
-    .select('ba_code')
-    .not('ba_code', 'is', null);
-  if (error) throw error;
+const AMBIGUOUS_CHARS = /[0O1IL]/g; // excluded from the random suffix
+const RANDOM_SUFFIX_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 0/O/1/I/L removed
+const RANDOM_SUFFIX_LENGTH = 5;
+const NAME_SLUG_MAX_LENGTH = 12;
 
-  let maxNumber = 0;
-  for (const row of data || []) {
-    const match = /^BA-(\d+)$/.exec(row.ba_code || '');
-    if (match) maxNumber = Math.max(maxNumber, parseInt(match[1], 10));
+function slugifyBaName(fullName) {
+  const slug = String(fullName || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '') // strip spaces/punctuation entirely
+    .slice(0, NAME_SLUG_MAX_LENGTH);
+  return slug || 'BA'; // fallback if the name is empty or all-symbols
+}
+
+function randomSuffix() {
+  let out = '';
+  for (let i = 0; i < RANDOM_SUFFIX_LENGTH; i++) {
+    out += RANDOM_SUFFIX_ALPHABET[Math.floor(Math.random() * RANDOM_SUFFIX_ALPHABET.length)];
   }
-  return `BA-${String(maxNumber + 1).padStart(4, '0')}`;
+  return out;
+}
+
+/**
+ * Generates `<SLUG>-<RANDOM5>` and regenerates the random half on any
+ * uniqueness collision against existing ba_code/referral_code values
+ * (both columns are always set to the same value, so checking one
+ * checks both). Bounded retry loop - a collision on a 5-char,
+ * 32-symbol alphabet (32^5 ≈ 33.5M combinations) is already
+ * vanishingly unlikely; the cap just guards against an infinite loop
+ * if something is structurally wrong (e.g. the table itself is
+ * corrupted with duplicates).
+ */
+async function generateBaCode(fullName) {
+  const slug = slugifyBaName(fullName);
+  const MAX_ATTEMPTS = 20;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const candidate = `${slug}-${randomSuffix()}`;
+    const { data: existing, error } = await supabase
+      .from('brand_ambassadors')
+      .select('id')
+      .eq('ba_code', candidate)
+      .maybeSingle();
+    if (error) throw error;
+    if (!existing) return candidate;
+  }
+  throw new Error('Could not generate a unique BA referral code after multiple attempts.');
 }
 
 /** POST /api/brand-ambassadors/:id/approve (admin-only) */
@@ -672,7 +713,7 @@ async function approveBaApplication(req, res) {
       return res.status(400).json({ error: `This application is already ${application.status}, not pending approval.` });
     }
 
-    const baCode = await getNextBaCode();
+    const baCode = await generateBaCode(application.full_name);
     const tempPassword = generateTempPassword();
     const passwordHash = await hashPassword(tempPassword);
 
@@ -929,306 +970,102 @@ async function updateLeaderboardOptIn(req, res) {
   }
 }
 
-// PHASE 4 - PUBLIC: resolves a ?ref=BA-XXXX code to a display name only
+// PHASE 4 - PUBLIC: resolves a ?ref=<code> code to a display name only
 // (never phone/email/internal id) so the landlord signup form can show
 // "Referred by <name>" before the account exists. Only ever matches an
-// 'active' BA - a typo'd/expired/rejected code returns matched: false,
-// same "fail silently, never block signup" rule as the actual tagging
-// in registerLandlord.
+// 'active' BA.
+//
+// SECTION D (consolidated instructions): "no code provided" and "code
+// provided but doesn't exist/isn't active" are now distinguishable via
+// `reason`, so the frontend can tell the two apart - a blank field
+// should never show an error, but a typo'd code the landlord actually
+// typed in should. The link-based (?ref=) flow only ever hits the "no
+// code" case as an initial state, never surfaces the not-found error to
+// the person (see D's "fail silently" note for link-based referrals,
+// unchanged from before) - that message is for the manual-entry path.
 async function resolveReferralCode(req, res) {
   try {
     const { code } = req.params;
-    if (!code) return res.json({ matched: false });
+    if (!code || !code.trim()) return res.json({ matched: false, reason: 'no_code' });
     const { data: ba } = await supabase
       .from('brand_ambassadors')
       .select('full_name, status')
       .eq('referral_code', code.trim())
       .maybeSingle();
-    if (!ba || ba.status !== 'active') return res.json({ matched: false });
+    if (!ba || ba.status !== 'active') return res.json({ matched: false, reason: 'not_found' });
     return res.json({ matched: true, fullName: ba.full_name });
   } catch (err) {
     logger.error('[brandAmbassador] resolveReferralCode error:', err.message);
     captureException(err);
-    return res.json({ matched: false });
+    return res.json({ matched: false, reason: 'not_found' });
   }
 }
 
 // ---------------------------------------------------------------------
-// PHASE 4 - BA logs a landlord claim (Part B). Phone-match against the
-// real landlords table is the authoritative signal (landlord phones
-// are already globally unique per phoneUniqueness.js) - no fuzzy
-// matching, no ba_landlord_claims row created unless a real account is
-// found. See Phase 15 for the three unmatched-message variants.
+// SECTION A (consolidated instructions) - manual claim logging
+// (submitLandlordClaim / listMyClaims / editMyClaim) has been removed
+// entirely, along with the ba_landlord_claims table. A landlord is
+// attached to a BA ONLY via the referral link/code at signup
+// (landlords.ba_id, set in auth.controller.js's registerLandlord) -
+// there is no fallback path and no way to retroactively assign one.
 // ---------------------------------------------------------------------
-async function submitLandlordClaim(req, res) {
-  try {
-    const baId = req.user.id;
-    let { fullName, phone, email, location } = req.body;
 
-    if (!fullName || !phone) {
-      return res.status(400).json({ error: 'fullName and phone are required.' });
-    }
-    fullName = String(fullName).trim();
-    location = location ? String(location).trim() : null;
-
-    try {
-      phone = normalizePhoneOrThrow(phone, 'Phone number');
-    } catch (phoneErr) {
-      return res.status(400).json({ error: phoneErr.message });
-    }
-
-    // (item 7) email is optional but, when given, must be a real
-    // address - it's a second matching key alongside phone, not a
-    // replacement for it (phone stays required, matching the rest of
-    // this flow's "phone is authoritative" design).
-    if (email) {
-      email = String(email).trim().toLowerCase();
-      if (!isValidEmail(email)) {
-        return res.status(400).json({ error: 'Please enter a valid email address.' });
-      }
-    } else {
-      email = null;
-    }
-
-    // Authoritative match: an active, real landlord account matching
-    // this exact normalized phone number OR (if given) this email -
-    // either one is enough to find the account, so a BA who only has
-    // one of the two correct still gets a match.
-    let landlordQuery = supabase
-      .from('landlords')
-      .select('id, full_name, phone, email, location, county, subscription_status, ba_id, created_at');
-    landlordQuery = email ? landlordQuery.or(`phone.eq.${phone},email.eq.${email}`) : landlordQuery.eq('phone', phone);
-    const { data: landlordMatches, error: landlordErr } = await landlordQuery.limit(1);
-    if (landlordErr) throw landlordErr;
-    const landlord = landlordMatches?.[0] || null;
-
-    if (!landlord) {
-      // PHASE 15 - two read-only checks purely to pick the clearest of
-      // three message variants. Neither check creates/modifies/saves
-      // anything.
-      let message =
-        "We couldn't find a registered landlord with that phone number. Have them complete registration using your referral link, then try again.";
-
-      const { data: lead } = await supabase
-        .from('landlord_leads')
-        .select('id, status')
-        .eq('phone', phone)
-        .in('status', ['new', 'contacted'])
-        .maybeSingle();
-
-      if (lead) {
-        message =
-          "This landlord's registration is still pending - they've been noted as interested but haven't completed signup yet. Have them finish registering on your referral link.";
-      } else {
-        // Near-miss check: same digits under a looser normalization
-        // (strip everything but digits, compare last 9) - if
-        // normalizePhoneOrThrow already collapsed the format
-        // difference away, this simply finds nothing extra to add,
-        // which is fine per the spec.
-        const looseDigits = String(phone).replace(/\D/g, '').slice(-9);
-        if (looseDigits.length === 9) {
-          const { data: nearMiss } = await supabase
-            .from('landlords')
-            .select('id')
-            .like('phone', `%${looseDigits}`)
-            .neq('phone', phone)
-            .maybeSingle();
-          if (nearMiss) {
-            message = "We couldn't find an exact match - double check the phone number format and try again.";
-          }
-        }
-      }
-
-      return res.status(200).json({ matched: false, message });
-    }
-
-    // (loop-prevention fix) A landlord whose account was created more
-    // than a week ago is no longer a fresh field onboarding - referral
-    // is optional, so plenty of landlords join on their own with no BA
-    // involved at all, and an old account showing up in this form is
-    // far more likely to be a stale/incorrect submission (or an
-    // attempt to backdate credit for someone the BA didn't actually
-    // just onboard) than a legitimate same-week claim. Reject outright
-    // rather than silently matching.
-    const CLAIM_MAX_ACCOUNT_AGE_DAYS = 7;
-    const accountAgeMs = Date.now() - new Date(landlord.created_at).getTime();
-    if (accountAgeMs > CLAIM_MAX_ACCOUNT_AGE_DAYS * 24 * 60 * 60 * 1000) {
-      return res.status(409).json({
-        matched: false,
-        tooOld: true,
-        message: `This landlord's account was created more than ${CLAIM_MAX_ACCOUNT_AGE_DAYS} days ago, so it can no longer be logged here. Only landlords onboarded in the last week are eligible for manual logging.`,
-      });
-    }
-
-    // (loop-prevention fix) A landlord already confirmed/matched to
-    // THIS BA (either via the referral link at signup, or a prior
-    // manual log) must not be re-submittable through this form again -
-    // without this check a BA could keep re-logging the same landlord
-    // and generate a fresh 'matched' claim row every time. Only the
-    // first confirmation for a given landlord+BA pair is allowed;
-    // anything after that is rejected as a duplicate.
-    if (landlord.ba_id === baId) {
-      const { data: existingMatch, error: existingMatchErr } = await supabase
-        .from('ba_landlord_claims')
-        .select('id')
-        .eq('matched_landlord_id', landlord.id)
-        .eq('ba_id', baId)
-        .eq('match_status', 'matched')
-        .limit(1)
-        .maybeSingle();
-      if (existingMatchErr) throw existingMatchErr;
-      if (existingMatch) {
-        return res.status(409).json({
-          matched: false,
-          alreadyConfirmed: true,
-          message: 'This landlord has already been confirmed to you - no need to log them again.',
-        });
-      }
-    }
-
-    // A real account exists. If it's already tied to a DIFFERENT BA,
-    // surface a clear conflict instead of silently reassigning credit.
-    // PHASE 11 - this attempt is still logged as a claim row (match_
-    // status 'conflict', never 'matched') rather than just returning
-    // the 409 and vanishing, so the cross-BA security report's
-    // duplicatePhoneAttempts signal has the full attempt history, not
-    // just the winning claim.
-    if (landlord.ba_id && landlord.ba_id !== baId) {
-      const { data: conflictClaim, error: conflictErr } = await supabase
-        .from('ba_landlord_claims')
-        .insert({
-          ba_id: baId,
-          submitted_name: fullName,
-          submitted_phone: phone,
-          submitted_email: email,
-          submitted_location: location,
-          match_status: 'conflict',
-          matched_landlord_id: landlord.id,
-          matched_at: new Date().toISOString(),
-          referred_at_signup: false,
-        })
-        .select()
-        .single();
-      if (conflictErr) {
-        logger.error('[brandAmbassador] submitLandlordClaim: failed to log conflict attempt:', conflictErr.message);
-        captureException(conflictErr);
-      }
-
-      logActivity({
-        actorType: 'brand_ambassador',
-        actorId: baId,
-        action: 'ba_landlord_claim_conflict',
-        targetType: 'landlord',
-        targetId: landlord.id,
-        metadata: { conflictWithBaId: landlord.ba_id, claimId: conflictClaim?.id || null },
-      });
-
-      return res.status(409).json({
-        matched: false,
-        conflict: true,
-        message: 'This landlord is already linked to another ambassador.',
-      });
-    }
-
-    // referred_at_signup = true only when landlords.ba_id was ALREADY
-    // set to this same BA at registration time (Part A, the normal
-    // case now via the referral link) - false when the match is found
-    // via this phone-lookup path without a prior referral tag (still a
-    // valid claim, just a lighter audit flag later per Phase 11).
-    const referredAtSignup = landlord.ba_id === baId;
-
-    if (!landlord.ba_id) {
-      const { error: tagErr } = await supabase.from('landlords').update({ ba_id: baId }).eq('id', landlord.id);
-      if (tagErr) throw tagErr;
-    }
-
-    const { data: claim, error: claimErr } = await supabase
-      .from('ba_landlord_claims')
-      .insert({
-        ba_id: baId,
-        submitted_name: fullName,
-        submitted_phone: phone,
-        submitted_email: email,
-        submitted_location: location,
-        match_status: 'matched',
-        matched_landlord_id: landlord.id,
-        matched_at: new Date().toISOString(),
-        referred_at_signup: referredAtSignup,
-      })
-      .select()
-      .single();
-    if (claimErr) throw claimErr;
-
-    const { count: unitsCount } = await supabase
-      .from('units')
-      .select('id', { count: 'exact', head: true })
-      .eq('landlord_id', landlord.id);
-
-    logActivity({
-      actorType: 'brand_ambassador',
-      actorId: baId,
-      action: 'ba_landlord_claim_matched',
-      targetType: 'landlord',
-      targetId: landlord.id,
-      metadata: { claimId: claim.id, referredAtSignup },
-    });
-
-    return res.status(201).json({
-      matched: true,
-      claim,
-      landlord: {
-        id: landlord.id,
-        fullName: landlord.full_name,
-        phone: landlord.phone,
-        location: landlord.location,
-        county: landlord.county,
-        unitsCount: unitsCount || 0,
-        subscriptionStatus: landlord.subscription_status,
-      },
-    });
-  } catch (err) {
-    logger.error('[brandAmbassador] submitLandlordClaim error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to submit landlord claim.' });
-  }
-}
-
-// PHASE 4 - a BA's own claims, filterable by date range. Scoped
-// server-side to req.user.id (the JWT), never a client-supplied BA id
-// - see the Money & Data Integrity Rules ("a BA can only ever see
-// their own data").
-async function listMyClaims(req, res) {
+// ---------------------------------------------------------------------
+// SECTION B - "My Onboarded Landlords" is now the ONE single live
+// list, sourced directly from `landlords` filtered by ba_id, joined
+// against the qualification columns added directly onto `landlords`
+// (ba_qualification_status / ba_qualified_at - see Section C and
+// 2026-08-remove-manual-ba-claims.sql). There is no more dual "auto-
+// linked vs manually-logged" split and no ba_landlord_claims lookup -
+// landlords.ba_id is the only source of truth, set exactly once, at
+// signup, via the referral link/code.
+// ---------------------------------------------------------------------
+async function listMyOnboardedLandlords(req, res) {
   try {
     const baId = req.user.id;
     const { from, to } = req.query;
 
     let query = supabase
-      .from('ba_landlord_claims')
-      .select('*')
+      .from('landlords')
+      .select('id, full_name, phone, email, county, constituency, subscription_status, ba_qualification_status, ba_qualified_at, created_at')
       .eq('ba_id', baId)
       .order('created_at', { ascending: false });
 
     if (from) query = query.gte('created_at', from);
     if (to) query = query.lte('created_at', to);
 
-    const { data: claims, error } = await query;
+    const { data: landlordRows, error } = await query;
     if (error) throw error;
 
-    return res.json({ claims: claims || [] });
+    const landlords = (landlordRows || []).map((l) => ({
+      id: l.id,
+      fullName: l.full_name,
+      // Masked middle digits (e.g. 254***325966) - same
+      // maskPhoneMiddle utility/style used everywhere else this
+      // convention appears.
+      phone: maskPhoneMiddle(l.phone),
+      email: l.email,
+      location: [l.constituency, l.county].filter(Boolean).join(', ') || null,
+      subscriptionStatus: l.subscription_status,
+      qualificationStatus: l.ba_qualification_status || 'pending',
+      qualifiedAt: l.ba_qualified_at,
+      onboardedAt: l.created_at,
+    }));
+    return res.json({ landlords });
   } catch (err) {
-    logger.error('[brandAmbassador] listMyClaims error:', err.message);
+    logger.error('[brandAmbassador] listMyOnboardedLandlords error:', err.message);
     captureException(err);
-    return res.status(500).json({ error: 'Failed to load your claims.' });
+    return res.status(500).json({ error: 'Failed to load your onboarded landlords.' });
   }
 }
 
 // ---------------------------------------------------------------------
 // PHASE 7 - Sharing: WhatsApp Deep Link & In-App to Admin.
 //
-// Builds ONE plain-text summary of the BA's own claims for a selected
-// date/range (name, phone, match+qualification status per landlord,
-// plus a total count) and delivers it to admin two ways at once, not
-// as a choice between them:
+// Builds ONE plain-text summary of the BA's own live onboarded-
+// landlords list (Section B) for a selected date/range (name, phone,
+// qualification status per landlord, plus a total count) and delivers
+// it to admin two ways at once, not as a choice between them:
 //   1. Returns the summary text to the frontend so it can open a
 //      wa.me deep link (src/utils/whatsapp.js) pre-filled with it.
 //   2. Posts the SAME text into the existing admin notifications
@@ -1238,8 +1075,8 @@ async function listMyClaims(req, res) {
 //      2026-07-admin-notifications-support.sql). No parallel
 //      messaging system is built for this.
 //
-// Scoped server-side to req.user.id, same as listMyClaims - a BA can
-// only ever report on their own claims.
+// Scoped server-side to req.user.id, same as listMyOnboardedLandlords
+// - a BA can only ever report on their own landlords.
 //
 // PHASE 20 - the full report text below always lands as its own,
 // untouched notifications row immediately (never batched, never
@@ -1249,22 +1086,21 @@ async function listMyClaims(req, res) {
 // ("3 new BA reports - check your inbox") instead of a flood. See
 // notificationBatch.service.js and notificationBatchFlush.job.js.
 // ---------------------------------------------------------------------
-const SHARE_REPORT_MAX_LISTED_CLAIMS = 50;
+const SHARE_REPORT_MAX_LISTED_LANDLORDS = 50;
 
-function formatClaimLine(c, index) {
-  const status = `${c.match_status}${c.qualification_status ? `/${c.qualification_status}` : ''}`;
-  return `${index + 1}. ${c.submitted_name} — ${c.submitted_phone} — ${status}`;
+function formatLandlordLine(l, index) {
+  return `${index + 1}. ${l.full_name} — ${l.phone} — ${l.ba_qualification_status || 'pending'}`;
 }
 
-function buildClaimsReportSummary(ba, claims, { from, to } = {}) {
+function buildOnboardedLandlordsReportSummary(ba, landlords, { from, to } = {}) {
   const periodLabel = from || to ? `${from ? from.slice(0, 10) : '…'} to ${to ? to.slice(0, 10) : '…'}` : 'all time';
-  const lines = claims.slice(0, SHARE_REPORT_MAX_LISTED_CLAIMS).map(formatClaimLine);
-  const overflow = claims.length - lines.length;
+  const lines = landlords.slice(0, SHARE_REPORT_MAX_LISTED_LANDLORDS).map(formatLandlordLine);
+  const overflow = landlords.length - lines.length;
 
   const header = `BA report from ${ba.full_name}${ba.ba_code ? ` (${ba.ba_code})` : ''} — ${periodLabel}`;
   const body = [header, '', ...lines];
   if (overflow > 0) body.push(`…and ${overflow} more (full list in admin inbox).`);
-  body.push('', `Total: ${claims.length} landlord${claims.length === 1 ? '' : 's'}`);
+  body.push('', `Total: ${landlords.length} landlord${landlords.length === 1 ? '' : 's'}`);
 
   return body.join('\n');
 }
@@ -1283,21 +1119,21 @@ async function shareClaimsReport(req, res) {
     if (!ba) return res.status(404).json({ error: 'Brand Ambassador profile not found.' });
 
     let query = supabase
-      .from('ba_landlord_claims')
-      .select('submitted_name, submitted_phone, match_status, qualification_status, created_at')
+      .from('landlords')
+      .select('full_name, phone, ba_qualification_status, created_at')
       .eq('ba_id', baId)
       .order('created_at', { ascending: false });
     if (from) query = query.gte('created_at', from);
     if (to) query = query.lte('created_at', to);
 
-    const { data: claims, error: claimsErr } = await query;
-    if (claimsErr) throw claimsErr;
+    const { data: landlords, error: landlordsErr } = await query;
+    if (landlordsErr) throw landlordsErr;
 
-    if (!claims || claims.length === 0) {
-      return res.status(400).json({ error: 'No claims logged in this period to share.' });
+    if (!landlords || landlords.length === 0) {
+      return res.status(400).json({ error: 'No onboarded landlords in this period to share.' });
     }
 
-    const summary = buildClaimsReportSummary(ba, claims, { from, to });
+    const summary = buildOnboardedLandlordsReportSummary(ba, landlords, { from, to });
 
     // Best-effort, same as every other notify() call site - a hiccup
     // here shouldn't stop the BA from still sending it themselves via
@@ -1308,7 +1144,7 @@ async function shareClaimsReport(req, res) {
     // report).
     try {
       await notify('admin', 'super-admin', null, summary, {
-        title: `BA report: ${ba.full_name} (${claims.length} landlord${claims.length === 1 ? '' : 's'})`,
+        title: `BA report: ${ba.full_name} (${landlords.length} landlord${landlords.length === 1 ? '' : 's'})`,
         category: 'ba_report',
         urgent: false,
       });
@@ -1330,7 +1166,7 @@ async function shareClaimsReport(req, res) {
           batchKey: 'admin_ba_report_ping',
           eventType: 'ba_report',
           fragment: ba.full_name,
-          metadata: { baId, count: claims.length },
+          metadata: { baId, count: landlords.length },
         },
         () =>
           sendPushToRecipient('admin', 'super-admin', {
@@ -1343,88 +1179,11 @@ async function shareClaimsReport(req, res) {
       captureException(batchErr);
     }
 
-    return res.json({ summary, count: claims.length });
+    return res.json({ summary, count: landlords.length });
   } catch (err) {
     logger.error('[brandAmbassador] shareClaimsReport error:', err.message);
     captureException(err);
     return res.status(500).json({ error: 'Failed to share your report.' });
-  }
-}
-
-// PHASE 4 - editing an already-created claim's submitted fields
-// (name/phone/location) after the fact. Every edit appends to
-// edit_history rather than silently overwriting it - this is what
-// powers the admin reconciliation tool in Phase 11. Scoped to the
-// claim's owning BA via the JWT, same as listMyClaims.
-async function editMyClaim(req, res) {
-  try {
-    const baId = req.user.id;
-    const { id } = req.params;
-    const { fullName, phone, email, location } = req.body;
-
-    const { data: claim, error: findErr } = await supabase
-      .from('ba_landlord_claims')
-      .select('*')
-      .eq('id', id)
-      .eq('ba_id', baId)
-      .maybeSingle();
-    if (findErr) throw findErr;
-    if (!claim) return res.status(404).json({ error: 'Claim not found.' });
-
-    const editedAt = new Date().toISOString();
-    const editHistory = Array.isArray(claim.edit_history) ? [...claim.edit_history] : [];
-    const updates = {};
-
-    if (fullName !== undefined && fullName !== claim.submitted_name) {
-      editHistory.push({ editedAt, editedField: 'submitted_name', oldValue: claim.submitted_name, newValue: fullName });
-      updates.submitted_name = fullName;
-    }
-    if (phone !== undefined) {
-      let normalizedPhone;
-      try {
-        normalizedPhone = normalizePhoneOrThrow(phone, 'Phone number');
-      } catch (phoneErr) {
-        return res.status(400).json({ error: phoneErr.message });
-      }
-      if (normalizedPhone !== claim.submitted_phone) {
-        editHistory.push({ editedAt, editedField: 'submitted_phone', oldValue: claim.submitted_phone, newValue: normalizedPhone });
-        updates.submitted_phone = normalizedPhone;
-      }
-    }
-    if (email !== undefined) {
-      const normalizedEmail = email ? String(email).trim().toLowerCase() : null;
-      if (normalizedEmail && !isValidEmail(normalizedEmail)) {
-        return res.status(400).json({ error: 'Please enter a valid email address.' });
-      }
-      if (normalizedEmail !== claim.submitted_email) {
-        editHistory.push({ editedAt, editedField: 'submitted_email', oldValue: claim.submitted_email, newValue: normalizedEmail });
-        updates.submitted_email = normalizedEmail;
-      }
-    }
-    if (location !== undefined && location !== claim.submitted_location) {
-      editHistory.push({ editedAt, editedField: 'submitted_location', oldValue: claim.submitted_location, newValue: location });
-      updates.submitted_location = location;
-    }
-
-    if (Object.keys(updates).length === 0) {
-      return res.json({ claim });
-    }
-
-    updates.edit_history = editHistory;
-
-    const { data: updated, error: updateErr } = await supabase
-      .from('ba_landlord_claims')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single();
-    if (updateErr) throw updateErr;
-
-    return res.json({ claim: updated });
-  } catch (err) {
-    logger.error('[brandAmbassador] editMyClaim error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to update claim.' });
   }
 }
 
@@ -1476,24 +1235,30 @@ async function getBaStats(req, res) {
     const windowStart = new Date();
     windowStart.setUTCDate(windowStart.getUTCDate() - STATS_WINDOW_DAYS);
 
-    const [{ data: ba, error: baErr }, { data: claims, error: claimsErr }] = await Promise.all([
+    const [{ data: ba, error: baErr }, { data: landlordRows, error: landlordsErr }] = await Promise.all([
       supabase
         .from('brand_ambassadors')
         .select('id, current_commission_percent')
         .eq('id', baId)
         .maybeSingle(),
+      // SECTION B/C: onboarding counts/trend AND qualification status
+      // both come LIVE from `landlords` now - ba_id (set the instant a
+      // landlord signs up via this BA's referral link/code) and
+      // ba_qualification_status (set by the qualification job, see
+      // Section C / baQualification.job.js). No separate claims table
+      // to join against anymore.
       supabase
-        .from('ba_landlord_claims')
-        .select('created_at, match_status, qualification_status')
+        .from('landlords')
+        .select('id, created_at, ba_qualification_status')
         .eq('ba_id', baId)
         .gte('created_at', windowStart.toISOString())
         .order('created_at', { ascending: true }),
     ]);
     if (baErr) throw baErr;
-    if (claimsErr) throw claimsErr;
+    if (landlordsErr) throw landlordsErr;
 
-    const rows = claims || [];
-    const matchedRows = rows.filter((c) => c.match_status === 'matched');
+    const landlordsInWindow = landlordRows || [];
+    const qualifiedRows = landlordsInWindow.filter((l) => l.ba_qualification_status === 'qualified');
 
     const now = new Date();
     const todayKey = dayKey(now);
@@ -1503,14 +1268,14 @@ async function getBaStats(req, res) {
     let onboardedToday = 0;
     let onboardedThisWeek = 0;
     let onboardedThisMonth = 0;
-    let qualifiedCount = 0;
+    const qualifiedCount = qualifiedRows.length;
 
     const byDay = new Map(); // last 14 days, for the dashboard trend chart
     const byWeek = new Map(); // last 8 weeks, for the Stats section
     const byMonth = new Map(); // last 6 months, for the Stats section
 
-    for (const c of matchedRows) {
-      const created = new Date(c.created_at);
+    for (const l of landlordsInWindow) {
+      const created = new Date(l.created_at);
       const dKey = dayKey(created);
       const wKey = weekKey(created);
       const mKey = monthKey(created);
@@ -1518,7 +1283,6 @@ async function getBaStats(req, res) {
       if (dKey === todayKey) onboardedToday += 1;
       if (wKey === thisWeekKey) onboardedThisWeek += 1;
       if (mKey === thisMonthKey) onboardedThisMonth += 1;
-      if (c.qualification_status === 'qualified' || c.qualification_status === 'paid') qualifiedCount += 1;
 
       byDay.set(dKey, (byDay.get(dKey) || 0) + 1);
       byWeek.set(wKey, (byWeek.get(wKey) || 0) + 1);
@@ -1552,57 +1316,32 @@ async function getBaStats(req, res) {
       monthlyRollup.push({ label: d.toLocaleDateString('en-GB', { month: 'short' }), value: byMonth.get(key) || 0 });
     }
 
-    const totalMatched = matchedRows.length;
+    const totalMatched = landlordsInWindow.length;
     const qualificationRate = totalMatched > 0 ? Math.round((qualifiedCount / totalMatched) * 1000) / 10 : 0;
 
-    // Next-tier progress. Prefer a ba_override ladder for this BA if
-    // one exists, otherwise the global ladder (same precedence Phase
-    // 10's qualification job uses for payout_rules/commission_tiers -
-    // an override, when present, fully replaces the global ladder for
-    // that BA rather than merging with it).
-    const currentCommissionPercent = ba?.current_commission_percent || 0;
-    let nextTier = null;
+    // SECTION E: commission is now a recurring percentage of each
+    // qualifying landlord's actual payment, not a milestone ladder -
+    // commission_tiers no longer exists. currentCommissionPercent here
+    // is the rate that would apply to a payment landing right now
+    // (BA override, if one exists, otherwise the global rate) -
+    // resolveApplicableRate is the exact same lookup the payment path
+    // itself uses, so this always matches reality.
+    let currentCommissionPercent = 0;
+    let thisMonthCommissionEarned = 0;
+    let lifetimeCommissionEarned = 0;
     try {
-      const { data: overrideTiers } = await supabase
-        .from('commission_tiers')
-        .select('target_qualified_landlords, commission_percent')
-        .eq('scope', 'ba_override')
-        .eq('ba_id', baId)
-        .order('target_qualified_landlords', { ascending: true });
+      const rate = await resolveApplicableRate(baId, new Date());
+      currentCommissionPercent = rate ? rate.percentage : 0;
 
-      let ladder = overrideTiers || [];
-      if (ladder.length === 0) {
-        const { data: globalTiers } = await supabase
-          .from('commission_tiers')
-          .select('target_qualified_landlords, commission_percent')
-          .eq('scope', 'global')
-          .order('target_qualified_landlords', { ascending: true });
-        ladder = globalTiers || [];
-      }
-
-      // Need the BA's all-time qualified count (not just this
-      // STATS_WINDOW_DAYS window) to place them correctly on the
-      // ladder - a small, separate count query, since tier progress
-      // must reflect lifetime standing, not a rolling window.
-      const { count: lifetimeQualified } = await supabase
-        .from('ba_landlord_claims')
-        .select('id', { count: 'exact', head: true })
-        .eq('ba_id', baId)
-        .in('qualification_status', ['qualified', 'paid']);
-
-      const next = ladder.find((t) => t.target_qualified_landlords > (lifetimeQualified || 0));
-      if (next) {
-        nextTier = {
-          targetQualifiedLandlords: next.target_qualified_landlords,
-          commissionPercent: next.commission_percent,
-          currentQualifiedLandlords: lifetimeQualified || 0,
-        };
-      }
-    } catch (tierErr) {
-      // Commission tiers may not be configured yet (Phase 10 not
-      // built/seeded) - the dashboard should still render without
-      // tier progress rather than fail the whole stats call.
-      logger.warn('[brandAmbassador] getBaStats: tier lookup skipped:', tierErr.message);
+      const cycle = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+      const [{ data: monthRows }, { data: lifetimeRows }] = await Promise.all([
+        supabase.from('ba_commission_earnings').select('commission_amount').eq('ba_id', baId).eq('billing_cycle', cycle),
+        supabase.from('ba_commission_earnings').select('commission_amount').eq('ba_id', baId),
+      ]);
+      thisMonthCommissionEarned = (monthRows || []).reduce((sum, r) => sum + Number(r.commission_amount || 0), 0);
+      lifetimeCommissionEarned = (lifetimeRows || []).reduce((sum, r) => sum + Number(r.commission_amount || 0), 0);
+    } catch (rateErr) {
+      logger.warn('[brandAmbassador] getBaStats: commission rate/earnings lookup skipped:', rateErr.message);
     }
 
     return res.json({
@@ -1612,7 +1351,8 @@ async function getBaStats(req, res) {
       qualifiedCount,
       qualificationRate,
       currentCommissionPercent,
-      nextTier,
+      thisMonthCommissionEarned,
+      lifetimeCommissionEarned,
       trend,
       weeklyRollup,
       monthlyRollup,
@@ -1674,18 +1414,21 @@ async function getLeaderboard(req, res) {
     const activeBas = bas || [];
     const activeIds = activeBas.map((b) => b.id);
 
-    let claimsQuery = supabase
-      .from('ba_landlord_claims')
-      .select('ba_id, qualification_status, qualified_at')
+    // SECTION B/C: qualified counts now come straight from
+    // `landlords` (ba_id + ba_qualification_status/ba_qualified_at) -
+    // no more ba_landlord_claims join.
+    let qualifiedQuery = supabase
+      .from('landlords')
+      .select('ba_id, ba_qualification_status, ba_qualified_at')
       .in('ba_id', activeIds.length ? activeIds : ['00000000-0000-0000-0000-000000000000'])
-      .in('qualification_status', ['qualified', 'paid']);
-    if (periodStart) claimsQuery = claimsQuery.gte('qualified_at', periodStart.toISOString());
-    const { data: claims, error: claimsErr } = await claimsQuery;
-    if (claimsErr) throw claimsErr;
+      .eq('ba_qualification_status', 'qualified');
+    if (periodStart) qualifiedQuery = qualifiedQuery.gte('ba_qualified_at', periodStart.toISOString());
+    const { data: qualifiedLandlords, error: qualifiedErr } = await qualifiedQuery;
+    if (qualifiedErr) throw qualifiedErr;
 
     const countByBa = new Map();
-    for (const c of claims || []) {
-      countByBa.set(c.ba_id, (countByBa.get(c.ba_id) || 0) + 1);
+    for (const l of qualifiedLandlords || []) {
+      countByBa.set(l.ba_id, (countByBa.get(l.ba_id) || 0) + 1);
     }
 
     // Full ranking across every active BA (opted-in or not) - this is
@@ -1718,6 +1461,50 @@ async function getLeaderboard(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// SECTION E - the BA's own recurring commission earnings, one row per
+// completed landlord subscription payment (ba_commission_earnings).
+// Scoped server-side to req.user.id, never a client-supplied BA id -
+// same convention as every other /me/* route in this file. Optional
+// ?cycle=YYYY-MM filters to one billing cycle; otherwise the most
+// recent 100 rows across all cycles.
+// ---------------------------------------------------------------------
+async function getMyCommissionEarnings(req, res) {
+  try {
+    const baId = req.user.id;
+    const { cycle } = req.query;
+
+    let query = supabase
+      .from('ba_commission_earnings')
+      .select('id, landlord_id, payment_amount, percentage_applied, commission_amount, billing_cycle, paid_at, landlords(full_name)')
+      .eq('ba_id', baId)
+      .order('paid_at', { ascending: false })
+      .limit(100);
+    if (cycle) query = query.eq('billing_cycle', cycle);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const rows = (data || []).map((r) => ({
+      id: r.id,
+      landlordName: r.landlords?.full_name || 'Former landlord',
+      paymentAmount: Number(r.payment_amount),
+      percentageApplied: Number(r.percentage_applied),
+      commissionAmount: Number(r.commission_amount),
+      billingCycle: r.billing_cycle,
+      paidAt: r.paid_at,
+    }));
+
+    const total = rows.reduce((sum, r) => sum + r.commissionAmount, 0);
+
+    return res.json({ earnings: rows, total });
+  } catch (err) {
+    logger.error('[brandAmbassador] getMyCommissionEarnings error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load your commission earnings.' });
+  }
+}
+
 module.exports = {
   requestBaEmailVerification,
   confirmBaEmailVerification,
@@ -1736,11 +1523,10 @@ module.exports = {
   updateMyProfile,
   updateLeaderboardOptIn,
   resolveReferralCode,
-  submitLandlordClaim,
-  listMyClaims,
+  listMyOnboardedLandlords,
   shareClaimsReport,
-  editMyClaim,
   getBaStats,
   getLeaderboard,
+  getMyCommissionEarnings,
   REMINDER_THRESHOLD_HOURS,
 };

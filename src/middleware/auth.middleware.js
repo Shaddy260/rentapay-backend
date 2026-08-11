@@ -465,10 +465,11 @@ function requireBrandAmbassador(req, res, next) {
 
 /**
  * A BA can only ever see their own data - enforced server-side, not
- * just hidden in the UI. Every BA-scoped controller (listMyClaims,
- * getBaStats, dashboard totals, referral link, earnings statement)
- * should derive the BA id from this helper, never from a client-
- * supplied id/param, mirroring effectiveLandlordId's role above.
+ * just hidden in the UI. Every BA-scoped controller
+ * (listMyOnboardedLandlords, getBaStats, dashboard totals, referral
+ * link, earnings statement) should derive the BA id from this helper,
+ * never from a client-supplied id/param, mirroring effectiveLandlordId's
+ * role above.
  */
 function effectiveBaId(req) {
   return req.user.id;

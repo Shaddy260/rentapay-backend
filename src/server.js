@@ -114,7 +114,49 @@ app.use(helmet());
 // transfer means a faster-feeling app with zero change to the data
 // itself.
 app.use(compression());
-app.use(cors());
+
+// SECURITY FIX (pre-deploy review): this used to be a bare cors() call,
+// which has no allowlist - it reflects whatever Origin header the
+// request sends and echoes it back as Access-Control-Allow-Origin,
+// meaning literally any website can call this API cross-origin.
+// Since auth here is a Bearer token (not a cookie), that's not a CSRF
+// hole by itself, but it's still unnecessary exposure on an API that
+// moves real M-Pesa money - a compromised/malicious third-party page
+// has no business being able to hit these endpoints even if it
+// somehow got hold of a token via XSS elsewhere.
+//
+// FRONTEND_URL already exists as an env var (used everywhere else in
+// this codebase to build links back to the frontend - see
+// brandAmbassador.controller.js, notificationTemplates.js, etc.), so
+// we reuse it here rather than inventing a second variable. Supports
+// a comma-separated list so staging/prod/a custom domain can all be
+// allowed at once, e.g. FRONTEND_URL=https://rentapay.co.ke,https://staging.rentapay.co.ke
+// In development (no FRONTEND_URL set, or NODE_ENV !== 'production'),
+// we fall back to allowing any origin so `vite dev` / Postman / local
+// testing keeps working without extra setup.
+const allowedOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin(origin, callback) {
+    // No Origin header (curl, server-to-server, Daraja's own callback
+    // hitting our webhook) - not a browser CORS request, always allow.
+    if (!origin) return callback(null, true);
+
+    if (process.env.NODE_ENV !== 'production' || allowedOrigins.length === 0) {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+
+    logger.warn('[server] blocked CORS request from disallowed origin', { origin });
+    return callback(new Error('Not allowed by CORS'));
+  },
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Gives every request a requestId, tags all logging done while handling

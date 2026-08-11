@@ -416,14 +416,17 @@ function generateEarningsStatementPdf(res, { ba, claims, totals, periodLabel, ge
     doc.text(c.status === 'paid' ? 'Paid' : 'Qualified', colX.status, rowY);
     doc.moveDown(0.9);
 
-    // Item 10 - transparency: a small grey line under the row naming
-    // which unit bracket / commission tier (if any) produced the
-    // amounts above, so this isn't just a final number.
+    // Item 10 / ITEM 13 - transparency: a small grey line under the row
+    // naming which unit bracket / percentage basis / commission tier
+    // (if any) produced the amounts above, so this isn't just a final
+    // number.
     const bracket = c.breakdown?.unitBracket;
+    const percentage = c.breakdown?.percentage;
     const tier = c.breakdown?.commissionTier;
-    if (bracket || tier) {
+    if (bracket || percentage || tier) {
       const parts = [];
-      if (bracket) parts.push(`Base: ${bracket.minUnits}-${bracket.maxUnits ?? '+'} units bracket (KES ${Number(bracket.amount).toLocaleString()})`);
+      if (percentage) parts.push(`Base: ${percentage.rate}% of KES ${Number(percentage.basisAmount).toLocaleString()} qualifying payment`);
+      else if (bracket) parts.push(`Base: ${bracket.minUnits}-${bracket.maxUnits ?? '+'} units bracket (KES ${Number(bracket.amount).toLocaleString()})`);
       if (tier) parts.push(`Commission: ${tier.commissionPercent}% tier (crossed at ${tier.targetQualifiedLandlords} qualified)`);
       doc.fontSize(7.5).fillColor('#999').text(parts.join('  ·  '), colX.landlord, doc.y, { width: 495 });
       doc.fontSize(9).fillColor('#333');

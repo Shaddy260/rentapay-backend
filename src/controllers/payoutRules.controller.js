@@ -1,53 +1,68 @@
 // src/controllers/payoutRules.controller.js
 //
-// BUILD SPEC PHASE 10 - Payout Rules Engine, Qualification & Commission
-// Tiers: admin-only CRUD for the single global payout_rules row, an
-// optional per-BA override row, the global commission_tiers ladder,
-// and an optional per-BA override ladder. Every change is logged via
-// activityLog.service.js with who/when/before/after, same convention
-// admin.controller.js already uses for subscription edits.
+// Consolidated Change Instructions - Section E (percentage commission,
+// HARD CUTOVER replacing the old fixed-price payout_rules /
+// commission_tiers / unit_pricing_tiers model entirely - see
+// 2026-08-section-e-recurring-percentage-commission.sql).
 //
-// Read side (getPayoutRules/getCommissionTiers) intentionally returns
-// BOTH the global row/ladder and, if present, a specific BA's override,
-// so the admin UI can show "using global" vs "custom override" without
-// a second round trip.
+// payout_rules is now a pure, append-only PERCENTAGE-RATE HISTORY per
+// scope (global / ba_override): setting a new rate always INSERTS a
+// new row with its own effective_from rather than overwriting the
+// current one. The rate applied to any given payment = whichever row
+// has the latest effective_from at or before that payment's paid_at
+// (see baCommission.service.js's resolveApplicableRate - the same
+// lookup, reused here for the read-side "what's the current/upcoming
+// rate" views).
+//
+// Every rate change (global or BA-specific) triggers an immediate
+// in-app + push notification to affected BA(s) - see
+// baCommission.service.js's notifyRateChange.
+//
+// Commission_tiers and unit_pricing_tiers endpoints that used to live
+// in this file are GONE - those tables no longer exist (hard cutover).
+// Qualification-dry-run stays here unchanged (Section C, untouched by
+// this section).
 
 const supabase = require('../config/supabase');
 const { logActivity } = require('../services/activityLog.service');
 const { captureException } = require('../services/sentry.service');
 const { runBaQualificationCheck } = require('../jobs/baQualification.job');
+const { notifyRateChange } = require('../services/baCommission.service');
 const logger = require('../utils/logger');
 
 const ADMIN_ACTOR_ID = 'super-admin';
 
 // ---------------------------------------------------------------------
-// Payout rules (amount / required_consecutive_months / min_units)
+// Percentage commission rate - global default + optional per-BA
+// override, each an append-only history.
 // ---------------------------------------------------------------------
+
+async function currentAndUpcoming(scope, baId) {
+  let query = supabase.from('payout_rules').select('*').eq('scope', scope).order('effective_from', { ascending: false });
+  query = baId ? query.eq('ba_id', baId) : query.is('ba_id', null);
+  const { data, error } = await query;
+  if (error) throw error;
+
+  const rows = data || [];
+  const now = new Date();
+  const current = rows.find((r) => new Date(r.effective_from) <= now) || null;
+  const upcoming = rows.filter((r) => new Date(r.effective_from) > now).sort((a, b) => new Date(a.effective_from) - new Date(b.effective_from));
+  const history = rows.filter((r) => new Date(r.effective_from) <= now);
+
+  return { current, upcoming, history };
+}
 
 async function getPayoutRules(req, res) {
   try {
     const { baId } = req.query;
 
-    const { data: global, error: globalErr } = await supabase
-      .from('payout_rules')
-      .select('*')
-      .eq('scope', 'global')
-      .maybeSingle();
-    if (globalErr) throw globalErr;
-
+    const global = await currentAndUpcoming('global', null);
     let override = null;
     if (baId) {
-      const { data, error } = await supabase
-        .from('payout_rules')
-        .select('*')
-        .eq('scope', 'ba_override')
-        .eq('ba_id', baId)
-        .maybeSingle();
-      if (error) throw error;
-      override = data || null;
+      override = await currentAndUpcoming('ba_override', baId);
     }
 
-    return res.json({ global: global || null, override });
+    return res.json({ global, override });
   } catch (err) {
     logger.error('[payoutRules] getPayoutRules error:', err.message);
     captureException(err);
@@ -55,82 +70,93 @@ async function getPayoutRules(req, res) {
   }
 }
 
+function validatePercentagePayload(body) {
+  const percentage = Number(body.percentage);
+  if (Number.isNaN(percentage) || percentage < 0 || percentage > 100) {
+    return { error: 'A valid commission percentage between 0 and 100 is required.' };
+  }
+
+  // "Immediately, or from a specific future date (date picker, default
+  // = today)" - a missing/blank effectiveFrom means "now".
+  let effectiveFrom = new Date();
+  if (body.effectiveFrom) {
+    const parsed = new Date(body.effectiveFrom);
+    if (Number.isNaN(parsed.getTime())) {
+      return { error: 'effectiveFrom must be a valid date.' };
+    }
+    effectiveFrom = parsed;
+  }
+
+  return { percentage, effectiveFrom };
+}
+
 async function updateGlobalPayoutRule(req, res) {
   try {
-    const { amount, requiredConsecutiveMonths, minUnits } = req.body;
-    if (amount == null || Number.isNaN(Number(amount)) || Number(amount) < 0) {
-      return res.status(400).json({ error: 'A valid, non-negative amount is required.' });
-    }
-    const months = requiredConsecutiveMonths != null ? parseInt(requiredConsecutiveMonths, 10) : 2;
-    const minUnitsVal = minUnits != null ? parseInt(minUnits, 10) : 1;
-    if (!Number.isInteger(months) || months < 1) {
-      return res.status(400).json({ error: 'requiredConsecutiveMonths must be a positive integer.' });
-    }
-    if (!Number.isInteger(minUnitsVal) || minUnitsVal < 1) {
-      return res.status(400).json({ error: 'minUnits must be a positive integer.' });
-    }
+    const parsed = validatePercentagePayload(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const { percentage, effectiveFrom } = parsed;
 
-    const { data: existing, error: fetchErr } = await supabase
+    const { current: existingCurrent } = await currentAndUpcoming('global', null);
+
+    const { data: saved, error: insertErr } = await supabase
       .from('payout_rules')
-      .select('*')
-      .eq('scope', 'global')
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-
-    const payload = {
-      scope: 'global',
-      ba_id: null,
-      amount: Number(amount),
-      required_consecutive_months: months,
-      min_units: minUnitsVal,
-      updated_at: new Date().toISOString(),
-    };
-
-    let saved;
-    if (existing) {
-      const { data, error } = await supabase.from('payout_rules').update(payload).eq('id', existing.id).select().single();
-      if (error) throw error;
-      saved = data;
-    } else {
-      const { data, error } = await supabase.from('payout_rules').insert(payload).select().single();
-      if (error) throw error;
-      saved = data;
-    }
+      .insert({
+        scope: 'global',
+        ba_id: null,
+        percentage,
+        effective_from: effectiveFrom.toISOString(),
+        set_by_admin_id: ADMIN_ACTOR_ID,
+      })
+      .select()
+      .single();
+    if (insertErr) throw insertErr;
 
     logActivity({
       actorType: 'admin',
       actorId: ADMIN_ACTOR_ID,
-      action: 'payout_rule_global_updated',
+      action: 'payout_rule_global_rate_set',
       targetType: 'payout_rules',
       targetId: saved.id,
       ipAddress: req.ip,
-      metadata: { before: existing || null, after: saved },
+      metadata: { before: existingCurrent, after: saved },
+    });
+
+    // Every rate change triggers an immediate notification, in-app +
+    // push, to every affected BA - fire-and-forget-with-logging, never
+    // blocks the admin's save.
+    notifyRateChange({
+      scope: 'global',
+      oldPercentage: existingCurrent ? Number(existingCurrent.percentage) : null,
+      newPercentage: percentage,
+      effectiveFrom,
+    }).catch((err) => {
+      logger.error('[payoutRules] global rate-change notification failed:', err.message);
+      captureException(err);
     });
 
     return res.json({ rule: saved });
   } catch (err) {
     logger.error('[payoutRules] updateGlobalPayoutRule error:', err.message);
     captureException(err);
-    return res.status(500).json({ error: 'Failed to update the global payout rule.' });
+    return res.status(500).json({ error: 'Failed to update the global commission rate.' });
   }
 }
 
 async function setBaPayoutOverride(req, res) {
   try {
     const { baId } = req.params;
-    const { amount, requiredConsecutiveMonths, minUnits, clear } = req.body;
+    const { clear } = req.body;
 
-    const { data: existing, error: fetchErr } = await supabase
-      .from('payout_rules')
-      .select('*')
-      .eq('scope', 'ba_override')
-      .eq('ba_id', baId)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
+    const { current: existingCurrent, history } = await currentAndUpcoming('ba_override', baId);
 
     if (clear) {
-      if (existing) {
-        const { error } = await supabase.from('payout_rules').delete().eq('id', existing.id);
+      // No partial "unlink one rate" concept - clearing an override
+      // means this BA reverts fully to the global rate going forward;
+      // the override's own history rows are removed entirely so a
+      // stale row can never accidentally resurface in a future
+      // resolveApplicableRate lookup.
+      if (history.length > 0 || existingCurrent) {
+        const { error } = await supabase.from('payout_rules').delete().eq('scope', 'ba_override').eq('ba_id', baId);
         if (error) throw error;
       }
       logActivity({
@@ -140,409 +166,93 @@ async function setBaPayoutOverride(req, res) {
         targetType: 'brand_ambassador',
         targetId: baId,
         ipAddress: req.ip,
-        metadata: { before: existing || null, after: null },
+        metadata: { before: existingCurrent, after: null },
       });
+
+      const { current: globalCurrent } = await currentAndUpcoming('global', null);
+      notifyRateChange({
+        scope: 'ba_override',
+        baId,
+        oldPercentage: existingCurrent ? Number(existingCurrent.percentage) : null,
+        newPercentage: globalCurrent ? Number(globalCurrent.percentage) : 0,
+        effectiveFrom: new Date(),
+      }).catch((err) => {
+        logger.error('[payoutRules] override-clear notification failed:', err.message);
+        captureException(err);
+      });
+
       return res.json({ override: null });
     }
 
-    if (amount == null || Number.isNaN(Number(amount)) || Number(amount) < 0) {
-      return res.status(400).json({ error: 'A valid, non-negative amount is required.' });
-    }
-    const months = requiredConsecutiveMonths != null ? parseInt(requiredConsecutiveMonths, 10) : 2;
-    const minUnitsVal = minUnits != null ? parseInt(minUnits, 10) : 1;
+    const parsed = validatePercentagePayload(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const { percentage, effectiveFrom } = parsed;
 
-    const payload = {
-      scope: 'ba_override',
-      ba_id: baId,
-      amount: Number(amount),
-      required_consecutive_months: months,
-      min_units: minUnitsVal,
-      updated_at: new Date().toISOString(),
-    };
-
-    let saved;
-    if (existing) {
-      const { data, error } = await supabase.from('payout_rules').update(payload).eq('id', existing.id).select().single();
-      if (error) throw error;
-      saved = data;
-    } else {
-      const { data, error } = await supabase.from('payout_rules').insert(payload).select().single();
-      if (error) throw error;
-      saved = data;
-    }
+    const { data: saved, error: insertErr } = await supabase
+      .from('payout_rules')
+      .insert({
+        scope: 'ba_override',
+        ba_id: baId,
+        percentage,
+        effective_from: effectiveFrom.toISOString(),
+        set_by_admin_id: ADMIN_ACTOR_ID,
+      })
+      .select()
+      .single();
+    if (insertErr) throw insertErr;
 
     logActivity({
       actorType: 'admin',
       actorId: ADMIN_ACTOR_ID,
-      action: 'payout_rule_ba_override_set',
+      action: 'payout_rule_ba_override_rate_set',
       targetType: 'brand_ambassador',
       targetId: baId,
       ipAddress: req.ip,
-      metadata: { before: existing || null, after: saved },
+      metadata: { before: existingCurrent, after: saved },
+    });
+
+    notifyRateChange({
+      scope: 'ba_override',
+      baId,
+      oldPercentage: existingCurrent ? Number(existingCurrent.percentage) : null,
+      newPercentage: percentage,
+      effectiveFrom,
+    }).catch((err) => {
+      logger.error('[payoutRules] override rate-change notification failed:', err.message);
+      captureException(err);
     });
 
     return res.json({ override: saved });
   } catch (err) {
     logger.error('[payoutRules] setBaPayoutOverride error:', err.message);
     captureException(err);
-    return res.status(500).json({ error: 'Failed to update this BA\'s payout override.' });
+    return res.status(500).json({ error: "Failed to update this BA's commission rate override." });
   }
 }
 
-// ---------------------------------------------------------------------
-// Commission tiers ladder
-// ---------------------------------------------------------------------
-
-function validateLadder(tiers) {
-  if (!Array.isArray(tiers) || tiers.length === 0) {
-    return 'At least one tier is required.';
-  }
-  const seen = new Set();
-  for (const t of tiers) {
-    const target = parseInt(t.targetQualifiedLandlords, 10);
-    const pct = Number(t.commissionPercent);
-    if (!Number.isInteger(target) || target < 1) return 'Each tier needs a positive whole-number target.';
-    if (Number.isNaN(pct) || pct < 0 || pct > 100) return 'Each tier needs a commission percent between 0 and 100.';
-    if (seen.has(target)) return `Duplicate target threshold: ${target}.`;
-    seen.add(target);
-  }
-  return null;
-}
-
-async function getCommissionTiers(req, res) {
+// Full history for one scope, newest first - powers the "rate applied
+// per landlord's payment (resolved... may differ across landlords
+// within the same BA if a rate changed mid-cycle)" transparency called
+// for by Section F/G, and a simple audit trail in the admin UI itself.
+async function getPayoutRuleHistory(req, res) {
   try {
     const { baId } = req.query;
-
-    const { data: global, error: globalErr } = await supabase
-      .from('commission_tiers')
-      .select('*')
-      .eq('scope', 'global')
-      .order('target_qualified_landlords', { ascending: true });
-    if (globalErr) throw globalErr;
-
-    let override = null;
-    if (baId) {
-      const { data, error } = await supabase
-        .from('commission_tiers')
-        .select('*')
-        .eq('scope', 'ba_override')
-        .eq('ba_id', baId)
-        .order('target_qualified_landlords', { ascending: true });
-      if (error) throw error;
-      override = data && data.length > 0 ? data : null;
-    }
-
-    return res.json({ global: global || [], override });
+    const scope = baId ? 'ba_override' : 'global';
+    let query = supabase.from('payout_rules').select('*').eq('scope', scope).order('effective_from', { ascending: false });
+    query = baId ? query.eq('ba_id', baId) : query.is('ba_id', null);
+    const { data, error } = await query;
+    if (error) throw error;
+    return res.json({ history: data || [] });
   } catch (err) {
-    logger.error('[payoutRules] getCommissionTiers error:', err.message);
+    logger.error('[payoutRules] getPayoutRuleHistory error:', err.message);
     captureException(err);
-    return res.status(500).json({ error: 'Failed to load commission tiers.' });
-  }
-}
-
-async function updateCommissionTiers(req, res) {
-  try {
-    const { tiers } = req.body;
-    const validationError = validateLadder(tiers);
-    if (validationError) return res.status(400).json({ error: validationError });
-
-    const { data: existing, error: fetchErr } = await supabase
-      .from('commission_tiers')
-      .select('*')
-      .eq('scope', 'global');
-    if (fetchErr) throw fetchErr;
-
-    // Replace the whole global ladder atomically-ish: delete then
-    // insert. Simpler and safer than trying to diff/upsert individual
-    // rows against arbitrary target changes, and this table has no
-    // other rows referencing it by id that would break (claims store
-    // commission_tier_id but via ON DELETE SET NULL, and only ever
-    // point at a tier AFTER it was crossed - a currently-unconfigured
-    // ladder being replaced has no qualified claims pointing at it yet
-    // in the normal flow; historical claims keep their own snapshot
-    // commission_bonus_amount regardless of what happens to the tier
-    // row later).
-    const { error: deleteErr } = await supabase.from('commission_tiers').delete().eq('scope', 'global');
-    if (deleteErr) throw deleteErr;
-
-    const rows = tiers.map((t) => ({
-      scope: 'global',
-      ba_id: null,
-      target_qualified_landlords: parseInt(t.targetQualifiedLandlords, 10),
-      commission_percent: Number(t.commissionPercent),
-    }));
-    const { data: inserted, error: insertErr } = await supabase.from('commission_tiers').insert(rows).select();
-    if (insertErr) throw insertErr;
-
-    logActivity({
-      actorType: 'admin',
-      actorId: ADMIN_ACTOR_ID,
-      action: 'commission_tiers_global_updated',
-      targetType: 'commission_tiers',
-      ipAddress: req.ip,
-      metadata: { before: existing || [], after: inserted },
-    });
-
-    return res.json({ tiers: inserted });
-  } catch (err) {
-    logger.error('[payoutRules] updateCommissionTiers error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to update commission tiers.' });
-  }
-}
-
-async function setBaCommissionTierOverride(req, res) {
-  try {
-    const { baId } = req.params;
-    const { tiers, clear } = req.body;
-
-    const { data: existing, error: fetchErr } = await supabase
-      .from('commission_tiers')
-      .select('*')
-      .eq('scope', 'ba_override')
-      .eq('ba_id', baId);
-    if (fetchErr) throw fetchErr;
-
-    if (clear) {
-      if (existing && existing.length > 0) {
-        const { error } = await supabase.from('commission_tiers').delete().eq('scope', 'ba_override').eq('ba_id', baId);
-        if (error) throw error;
-      }
-      logActivity({
-        actorType: 'admin',
-        actorId: ADMIN_ACTOR_ID,
-        action: 'commission_tiers_ba_override_cleared',
-        targetType: 'brand_ambassador',
-        targetId: baId,
-        ipAddress: req.ip,
-        metadata: { before: existing || [], after: [] },
-      });
-      return res.json({ override: null });
-    }
-
-    const validationError = validateLadder(tiers);
-    if (validationError) return res.status(400).json({ error: validationError });
-
-    if (existing && existing.length > 0) {
-      const { error } = await supabase.from('commission_tiers').delete().eq('scope', 'ba_override').eq('ba_id', baId);
-      if (error) throw error;
-    }
-
-    const rows = tiers.map((t) => ({
-      scope: 'ba_override',
-      ba_id: baId,
-      target_qualified_landlords: parseInt(t.targetQualifiedLandlords, 10),
-      commission_percent: Number(t.commissionPercent),
-    }));
-    const { data: inserted, error: insertErr } = await supabase.from('commission_tiers').insert(rows).select();
-    if (insertErr) throw insertErr;
-
-    logActivity({
-      actorType: 'admin',
-      actorId: ADMIN_ACTOR_ID,
-      action: 'commission_tiers_ba_override_set',
-      targetType: 'brand_ambassador',
-      targetId: baId,
-      ipAddress: req.ip,
-      metadata: { before: existing || [], after: inserted },
-    });
-
-    return res.json({ override: inserted });
-  } catch (err) {
-    logger.error('[payoutRules] setBaCommissionTierOverride error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to update this BA\'s commission tier override.' });
+    return res.status(500).json({ error: 'Failed to load the rate history.' });
   }
 }
 
 // ---------------------------------------------------------------------
-// Unit-volume pricing tiers (item 10) - bracket-based BASE payout by
-// how many subscribed units the referred landlord has. Same
-// global/ba_override scope pattern as commission_tiers above; the
-// admin UI reuses the same "editing: global vs a specific BA" picker.
-// ---------------------------------------------------------------------
-
-function validateUnitLadder(tiers) {
-  if (!Array.isArray(tiers) || tiers.length === 0) {
-    return 'At least one unit-volume bracket is required.';
-  }
-  const rows = tiers.map((t) => ({
-    minUnits: parseInt(t.minUnits, 10),
-    maxUnits: t.maxUnits === '' || t.maxUnits == null ? null : parseInt(t.maxUnits, 10),
-    amount: Number(t.amount),
-  }));
-  for (const r of rows) {
-    if (!Number.isInteger(r.minUnits) || r.minUnits < 1) return 'Each bracket needs a positive whole-number minimum unit count.';
-    if (r.maxUnits != null && (!Number.isInteger(r.maxUnits) || r.maxUnits < r.minUnits)) {
-      return 'A bracket\'s maximum units must be blank (unbounded) or a whole number >= its minimum.';
-    }
-    if (Number.isNaN(r.amount) || r.amount < 0) return 'Each bracket needs a valid, non-negative amount.';
-  }
-  // Overlap check: sort by minUnits, ensure each bracket's range
-  // doesn't overlap the next one. An unbounded bracket (maxUnits ===
-  // null) must be the last one, since it swallows everything above it.
-  const sorted = [...rows].sort((a, b) => a.minUnits - b.minUnits);
-  for (let i = 0; i < sorted.length; i++) {
-    const cur = sorted[i];
-    const next = sorted[i + 1];
-    if (cur.maxUnits == null && next) return 'Only the highest bracket may be left unbounded (blank maximum) - it must be last.';
-    if (next && cur.maxUnits != null && next.minUnits <= cur.maxUnits) {
-      return `Overlapping brackets: ${cur.minUnits}-${cur.maxUnits} overlaps ${next.minUnits}-${next.maxUnits ?? '+'}.`;
-    }
-    if (next && cur.minUnits === next.minUnits) return `Duplicate bracket starting at ${cur.minUnits} units.`;
-  }
-  return null;
-}
-
-async function getUnitPricingTiers(req, res) {
-  try {
-    const { baId } = req.query;
-
-    const { data: global, error: globalErr } = await supabase
-      .from('unit_pricing_tiers')
-      .select('*')
-      .eq('scope', 'global')
-      .order('min_units', { ascending: true });
-    if (globalErr) throw globalErr;
-
-    let override = null;
-    if (baId) {
-      const { data, error } = await supabase
-        .from('unit_pricing_tiers')
-        .select('*')
-        .eq('scope', 'ba_override')
-        .eq('ba_id', baId)
-        .order('min_units', { ascending: true });
-      if (error) throw error;
-      override = data && data.length > 0 ? data : null;
-    }
-
-    return res.json({ global: global || [], override });
-  } catch (err) {
-    logger.error('[payoutRules] getUnitPricingTiers error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to load unit-volume pricing tiers.' });
-  }
-}
-
-async function updateUnitPricingTiers(req, res) {
-  try {
-    const { tiers } = req.body;
-    const validationError = validateUnitLadder(tiers);
-    if (validationError) return res.status(400).json({ error: validationError });
-
-    const { data: existing, error: fetchErr } = await supabase
-      .from('unit_pricing_tiers')
-      .select('*')
-      .eq('scope', 'global');
-    if (fetchErr) throw fetchErr;
-
-    const { error: deleteErr } = await supabase.from('unit_pricing_tiers').delete().eq('scope', 'global');
-    if (deleteErr) throw deleteErr;
-
-    const rows = tiers.map((t) => ({
-      scope: 'global',
-      ba_id: null,
-      min_units: parseInt(t.minUnits, 10),
-      max_units: t.maxUnits === '' || t.maxUnits == null ? null : parseInt(t.maxUnits, 10),
-      amount: Number(t.amount),
-    }));
-    const { data: inserted, error: insertErr } = await supabase.from('unit_pricing_tiers').insert(rows).select();
-    if (insertErr) throw insertErr;
-
-    logActivity({
-      actorType: 'admin',
-      actorId: ADMIN_ACTOR_ID,
-      action: 'unit_pricing_tiers_global_updated',
-      targetType: 'unit_pricing_tiers',
-      ipAddress: req.ip,
-      metadata: { before: existing || [], after: inserted },
-    });
-
-    return res.json({ tiers: inserted });
-  } catch (err) {
-    logger.error('[payoutRules] updateUnitPricingTiers error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to update unit-volume pricing tiers.' });
-  }
-}
-
-async function setBaUnitPricingTierOverride(req, res) {
-  try {
-    const { baId } = req.params;
-    const { tiers, clear } = req.body;
-
-    const { data: existing, error: fetchErr } = await supabase
-      .from('unit_pricing_tiers')
-      .select('*')
-      .eq('scope', 'ba_override')
-      .eq('ba_id', baId);
-    if (fetchErr) throw fetchErr;
-
-    if (clear) {
-      if (existing && existing.length > 0) {
-        const { error } = await supabase.from('unit_pricing_tiers').delete().eq('scope', 'ba_override').eq('ba_id', baId);
-        if (error) throw error;
-      }
-      logActivity({
-        actorType: 'admin',
-        actorId: ADMIN_ACTOR_ID,
-        action: 'unit_pricing_tiers_ba_override_cleared',
-        targetType: 'brand_ambassador',
-        targetId: baId,
-        ipAddress: req.ip,
-        metadata: { before: existing || [], after: [] },
-      });
-      return res.json({ override: null });
-    }
-
-    const validationError = validateUnitLadder(tiers);
-    if (validationError) return res.status(400).json({ error: validationError });
-
-    if (existing && existing.length > 0) {
-      const { error } = await supabase.from('unit_pricing_tiers').delete().eq('scope', 'ba_override').eq('ba_id', baId);
-      if (error) throw error;
-    }
-
-    const rows = tiers.map((t) => ({
-      scope: 'ba_override',
-      ba_id: baId,
-      min_units: parseInt(t.minUnits, 10),
-      max_units: t.maxUnits === '' || t.maxUnits == null ? null : parseInt(t.maxUnits, 10),
-      amount: Number(t.amount),
-    }));
-    const { data: inserted, error: insertErr } = await supabase.from('unit_pricing_tiers').insert(rows).select();
-    if (insertErr) throw insertErr;
-
-    logActivity({
-      actorType: 'admin',
-      actorId: ADMIN_ACTOR_ID,
-      action: 'unit_pricing_tiers_ba_override_set',
-      targetType: 'brand_ambassador',
-      targetId: baId,
-      ipAddress: req.ip,
-      metadata: { before: existing || [], after: inserted },
-    });
-
-    return res.json({ override: inserted });
-  } catch (err) {
-    logger.error('[payoutRules] setBaUnitPricingTierOverride error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to update this BA\'s unit-volume pricing override.' });
-  }
-}
-
-// ---------------------------------------------------------------------
-// PHASE 19 - Qualification Job Dry-Run Mode.
-//
-// Admin-triggered manual run, distinct from the always-on
-// BA_QUALIFICATION_DRY_RUN env flag (Phase 10 groundwork) - lets
-// admin sanity-check a full cycle against real data on demand,
-// especially right after a payout_rules/commission_tiers change,
-// without waiting for or interfering with the next scheduled live
-// run. Both routes below re-run the exact same side-effect-free check
-// (runBaQualificationCheck({ forceDryRun: true })) - safe to call
-// repeatedly, since dry-run mode never writes anything.
+// PHASE 19 - Qualification Job Dry-Run Mode (Section C - unaffected by
+// Section E, kept exactly as before).
 // ---------------------------------------------------------------------
 
 async function runQualificationDryRun(req, res) {
@@ -551,7 +261,6 @@ async function runQualificationDryRun(req, res) {
     return res.json({
       checked: result.checked,
       qualified: result.qualified,
-      tiersCrossed: result.tiersCrossed,
       skippedInactiveBa: result.skippedInactiveBa,
       errors: result.errors,
       report: result.report || [],
@@ -573,32 +282,22 @@ async function downloadQualificationDryRunCsv(req, res) {
     const rows = result.report || [];
 
     const lines = [
-      ['Claim ID', 'BA Code', 'BA Name', 'Landlord (snapshot name)', 'Unit Bracket Applied', 'Would-be Base Payout (KES)', 'Would-be Commission Bonus (KES)', 'Would-be Tier Change'].join(','),
+      ['Landlord ID', 'BA Code', 'BA Name', 'Landlord Name', 'Would-be Qualified Unit Count'].join(','),
     ];
     for (const r of rows) {
-      const tierChange = r.wouldBeTierChange
-        ? `${r.wouldBeTierChange.fromPercent}% -> ${r.wouldBeTierChange.toPercent}% (at ${r.wouldBeTierChange.targetQualifiedLandlords} qualified)`
-        : '';
-      const unitBracket = r.wouldBeUnitBracket
-        ? `${r.wouldBeUnitBracket.minUnits}-${r.wouldBeUnitBracket.maxUnits ?? '+'} units`
-        : 'flat rate';
       lines.push(
         [
-          csvEscape(r.claimId),
+          csvEscape(r.landlordId),
           csvEscape(r.baCode),
           csvEscape(r.baName),
-          csvEscape(r.landlordSnapshotName),
-          csvEscape(unitBracket),
-          Number(r.wouldBePayoutAmount || 0).toFixed(2),
-          Number(r.wouldBeCommissionBonusAmount || 0).toFixed(2),
-          csvEscape(tierChange),
+          csvEscape(r.landlordName),
+          Number(r.wouldBeQualifiedUnitCount || 0),
         ].join(',')
       );
     }
     lines.push('');
-    lines.push(`Claims checked,${result.checked}`);
+    lines.push(`Landlords checked,${result.checked}`);
     lines.push(`Would qualify,${result.qualified}`);
-    lines.push(`Commission tiers that would be crossed,${result.tiersCrossed}`);
 
     const filename = `ba-qualification-dry-run-${new Date().toISOString().slice(0, 10)}.csv`;
     res.setHeader('Content-Type', 'text/csv');
@@ -615,12 +314,7 @@ module.exports = {
   getPayoutRules,
   updateGlobalPayoutRule,
   setBaPayoutOverride,
-  getCommissionTiers,
-  updateCommissionTiers,
-  setBaCommissionTierOverride,
-  getUnitPricingTiers,
-  updateUnitPricingTiers,
-  setBaUnitPricingTierOverride,
+  getPayoutRuleHistory,
   runQualificationDryRun,
   downloadQualificationDryRunCsv,
 };
