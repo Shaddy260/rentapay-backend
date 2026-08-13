@@ -1230,7 +1230,16 @@ async function editOwnProfile(req, res) {
     // login identifier and needs the same lock, enforced here too so a
     // direct API call can't slip past the disabled input client-side.
     if (email !== undefined) {
-      return res.status(400).json({ error: 'Your primary email cannot be changed after registration. Contact your landlord if you need to update it.' });
+      const { data: currentTenant, error: fetchError } = await supabase
+        .from('tenants')
+        .select('email')
+        .eq('id', tenantId)
+        .single();
+      if (fetchError) throw fetchError;
+
+      if (email !== currentTenant.email) {
+        return res.status(400).json({ error: 'Your primary email cannot be changed after registration. Contact your landlord if you need to update it.' });
+      }
     }
 
     const updateFields = {};

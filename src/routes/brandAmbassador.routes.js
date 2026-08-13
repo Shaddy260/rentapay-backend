@@ -73,6 +73,7 @@ router.get('/', verifyToken, requireRole('admin'), ctrl.listBrandAmbassadors);
 router.post('/:id/suspend', verifyToken, requireRole('admin'), ctrl.suspendBrandAmbassador);
 router.post('/:id/reactivate', verifyToken, requireRole('admin'), ctrl.reactivateBrandAmbassador);
 router.post('/:id/offboard', verifyToken, requireRole('admin'), ctrl.offboardBrandAmbassador);
+router.post('/:id/restore', verifyToken, requireRole('admin'), ctrl.restoreBrandAmbassador);
 
 // SECTION E - percentage commission rate (global + per-BA override),
 // each an append-only history (setting a new rate inserts a new row

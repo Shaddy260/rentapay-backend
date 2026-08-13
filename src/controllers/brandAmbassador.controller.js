@@ -26,7 +26,7 @@
 
 const crypto = require('crypto');
 const supabase = require('../config/supabase');
-const { hashPassword } = require('../utils/password');
+const { hashPassword, comparePassword } = require('../utils/password');
 const { generateOTP, getEmailVerificationOTPExpiry, isOTPExpired } = require('../utils/otp');
 const { resolveApplicableRate } = require('../services/baCommission.service');
 const { maskPhoneMiddle } = require('../utils/maskPhone');
@@ -522,6 +522,19 @@ async function listBrandAmbassadors(req, res) {
   }
 }
 
+// FIX (direct request: "offboard or activate an account should ask
+// for the password, just like for landlords"): mirrors
+// admin.controller.js's verifyAdminPassword - same env-var hash, same
+// bcrypt compare. Every state-changing BA action below (suspend,
+// reactivate, offboard, restore) now re-checks this before writing
+// anything, instead of firing on a bare authenticated POST.
+async function verifyAdminPassword(password) {
+  const adminPasswordHash = process.env.SUPER_ADMIN_PASSWORD_HASH;
+  if (!adminPasswordHash) return false;
+  if (!password) return false;
+  return comparePassword(password, adminPasswordHash);
+}
+
 /**
  * POST /api/brand-ambassadors/:id/suspend (admin-only)
  *
@@ -536,6 +549,12 @@ async function listBrandAmbassadors(req, res) {
 async function suspendBrandAmbassador(req, res) {
   try {
     const { id } = req.params;
+    const { password } = req.body;
+    const passwordOk = await verifyAdminPassword(password);
+    if (!passwordOk) {
+      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT suspended.' });
+    }
+
     const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
     if (findErr) throw findErr;
     if (!ba) return res.status(404).json({ error: 'Brand Ambassador not found.' });
@@ -569,6 +588,12 @@ async function suspendBrandAmbassador(req, res) {
 async function reactivateBrandAmbassador(req, res) {
   try {
     const { id } = req.params;
+    const { password } = req.body;
+    const passwordOk = await verifyAdminPassword(password);
+    if (!passwordOk) {
+      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT reactivated.' });
+    }
+
     const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
     if (findErr) throw findErr;
     if (!ba) return res.status(404).json({ error: 'Brand Ambassador not found.' });
@@ -615,6 +640,12 @@ async function reactivateBrandAmbassador(req, res) {
 async function offboardBrandAmbassador(req, res) {
   try {
     const { id } = req.params;
+    const { password } = req.body;
+    const passwordOk = await verifyAdminPassword(password);
+    if (!passwordOk) {
+      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT offboarded.' });
+    }
+
     const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
     if (findErr) throw findErr;
     if (!ba) return res.status(404).json({ error: 'Brand Ambassador not found.' });
@@ -637,6 +668,51 @@ async function offboardBrandAmbassador(req, res) {
     logger.error('[brandAmbassador] offboardBrandAmbassador error:', err.message);
     captureException(err);
     return res.status(500).json({ error: 'Failed to offboard this Brand Ambassador.' });
+  }
+}
+
+/**
+ * POST /api/brand-ambassadors/:id/restore (admin-only)
+ *
+ * Reverses offboardBrandAmbassador above: brings an 'inactive' BA
+ * back to 'active' so they can log in and start qualifying for new
+ * payouts again. Clears offboarded_at/offboarded_by_admin_id so the
+ * roster doesn't keep showing a stale offboard date for a BA who is
+ * active again - a fresh offboard later will set them again. Does
+ * NOT touch referral_code, existing claims, or landlords.ba_id, same
+ * as offboard didn't.
+ */
+async function restoreBrandAmbassador(req, res) {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+    const passwordOk = await verifyAdminPassword(password);
+    if (!passwordOk) {
+      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT restored.' });
+    }
+
+    const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
+    if (findErr) throw findErr;
+    if (!ba) return res.status(404).json({ error: 'Brand Ambassador not found.' });
+    if (ba.status !== 'inactive') {
+      return res.status(400).json({ error: `This Brand Ambassador is ${ba.status}, not offboarded - only an offboarded (inactive) BA can be restored.` });
+    }
+
+    const { data: updated, error: updateErr } = await supabase
+      .from('brand_ambassadors')
+      .update({ status: 'active', offboarded_at: null, offboarded_by_admin_id: null })
+      .eq('id', id)
+      .select('id, full_name, status')
+      .single();
+    if (updateErr) throw updateErr;
+
+    logActivity({ actorType: 'admin', actorId: req.user.id, action: 'ba_restored', targetType: 'brand_ambassador', targetId: id });
+
+    return res.json({ message: 'Brand Ambassador restored to active.', brandAmbassador: updated });
+  } catch (err) {
+    logger.error('[brandAmbassador] restoreBrandAmbassador error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to restore this Brand Ambassador.' });
   }
 }
 
@@ -1519,6 +1595,7 @@ module.exports = {
   suspendBrandAmbassador,
   reactivateBrandAmbassador,
   offboardBrandAmbassador,
+  restoreBrandAmbassador,
   getMyBaProfile,
   updateMyProfile,
   updateLeaderboardOptIn,

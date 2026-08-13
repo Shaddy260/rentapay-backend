@@ -94,20 +94,19 @@ async function getPayoutReview(req, res) {
       .order('full_name', { ascending: true });
     if (baErr) throw baErr;
 
-    // qualified_at is the moment a claim BECAME owed money - that's
-    // what a payout period groups by, not created_at (when it was
-    // first logged, possibly weeks earlier) or marked_paid_at (when
-    // admin got around to paying it).
-    const { data: claims, error: claimsErr } = await supabase
-      .from('ba_landlord_claims')
-      .select(
-        'id, ba_id, submitted_name, submitted_location, qualification_status, qualified_at, payout_amount, commission_bonus_amount, commission_tier_id, marked_paid_by, marked_paid_at, matched_landlord_id, landlords(full_name, location)'
-      )
-      .in('qualification_status', ['qualified', 'paid', 'not_paid'])
-      .gte('qualified_at', range.start.toISOString())
-      .lt('qualified_at', range.end.toISOString())
-      .order('qualified_at', { ascending: true });
-    if (claimsErr) throw claimsErr;
+    // REBUILT (Section E/F): commission is a recurring percentage of
+    // each completed landlord subscription payment, recorded in
+    // ba_commission_earnings (one row per payment) rather than a
+    // one-time snapshot on the now-dropped ba_landlord_claims. paid_at
+    // is what a payout period groups by - the moment the money was
+    // actually earned, same intent as the old qualified_at grouping.
+    const { data: earnings, error: earningsErr } = await supabase
+      .from('ba_commission_earnings')
+      .select('id, ba_id, landlord_id, payment_amount, percentage_applied, commission_amount, paid_at, landlords(full_name, location)')
+      .gte('paid_at', range.start.toISOString())
+      .lt('paid_at', range.end.toISOString())
+      .order('paid_at', { ascending: true });
+    if (earningsErr) throw earningsErr;
 
     const { data: mark, error: markErr } = await supabase
       .from('ba_payout_period_marks')
@@ -117,67 +116,48 @@ async function getPayoutReview(req, res) {
     if (markErr) throw markErr;
     const markByBa = new Map((mark || []).map((m) => [m.ba_id, m]));
 
-    const claimsByBa = new Map();
-    for (const c of claims || []) {
-      if (!claimsByBa.has(c.ba_id)) claimsByBa.set(c.ba_id, []);
-      claimsByBa.get(c.ba_id).push(c);
+    const earningsByBa = new Map();
+    for (const e of earnings || []) {
+      if (!earningsByBa.has(e.ba_id)) earningsByBa.set(e.ba_id, []);
+      earningsByBa.get(e.ba_id).push(e);
     }
 
     // Item 10 - "Payout Run" view needs, per BA: total landlords that
     // qualify, total that do NOT qualify, and their commission rate -
-    // not just the period-scoped $ owed above. Qualification here
-    // uses the same live definition as
-    // baPayoutQualificationReport.service.js (latest matched claim's
-    // qualification_status in 'qualified'/'paid') so the two screens
-    // can never disagree, and is NOT period-scoped - it reflects the
-    // BA's full onboarded roster, not just this run's owed amounts.
+    // not just the period-scoped $ owed above. REBUILT (Section C):
+    // qualification now lives directly on landlords.
+    // ba_qualification_status - the same column the qualification job
+    // and Section F's report already use, so no screen can disagree.
+    // NOT period-scoped - reflects the BA's full onboarded roster.
     const baIds = (bas || []).map((b) => b.id);
     const rosterCountByBa = new Map();
     const qualifyingCountByBa = new Map();
     if (baIds.length > 0) {
       const { data: rosterLandlords, error: rosterErr } = await supabase
         .from('landlords')
-        .select('id, ba_id')
+        .select('id, ba_id, ba_qualification_status')
         .in('ba_id', baIds);
       if (rosterErr) throw rosterErr;
 
       for (const l of rosterLandlords || []) {
         rosterCountByBa.set(l.ba_id, (rosterCountByBa.get(l.ba_id) || 0) + 1);
-      }
-
-      const rosterLandlordIds = (rosterLandlords || []).map((l) => l.id);
-      if (rosterLandlordIds.length > 0) {
-        const { data: allClaims, error: allClaimsErr } = await supabase
-          .from('ba_landlord_claims')
-          .select('ba_id, matched_landlord_id, qualification_status, created_at')
-          .in('matched_landlord_id', rosterLandlordIds)
-          .order('created_at', { ascending: false });
-        if (allClaimsErr) throw allClaimsErr;
-
-        const latestByPair = new Map();
-        for (const c of allClaims || []) {
-          const key = `${c.ba_id}:${c.matched_landlord_id}`;
-          if (!latestByPair.has(key)) latestByPair.set(key, c);
-        }
-        const qualifyingLandlordIdsByBa = new Map();
-        for (const c of latestByPair.values()) {
-          if (['qualified', 'paid'].includes(c.qualification_status)) {
-            const set = qualifyingLandlordIdsByBa.get(c.ba_id) || new Set();
-            set.add(c.matched_landlord_id);
-            qualifyingLandlordIdsByBa.set(c.ba_id, set);
-          }
-        }
-        for (const [baId, set] of qualifyingLandlordIdsByBa.entries()) {
-          qualifyingCountByBa.set(baId, set.size);
+        if (l.ba_qualification_status === 'qualified') {
+          qualifyingCountByBa.set(l.ba_id, (qualifyingCountByBa.get(l.ba_id) || 0) + 1);
         }
       }
     }
 
     const rows = (bas || [])
       .map((ba) => {
-        const baClaims = claimsByBa.get(ba.id) || [];
-        const baseTotal = baClaims.reduce((sum, c) => sum + Number(c.payout_amount || 0), 0);
-        const commissionTotal = baClaims.reduce((sum, c) => sum + Number(c.commission_bonus_amount || 0), 0);
+        const baEarnings = earningsByBa.get(ba.id) || [];
+        // Section E replaced the old flat "base payout" + "commission
+        // bonus" split with a single recurring percentage-of-payment
+        // figure - there's no separate base amount anymore. Kept as a
+        // (zeroed) field so the response shape - and the existing
+        // frontend - don't need a reshape; the full amount now shows
+        // under commissionTotal.
+        const baseTotal = 0;
+        const commissionTotal = baEarnings.reduce((sum, e) => sum + Number(e.commission_amount || 0), 0);
         const periodMark = markByBa.get(ba.id) || null;
         const totalLandlordsOnboarded = rosterCountByBa.get(ba.id) || 0;
         const qualifyingLandlords = qualifyingCountByBa.get(ba.id) || 0;
@@ -191,20 +171,26 @@ async function getPayoutReview(req, res) {
             phone: ba.phone,
             email: ba.email,
             // Frontend uses this to render the "Inactive"/"Suspended"
-            // label - claims below are never hidden regardless of it.
+            // label - earnings below are never hidden regardless of it.
             status: ba.status,
             currentCommissionPercent: ba.current_commission_percent,
           },
-          claims: baClaims.map((c) => ({
-            id: c.id,
-            landlordName: c.landlords?.full_name || c.submitted_name,
-            landlordLocation: c.landlords?.location || c.submitted_location || null,
-            qualificationStatus: c.qualification_status,
-            qualifiedAt: c.qualified_at,
-            payoutAmount: Number(c.payout_amount || 0),
-            commissionBonusAmount: Number(c.commission_bonus_amount || 0),
-            markedPaidBy: c.marked_paid_by,
-            markedPaidAt: c.marked_paid_at,
+          // REBUILT: "claims" here means this cycle's commission-earning
+          // events, one per completed landlord payment - the field name
+          // is kept for the frontend, which hasn't changed shape.
+          // Per-row Paid/Not Paid no longer exists (Section E has no
+          // per-row status); the whole cycle is marked at once via
+          // periodMarkedStatus below.
+          claims: baEarnings.map((e) => ({
+            id: e.id,
+            landlordName: e.landlords?.full_name || 'Unknown',
+            landlordLocation: e.landlords?.location || null,
+            qualificationStatus: periodMark && periodMark.status === 'paid' ? 'paid' : 'qualified',
+            qualifiedAt: e.paid_at,
+            payoutAmount: 0,
+            commissionBonusAmount: Number(e.commission_amount || 0),
+            markedPaidBy: periodMark?.marked_paid_by || null,
+            markedPaidAt: periodMark?.marked_paid_at || null,
           })),
           baseTotal,
           commissionTotal,
@@ -247,13 +233,10 @@ async function getPayoutReview(req, res) {
 async function markBaPeriod(req, res, targetStatus) {
   try {
     const { baId } = req.params;
-    const { periodType, periodKey, claimIds } = req.body;
+    const { periodType, periodKey } = req.body;
 
     const validationError = validatePeriodParams(periodType, periodKey);
     if (validationError) return res.status(400).json({ error: validationError });
-    if (!Array.isArray(claimIds) || claimIds.length === 0) {
-      return res.status(400).json({ error: 'claimIds is required.' });
-    }
 
     let range;
     try {
@@ -277,27 +260,21 @@ async function markBaPeriod(req, res, targetStatus) {
       return res.json({ mark: existingMark, alreadyPaid: true });
     }
 
-    const { data: claims, error: claimsErr } = await supabase
-      .from('ba_landlord_claims')
-      .select('id, ba_id, qualification_status, qualified_at, payout_amount, commission_bonus_amount')
-      .in('id', claimIds);
-    if (claimsErr) throw claimsErr;
+    // REBUILT (Section E/F): there is no more per-landlord "claim" to
+    // select - commission accrues automatically per completed
+    // subscription payment (ba_commission_earnings). Marking
+    // Paid/Not Paid therefore always applies to this BA's WHOLE
+    // selected cycle, not a hand-picked subset.
+    const { data: earnings, error: earningsErr } = await supabase
+      .from('ba_commission_earnings')
+      .select('commission_amount')
+      .eq('ba_id', baId)
+      .gte('paid_at', range.start.toISOString())
+      .lt('paid_at', range.end.toISOString());
+    if (earningsErr) throw earningsErr;
 
-    if ((claims || []).length !== claimIds.length) {
-      return res.status(400).json({ error: 'One or more claim ids were not found.' });
-    }
-    for (const c of claims) {
-      if (c.ba_id !== baId) return res.status(400).json({ error: `Claim ${c.id} does not belong to this Brand Ambassador.` });
-      if (!['qualified', 'paid', 'not_paid'].includes(c.qualification_status)) {
-        return res.status(400).json({ error: `Claim ${c.id} is not qualified for payout.` });
-      }
-      if (!c.qualified_at || new Date(c.qualified_at) < range.start || new Date(c.qualified_at) >= range.end) {
-        return res.status(400).json({ error: `Claim ${c.id} does not fall in the selected period.` });
-      }
-    }
-
-    const baseTotal = claims.reduce((sum, c) => sum + Number(c.payout_amount || 0), 0);
-    const commissionTotal = claims.reduce((sum, c) => sum + Number(c.commission_bonus_amount || 0), 0);
+    const baseTotal = 0;
+    const commissionTotal = (earnings || []).reduce((sum, e) => sum + Number(e.commission_amount || 0), 0);
     const nowIso = new Date().toISOString();
 
     const markPayload = {
@@ -305,7 +282,7 @@ async function markBaPeriod(req, res, targetStatus) {
       period_type: periodType,
       period_key: periodKey,
       status: targetStatus,
-      claim_ids: claimIds,
+      claim_ids: [],
       base_total: baseTotal,
       commission_total: commissionTotal,
       grand_total: baseTotal + commissionTotal,
@@ -341,14 +318,6 @@ async function markBaPeriod(req, res, targetStatus) {
       mark = data;
     }
 
-    const claimUpdatePayload =
-      targetStatus === 'paid'
-        ? { qualification_status: 'paid', marked_paid_by: ADMIN_ACTOR_ID, marked_paid_at: nowIso }
-        : { qualification_status: 'not_paid', marked_paid_by: null, marked_paid_at: null };
-
-    const { error: updateErr } = await supabase.from('ba_landlord_claims').update(claimUpdatePayload).in('id', claimIds);
-    if (updateErr) throw updateErr;
-
     logActivity({
       actorType: 'admin',
       actorId: ADMIN_ACTOR_ID,
@@ -356,24 +325,22 @@ async function markBaPeriod(req, res, targetStatus) {
       targetType: 'brand_ambassador',
       targetId: baId,
       ipAddress: req.ip,
-      metadata: { periodType, periodKey, claimIds, baseTotal, commissionTotal },
+      metadata: { periodType, periodKey, baseTotal, commissionTotal },
     });
 
     // Item 11 - the moment admin marks a BA as paid, send them an
     // in-app notification (existing notifications system - no email/
-    // SMS) with their payment stats for this run: how many landlords
-    // it covered and the total amount paid. Best-effort/non-fatal -
-    // a notify() failure must never undo or fail the payout mark
-    // itself, which has already been committed above.
+    // SMS) with the total amount paid for this cycle. Best-effort/
+    // non-fatal - a notify() failure must never undo or fail the
+    // payout mark itself, which has already been committed above.
     if (targetStatus === 'paid') {
       const grandTotal = baseTotal + commissionTotal;
-      const count = claims.length;
       try {
         await notify(
           'brand_ambassador',
           baId,
           null,
-          `You've been paid KES ${grandTotal.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} for ${count} qualifying landlord${count === 1 ? '' : 's'} this ${periodType === 'week' ? 'week' : 'month'}.`,
+          `You've been paid KES ${grandTotal.toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} for this ${periodType === 'week' ? 'week' : 'month'}.`,
           { category: 'account', title: 'You have been paid' }
         );
       } catch (notifyErr) {
@@ -421,32 +388,46 @@ async function downloadBaPayoutStatement(req, res) {
     if (baErr) throw baErr;
     if (!ba) return res.status(404).json({ error: 'Brand Ambassador not found.' });
 
-    const { data: claims, error: claimsErr } = await supabase
-      .from('ba_landlord_claims')
-      .select('id, submitted_name, qualification_status, qualified_at, payout_amount, commission_bonus_amount, marked_paid_at, landlords(full_name)')
+    // REBUILT (Section E/F): sourced from ba_commission_earnings - see
+    // getPayoutReview's comment above for why ba_landlord_claims is no
+    // longer read here.
+    const { data: earnings, error: earningsErr } = await supabase
+      .from('ba_commission_earnings')
+      .select('commission_amount, percentage_applied, paid_at, landlords(full_name)')
       .eq('ba_id', baId)
-      .in('qualification_status', ['qualified', 'paid', 'not_paid'])
-      .gte('qualified_at', range.start.toISOString())
-      .lt('qualified_at', range.end.toISOString())
-      .order('qualified_at', { ascending: true });
-    if (claimsErr) throw claimsErr;
+      .gte('paid_at', range.start.toISOString())
+      .lt('paid_at', range.end.toISOString())
+      .order('paid_at', { ascending: true });
+    if (earningsErr) throw earningsErr;
 
-    const rows = claims || [];
-    const lines = [['Landlord', 'Qualified At', 'Base Payout (KES)', 'Commission Bonus (KES)', 'Status', 'Paid At'].join(',')];
-    let baseTotal = 0;
+    const { data: periodMark } = await supabase
+      .from('ba_payout_period_marks')
+      .select('status, marked_paid_at')
+      .eq('ba_id', baId)
+      .eq('period_type', periodType)
+      .eq('period_key', periodKey)
+      .maybeSingle();
+
+    const rows = earnings || [];
+    const lines = [['Landlord', 'Paid At', 'Commission (KES)', 'Rate Applied', 'Status', 'Paid At (Payout)'].join(',')];
     let commissionTotal = 0;
-    for (const c of rows) {
-      const name = (c.landlords?.full_name || c.submitted_name || '').replace(/"/g, '""');
-      baseTotal += Number(c.payout_amount || 0);
-      commissionTotal += Number(c.commission_bonus_amount || 0);
+    for (const e of rows) {
+      const name = (e.landlords?.full_name || 'Unknown').replace(/"/g, '""');
+      commissionTotal += Number(e.commission_amount || 0);
       lines.push(
-        [`"${name}"`, c.qualified_at || '', Number(c.payout_amount || 0).toFixed(2), Number(c.commission_bonus_amount || 0).toFixed(2), c.qualification_status, c.marked_paid_at || ''].join(',')
+        [
+          `"${name}"`,
+          e.paid_at || '',
+          Number(e.commission_amount || 0).toFixed(2),
+          `${e.percentage_applied}%`,
+          periodMark?.status === 'paid' ? 'paid' : 'qualified',
+          periodMark?.marked_paid_at || '',
+        ].join(',')
       );
     }
     lines.push('');
-    lines.push(`Base Total,,${baseTotal.toFixed(2)}`);
     lines.push(`Commission Total,,,${commissionTotal.toFixed(2)}`);
-    lines.push(`Grand Total,,,,${(baseTotal + commissionTotal).toFixed(2)}`);
+    lines.push(`Grand Total,,,,${commissionTotal.toFixed(2)}`);
 
     const filename = `statement-${ba.ba_code || ba.id}-${periodKey}.csv`;
     res.setHeader('Content-Type', 'text/csv');
@@ -482,7 +463,7 @@ async function downloadBaPayoutStatement(req, res) {
 function statementPeriodRange(periodType, periodKey, from, to) {
   if (periodType === 'month') {
     const range = periodRange('month', periodKey);
-    return { ...range, label: periodKey };
+    return { ...range, label: periodKey, markPeriodType: 'month', markPeriodKey: periodKey };
   }
   if (periodType === 'custom') {
     if (!from || !to) throw new Error('from and to are required for a custom period.');
@@ -493,7 +474,10 @@ function statementPeriodRange(periodType, periodKey, from, to) {
     }
     end.setUTCDate(end.getUTCDate() + 1); // "to" is inclusive of that whole day
     if (start >= end) throw new Error('The "from" date must be before the "to" date.');
-    return { start, end, label: `${from}_to_${to}` };
+    // A custom range has no matching cycle-level Paid/Not Paid mark
+    // (that's a month/week concept - see ba_payout_period_marks), so
+    // every row in a custom-range statement reads as 'qualified'.
+    return { start, end, label: `${from}_to_${to}`, markPeriodType: null, markPeriodKey: null };
   }
   throw new Error('periodType must be "month" or "custom".');
 }
@@ -509,67 +493,55 @@ async function fetchEarningsStatementData(baId, range) {
   if (baErr) throw baErr;
   if (!ba) return null;
 
-  const { data: claims, error: claimsErr } = await supabase
-    .from('ba_landlord_claims')
-    .select(
-      'id, submitted_name, submitted_location, qualification_status, qualified_at, payout_amount, commission_bonus_amount, commission_tier_id, unit_pricing_tier_id, qualified_unit_count, payout_commission_model, payout_percentage_rate, payout_basis_amount, marked_paid_at, marked_paid_by, landlords(full_name, location)'
-    )
+  // REBUILT (Section E/F): sourced from ba_commission_earnings, one
+  // row per completed landlord subscription payment this BA earned
+  // commission on. unit_pricing_tiers / commission_tiers (the old
+  // fixed-bracket tables referenced here) were dropped by the Section
+  // E migration along with ba_landlord_claims - the "why was I paid
+  // this" transparency line below now shows the percentage rate and
+  // payment amount that were actually applied instead.
+  const { data: earnings, error: earningsErr } = await supabase
+    .from('ba_commission_earnings')
+    .select('id, payment_amount, percentage_applied, commission_amount, paid_at, landlords(full_name, location)')
     .eq('ba_id', baId)
-    .in('qualification_status', ['qualified', 'paid'])
-    .gte('qualified_at', range.start.toISOString())
-    .lt('qualified_at', range.end.toISOString())
-    .order('qualified_at', { ascending: true });
-  if (claimsErr) throw claimsErr;
+    .gte('paid_at', range.start.toISOString())
+    .lt('paid_at', range.end.toISOString())
+    .order('paid_at', { ascending: true });
+  if (earningsErr) throw earningsErr;
 
-  // Item 10 - transparency: batch-fetch the specific unit-volume
-  // bracket and commission-tier rows this period's claims actually
-  // snapshotted at qualification time, so the statement can show
-  // "why was I paid this" (which bracket, which tier) instead of just
-  // a final number. Never re-resolves against CURRENT payout_rules /
-  // ladders - always reads the exact row the claim pointed at.
-  const unitTierIds = [...new Set((claims || []).map((c) => c.unit_pricing_tier_id).filter(Boolean))];
-  const commissionTierIds = [...new Set((claims || []).map((c) => c.commission_tier_id).filter(Boolean))];
-  const [unitTiersRes, commissionTiersRes] = await Promise.all([
-    unitTierIds.length
-      ? supabase.from('unit_pricing_tiers').select('id, min_units, max_units, amount').in('id', unitTierIds)
-      : Promise.resolve({ data: [] }),
-    commissionTierIds.length
-      ? supabase.from('commission_tiers').select('id, target_qualified_landlords, commission_percent').in('id', commissionTierIds)
-      : Promise.resolve({ data: [] }),
-  ]);
-  const unitTierById = new Map((unitTiersRes.data || []).map((t) => [t.id, t]));
-  const commissionTierById = new Map((commissionTiersRes.data || []).map((t) => [t.id, t]));
+  // A cycle-level Paid/Not Paid mark (ba_payout_period_marks) now
+  // covers every earning in that whole month/week at once - there's
+  // no more per-row status to read.
+  let periodMark = null;
+  if (range.markPeriodType && range.markPeriodKey) {
+    const { data } = await supabase
+      .from('ba_payout_period_marks')
+      .select('status, marked_paid_at, marked_paid_by')
+      .eq('ba_id', baId)
+      .eq('period_type', range.markPeriodType)
+      .eq('period_key', range.markPeriodKey)
+      .maybeSingle();
+    periodMark = data || null;
+  }
 
-  const rows = (claims || []).map((c) => {
-    const unitTier = c.unit_pricing_tier_id ? unitTierById.get(c.unit_pricing_tier_id) : null;
-    const commissionTier = c.commission_tier_id ? commissionTierById.get(c.commission_tier_id) : null;
-    return {
-      id: c.id,
-      landlordName: c.landlords?.full_name || c.submitted_name || 'Unknown',
-      landlordLocation: c.landlords?.location || c.submitted_location || '',
-      qualifiedAt: c.qualified_at,
-      payoutAmount: Number(c.payout_amount || 0),
-      commissionBonusAmount: Number(c.commission_bonus_amount || 0),
-      commissionTierId: c.commission_tier_id || null,
-      status: c.qualification_status, // 'qualified' | 'paid'
-      markedPaidAt: c.marked_paid_at,
-      markedPaidBy: c.marked_paid_by,
-      // Item 10 / ITEM 13 breakdown - null fields mean "flat rate / no
-      // tier crossed" (or, for percentage, "this claim used the fixed
-      // model") - not an error.
-      breakdown: {
-        unitCount: c.qualified_unit_count ?? null,
-        unitBracket: unitTier ? { minUnits: unitTier.min_units, maxUnits: unitTier.max_units, amount: Number(unitTier.amount) } : null,
-        percentage:
-          c.payout_commission_model === 'percentage'
-            ? { rate: Number(c.payout_percentage_rate || 0), basisAmount: Number(c.payout_basis_amount || 0) }
-            : null,
-        commissionTier: commissionTier
-          ? { targetQualifiedLandlords: commissionTier.target_qualified_landlords, commissionPercent: Number(commissionTier.commission_percent) }
-          : null,
-      },
-    };
-  });
+  const rows = (earnings || []).map((e) => ({
+    id: e.id,
+    landlordName: e.landlords?.full_name || 'Unknown',
+    landlordLocation: e.landlords?.location || '',
+    qualifiedAt: e.paid_at,
+    payoutAmount: 0,
+    commissionBonusAmount: Number(e.commission_amount || 0),
+    commissionTierId: null,
+    status: periodMark && periodMark.status === 'paid' ? 'paid' : 'qualified',
+    markedPaidAt: periodMark?.marked_paid_at || null,
+    markedPaidBy: periodMark?.marked_paid_by || null,
+    breakdown: {
+      unitCount: null,
+      unitBracket: null,
+      percentage: { rate: Number(e.percentage_applied || 0), basisAmount: Number(e.payment_amount || 0) },
+      commissionTier: null,
+    },
+  }));
 
   const totals = {
     baseTotal: 0,
@@ -583,19 +555,16 @@ async function fetchEarningsStatementData(baId, range) {
     qualifiedNotYetPaidTotal: 0,
   };
   for (const r of rows) {
-    totals.baseTotal += r.payoutAmount;
     totals.commissionTotal += r.commissionBonusAmount;
     if (r.status === 'paid') {
-      totals.paidBaseTotal += r.payoutAmount;
       totals.paidCommissionTotal += r.commissionBonusAmount;
     } else {
-      totals.qualifiedNotYetPaidBaseTotal += r.payoutAmount;
       totals.qualifiedNotYetPaidCommissionTotal += r.commissionBonusAmount;
     }
   }
-  totals.grandTotal = totals.baseTotal + totals.commissionTotal;
-  totals.paidTotal = totals.paidBaseTotal + totals.paidCommissionTotal;
-  totals.qualifiedNotYetPaidTotal = totals.qualifiedNotYetPaidBaseTotal + totals.qualifiedNotYetPaidCommissionTotal;
+  totals.grandTotal = totals.commissionTotal;
+  totals.paidTotal = totals.paidCommissionTotal;
+  totals.qualifiedNotYetPaidTotal = totals.qualifiedNotYetPaidCommissionTotal;
 
   return { ba, claims: rows, totals };
 }
@@ -827,29 +796,56 @@ async function reconcileBaList(req, res) {
 
 // =======================================================================
 // PART C - Cross-BA security report (standing, no BA selection)
+//
+// REBUILT (Section A of the 2026-08-remove-manual-ba-claims migration):
+// the manual claim-submission flow this report used to police
+// (ba_landlord_claims - a BA typing in a landlord's name/phone by hand,
+// which could be submitted by multiple BAs, matched loosely, or
+// rejected as a 'conflict') no longer exists. Attribution is now fully
+// automatic: a landlord is linked to a BA only via the referral
+// link/code they sign up through (landlords.ba_id), with no manual
+// submission step at all.
+//
+// That retires two of the original four signals outright - there is no
+// longer a "submission" to duplicate or a "match" that can happen
+// without a referral, because there is no separate submission/match
+// step anymore. Rather than silently return permanently-empty arrays
+// forever (which reads as "nothing to see" instead of "this check no
+// longer applies"), the response marks them `retired: true` with an
+// explanation, and the frontend renders that state explicitly.
+//
+// The other two signals still map onto the new model and are rebuilt
+// below against `landlords` directly instead of `ba_landlord_claims`:
+//   - rapidFireOnboarding (was rapidFireSubmissions): unusually many
+//     landlords onboarded by one BA in a short window - still a
+//     reasonable proxy for signups logged without an actual field
+//     visit, just measured off landlords.created_at instead of a
+//     claim's created_at.
+//   - disputedAttributions: unchanged in spirit, now joined directly
+//     off landlords.ba_id instead of via a claim's matched_landlord_id.
 // =======================================================================
 
 const SECURITY_REPORT_WINDOW_DAYS = parseInt(process.env.BA_SECURITY_REPORT_WINDOW_DAYS || '30', 10);
 const RAPID_FIRE_WINDOW_MINUTES = parseInt(process.env.BA_RAPID_FIRE_WINDOW_MINUTES || '60', 10);
 const RAPID_FIRE_THRESHOLD = parseInt(process.env.BA_RAPID_FIRE_THRESHOLD || '5', 10);
 
-// Finds the single largest rolling-window cluster of claims (>=
-// threshold claims within windowMs of each other) for one BA's claims,
-// already sorted ascending by created_at. Returns null if none found.
-// Reports only the best cluster per BA rather than every overlapping
-// sub-window, so the report stays one row per flagged BA.
-function findRapidFireCluster(claimsAsc, windowMs, threshold) {
+// Finds the single largest rolling-window cluster of landlords (>=
+// threshold within windowMs of each other) for one BA's onboarded
+// landlords, already sorted ascending by created_at. Returns null if
+// none found. Reports only the best cluster per BA rather than every
+// overlapping sub-window, so the report stays one row per flagged BA.
+function findRapidFireCluster(rowsAsc, windowMs, threshold) {
   let windowStart = 0;
   let best = null;
-  for (let i = 0; i < claimsAsc.length; i++) {
-    while (new Date(claimsAsc[i].created_at) - new Date(claimsAsc[windowStart].created_at) > windowMs) windowStart++;
+  for (let i = 0; i < rowsAsc.length; i++) {
+    while (new Date(rowsAsc[i].created_at) - new Date(rowsAsc[windowStart].created_at) > windowMs) windowStart++;
     const size = i - windowStart + 1;
     if (size >= threshold && (!best || size > best.count)) {
       best = {
         count: size,
-        claimIds: claimsAsc.slice(windowStart, i + 1).map((c) => c.id),
-        from: claimsAsc[windowStart].created_at,
-        to: claimsAsc[i].created_at,
+        landlordIds: rowsAsc.slice(windowStart, i + 1).map((c) => c.id),
+        from: rowsAsc[windowStart].created_at,
+        to: rowsAsc[i].created_at,
       };
     }
   }
@@ -861,72 +857,31 @@ async function getBaSecurityReport(req, res) {
     const windowStart = new Date();
     windowStart.setUTCDate(windowStart.getUTCDate() - SECURITY_REPORT_WINDOW_DAYS);
 
-    const { data: claims, error: claimsErr } = await supabase
-      .from('ba_landlord_claims')
-      .select(
-        'id, ba_id, submitted_name, submitted_phone, match_status, qualification_status, matched_landlord_id, referred_at_signup, created_at, brand_ambassadors(full_name, ba_code, status)'
-      )
+    const { data: landlordRows, error: landlordsErr } = await supabase
+      .from('landlords')
+      .select('id, full_name, ba_id, ba_attribution_disputed, ba_attribution_disputed_at, created_at, brand_ambassadors(full_name, ba_code, status)')
+      .not('ba_id', 'is', null)
       .gte('created_at', windowStart.toISOString())
       .order('created_at', { ascending: true });
-    if (claimsErr) throw claimsErr;
+    if (landlordsErr) throw landlordsErr;
 
-    const rows = claims || [];
+    const rows = landlordRows || [];
 
-    // --- Signal 1: duplicatePhoneAttempts -----------------------------
-    // Any phone number more than one BA has ever tried to submit a
-    // claim for - includes 'conflict' rows (rejected attempts), not
-    // just the winning 'matched' claim.
-    const byPhone = new Map();
-    for (const c of rows) {
-      if (!byPhone.has(c.submitted_phone)) byPhone.set(c.submitted_phone, []);
-      byPhone.get(c.submitted_phone).push(c);
-    }
-    const duplicatePhoneAttempts = [];
-    for (const [phone, list] of byPhone) {
-      const distinctBaIds = [...new Set(list.map((c) => c.ba_id))];
-      if (distinctBaIds.length > 1) {
-        duplicatePhoneAttempts.push({
-          phone,
-          bas: distinctBaIds.map((id) => {
-            const sample = list.find((c) => c.ba_id === id);
-            return {
-              baId: id,
-              baName: sample.brand_ambassadors?.full_name || null,
-              baCode: sample.brand_ambassadors?.ba_code || null,
-              claimIds: list.filter((c) => c.ba_id === id).map((c) => c.id),
-            };
-          }),
-        });
-      }
-    }
-
-    // --- Signal 2: notReferredButMatched -------------------------------
-    const notReferredButMatched = rows
-      .filter((c) => c.match_status === 'matched' && !c.referred_at_signup)
-      .map((c) => ({
-        claimId: c.id,
-        baId: c.ba_id,
-        baName: c.brand_ambassadors?.full_name || null,
-        submittedName: c.submitted_name,
-        submittedPhone: c.submitted_phone,
-        createdAt: c.created_at,
-      }));
-
-    // --- Signal 3: rapidFireSubmissions --------------------------------
+    // --- Signal: rapidFireOnboarding (was rapidFireSubmissions) --------
     const byBa = new Map();
-    for (const c of rows) {
-      if (!byBa.has(c.ba_id)) byBa.set(c.ba_id, []);
-      byBa.get(c.ba_id).push(c);
+    for (const l of rows) {
+      if (!byBa.has(l.ba_id)) byBa.set(l.ba_id, []);
+      byBa.get(l.ba_id).push(l);
     }
     const windowMs = RAPID_FIRE_WINDOW_MINUTES * 60 * 1000;
-    const rapidFireSubmissions = [];
+    const rapidFireOnboarding = [];
     for (const [baId, list] of byBa) {
       const cluster = findRapidFireCluster(list, windowMs, RAPID_FIRE_THRESHOLD);
       if (cluster) {
-        rapidFireSubmissions.push({
+        rapidFireOnboarding.push({
           baId,
           baName: list[0].brand_ambassadors?.full_name || null,
-          claimIds: cluster.claimIds,
+          landlordIds: cluster.landlordIds,
           count: cluster.count,
           windowMinutes: RAPID_FIRE_WINDOW_MINUTES,
           from: cluster.from,
@@ -935,40 +890,34 @@ async function getBaSecurityReport(req, res) {
       }
     }
 
-    // --- Signal 4: disputedAttributions --------------------------------
+    // --- Signal: disputedAttributions -----------------------------------
     // Internal-review-only, per Phase 14 - never shown to the landlord.
-    const candidateLandlordIds = [...new Set(rows.filter((c) => c.matched_landlord_id).map((c) => c.matched_landlord_id))];
-    let disputedAttributions = [];
-    if (candidateLandlordIds.length > 0) {
-      const { data: disputedLandlords, error: dlErr } = await supabase
-        .from('landlords')
-        .select('id, full_name, ba_attribution_disputed_at')
-        .in('id', candidateLandlordIds)
-        .eq('ba_attribution_disputed', true);
-      if (dlErr) throw dlErr;
-
-      const disputedById = new Map((disputedLandlords || []).map((l) => [l.id, l]));
-      disputedAttributions = rows
-        .filter((c) => disputedById.has(c.matched_landlord_id))
-        .map((c) => {
-          const landlord = disputedById.get(c.matched_landlord_id);
-          return {
-            claimId: c.id,
-            baId: c.ba_id,
-            baName: c.brand_ambassadors?.full_name || null,
-            landlordId: landlord.id,
-            landlordName: landlord.full_name,
-            disputedAt: landlord.ba_attribution_disputed_at,
-          };
-        });
-    }
+    const disputedAttributions = rows
+      .filter((l) => l.ba_attribution_disputed)
+      .map((l) => ({
+        landlordId: l.id,
+        landlordName: l.full_name,
+        baId: l.ba_id,
+        baName: l.brand_ambassadors?.full_name || null,
+        disputedAt: l.ba_attribution_disputed_at,
+      }));
 
     return res.json({
       windowDays: SECURITY_REPORT_WINDOW_DAYS,
-      duplicatePhoneAttempts,
-      notReferredButMatched,
-      rapidFireSubmissions,
+      rapidFireOnboarding,
       disputedAttributions,
+      // Retired alongside the manual-claim-submission flow - see the
+      // comment above PART C. Kept in the response (rather than
+      // dropped) so older frontend builds don't crash on a missing
+      // key, and so the reason is visible instead of just "empty".
+      duplicatePhoneAttempts: {
+        retired: true,
+        reason: "Retired: landlords no longer go through a manual claim-submission step a phone number could be duplicated across, so this check no longer applies.",
+      },
+      notReferredButMatched: {
+        retired: true,
+        reason: 'Retired: attribution is now always via the referral link/code at signup - there is no more post-hoc "matched without a referral" case to flag.',
+      },
     });
   } catch (err) {
     logger.error('[baAdminPayout] getBaSecurityReport error:', err.message);

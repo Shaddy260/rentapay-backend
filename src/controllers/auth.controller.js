@@ -11,6 +11,7 @@ const { generateOTP, getOTPExpiry, getPasswordResetOTPExpiry, isOTPExpired } = r
 const { normalizePhone, normalizePhoneOrThrow } = require('../utils/phone');
 const { isValidEmail } = require('../utils/email');
 const { findPhoneConflict } = require('../utils/phoneUniqueness');
+const { findEmailConflict } = require('../utils/emailUniqueness');
 const { checkAndRecordResend, clearResendAttempts } = require('../utils/resendRateLimit');
 const { signToken, effectiveLandlordId } = require('../middleware/auth.middleware');
 const { calculateSubscriptionCost } = require('../utils/pricing');
@@ -391,9 +392,21 @@ async function registerLandlord(req, res) {
     // frontend (see RegisterFlow.jsx's handleSubmitDetails fix). Check
     // explicitly first so this gets the same clean, specific message
     // as every other conflict check above.
+    //
+    // BUG FIX (direct request: "a landlord just logged in using a BA
+    // already used email and it went through"): this used to only
+    // query the landlords table, same as the phone check used to
+    // before findPhoneConflict was introduced above. That meant an
+    // email already used by a brand ambassador (or a manager/
+    // caretaker, or an active tenant) was never caught here, letting
+    // the same email register a second, unrelated account under a
+    // different role. Every other registration path (tenant, manager,
+    // BA) already goes through findEmailConflict - landlord signup was
+    // the one gap. Now email is enforced as globally unique across
+    // every role, exactly like phone.
     if (email) {
-      const { data: existingEmail } = await supabase.from('landlords').select('id').eq('email', email).maybeSingle();
-      if (existingEmail) return res.status(409).json({ error: 'An account with this email already exists.' });
+      const conflictEmail = await findEmailConflict(email, 'landlord');
+      if (conflictEmail) return res.status(409).json({ error: conflictEmail });
     }
 
     const { totalCost } = calculateSubscriptionCost(Number(unitsCount), Number(periodMonths));
@@ -789,8 +802,11 @@ async function updateLandlordRegistrationEmail(req, res) {
     }
 
     if (trimmedEmail !== landlord.email) {
-      const { data: existingEmail } = await supabase.from('landlords').select('id').eq('email', trimmedEmail).neq('id', landlordId).maybeSingle();
-      if (existingEmail) return res.status(409).json({ error: 'An account with this email already exists.' });
+      // Same cross-role gap as registerLandlord above - a BA/manager/
+      // tenant email must be blocked here too, not just another
+      // landlord's email.
+      const conflictEmail = await findEmailConflict(trimmedEmail, 'landlord');
+      if (conflictEmail) return res.status(409).json({ error: conflictEmail });
     }
 
     const emailOtp = generateOTP();
