@@ -1,11 +1,9 @@
 // src/utils/password.js
 //
-// Implements blueprint 3.3 password rules:
-//   - Min 8 characters
-//   - At least one uppercase
-//   - At least one number
-//   - At least one special character
-//   - Cannot equal phone number or name
+// Password rules (relaxed per request):
+//   - Min 6 characters
+//   - Letters and/or digits, user's choice - no forced uppercase,
+//     number, or special character requirement
 
 const bcrypt = require('bcrypt');
 
@@ -24,17 +22,8 @@ const SALT_ROUNDS = 10;
 function validatePasswordStrength(password, { phone, name } = {}) {
   const errors = [];
 
-  if (!password || password.length < 8) {
-    errors.push('Password must be at least 8 characters long.');
-  }
-  if (!/[A-Z]/.test(password)) {
-    errors.push('Password must contain at least one uppercase letter.');
-  }
-  if (!/[0-9]/.test(password)) {
-    errors.push('Password must contain at least one number.');
-  }
-  if (!/[!@#$%^&*(),.?":{}|<>]/.test(password)) {
-    errors.push('Password must contain at least one special character (!@#$%^&* etc).');
+  if (!password || password.length < 6) {
+    errors.push('Password must be at least 6 characters long.');
   }
   if (phone && password === phone) {
     errors.push('Password cannot be the same as your phone number.');

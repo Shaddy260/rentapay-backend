@@ -303,16 +303,31 @@ async function confirmManualSubscriptionPayment(req, res) {
       await completePropertyPurchase(propPayment);
     } else if (record.property_id) {
       // Renewing/activating one specific apartment's own clock.
-      const now = new Date();
-      const expiry = new Date(now);
-      expiry.setMonth(expiry.getMonth() + record.period_months);
+      // FIX: this used to always compute expiry as now + period_months,
+      // throwing away any days the property still had left on its
+      // current clock (e.g. 20 days remaining + a 2-month renewal used
+      // to land on "2 months from today" instead of "2 months + 20
+      // days from today"). Same carry-forward rule as the landlord-level
+      // branch below: start from the property's existing
+      // subscription_expires_at if it's still in the future, only fall
+      // back to "now" if the property had already lapsed.
+      const { data: existingProperty } = await supabase
+        .from('properties')
+        .select('subscription_expires_at')
+        .eq('id', record.property_id)
+        .maybeSingle();
+      let propertyExpiry = existingProperty?.subscription_expires_at
+        ? new Date(existingProperty.subscription_expires_at)
+        : new Date();
+      if (propertyExpiry < new Date()) propertyExpiry = new Date();
+      propertyExpiry.setMonth(propertyExpiry.getMonth() + record.period_months);
       await supabase
         .from('properties')
         .update({
           unit_limit: record.units_count,
           subscription_period_months: record.period_months,
-          subscription_started_at: now.toISOString(),
-          subscription_expires_at: expiry.toISOString(),
+          subscription_started_at: new Date().toISOString(),
+          subscription_expires_at: propertyExpiry.toISOString(),
           subscription_status: 'active',
         })
         .eq('id', record.property_id);

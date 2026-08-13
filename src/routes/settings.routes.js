@@ -9,6 +9,12 @@ const pricingCtrl = require('../controllers/subscriptionPricing.controller');
 const publicRouter = express.Router();
 publicRouter.get('/public/help-contacts', ctrl.getPublicHelpContacts);
 
+// Live base rate + period discount tiers - no auth, since this is
+// needed on the pre-login signup screen (RegisterFlow.jsx) to price
+// a brand-new landlord's first subscription correctly. Read-only,
+// no loyalty/history data exposed.
+publicRouter.get('/public/subscription-pricing', pricingCtrl.getPublicSubscriptionPricing);
+
 // Admin router - mount at /api/admin/settings.
 const adminRouter = express.Router();
 adminRouter.get('/', verifyToken, requireRole('admin'), ctrl.getAdminSettings);

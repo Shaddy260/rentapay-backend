@@ -33,6 +33,26 @@ async function getSubscriptionPricing(req, res) {
   }
 }
 
+// PUBLIC (no auth) - just the current base rate + period discount
+// tiers, nothing else (no loyalty data, no history). Used by the
+// signup flow and "add a property" flow on the frontend so their
+// live price preview always matches whatever admin last set here,
+// instead of a hardcoded number that goes stale the moment admin
+// changes the price.
+async function getPublicSubscriptionPricing(req, res) {
+  try {
+    const settings = await pricingService.getCurrentPricingSettings();
+    return res.json({
+      baseRatePerUnitPerMonth: Number(settings.base_rate_per_unit_per_month),
+      periodDiscounts: settings.period_discounts || {},
+    });
+  } catch (err) {
+    logger.error('[subscriptionPricing] getPublicSubscriptionPricing error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load subscription pricing.' });
+  }
+}
+
 function validatePricingPayload(body) {
   const result = {};
 
@@ -208,6 +228,7 @@ async function revokeLoyaltyDiscount(req, res) {
 
 module.exports = {
   getSubscriptionPricing,
+  getPublicSubscriptionPricing,
   updateSubscriptionPricing,
   getLoyaltyCandidates,
   getActiveLoyaltyDiscounts,
