@@ -61,6 +61,7 @@ const { applyUnitLimitChange } = require('../utils/unitLimitEnforcement');
 const { captureException } = require('../services/sentry.service');
 const tenantRatingReminderService = require('../services/tenantRatingReminder.service');
 const { recordCommissionForPayment } = require('../services/baCommission.service');
+const { consumeLoyaltyDiscount } = require('../services/landlordLoyalty.service');
 const logger = require('../utils/logger');
 
 // ---------------------------------------------------------------------
@@ -545,6 +546,20 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
         'Your RentaPay subscription has been renewed',
         wrapEmailHtml(templates.subscriptionRenewed(currentExpiry.toLocaleDateString('en-GB')))
       );
+    }
+
+    // ONE-TIME DISCOUNT CONSUMPTION (direct request: "after a landlord
+    // renews subscription with the discount... it should expire
+    // unless given another one"): only reached here because this
+    // renewal payment just CONFIRMED complete (resultCode === 0,
+    // checked above) - a failed/abandoned STK push returns before
+    // this point and never touches the discount. Whichever discount
+    // was active at the moment renewSubscription initiated this
+    // payment (captured on subPayment.loyalty_discount_id) is
+    // deactivated now, so it won't apply again on the next renewal
+    // unless the landlord is granted a new one.
+    if (subPayment.loyalty_discount_id) {
+      await consumeLoyaltyDiscount(subPayment.loyalty_discount_id, { subscriptionPaymentId: subPayment.id });
     }
   }
 

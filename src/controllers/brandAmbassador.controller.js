@@ -718,51 +718,39 @@ async function restoreBrandAmbassador(req, res) {
 
 /**
  * SECTION D (consolidated instructions) - referral code format.
- * Old scheme: sequential "BA-0001", "BA-0002", ... - trivially
- * guessable/enumerable. New scheme: `<NAME-SLUG>-<RANDOM5>`, e.g.
- * "JASRAH-4KLT7". The slug is derived from the BA's own registered
- * name (not attacker-controlled - it's set by admin approval of an
- * application the BA already submitted), so it doubles as a
- * human-readable "whose link is this" hint without being predictable,
- * since the random suffix still has to be guessed.
+ * Old scheme #1: sequential "BA-0001", "BA-0002", ... - trivially
+ * guessable/enumerable. Old scheme #2: `<NAME-SLUG>-<RANDOM5>` - still
+ * leaked the BA's name into the code. Current scheme: a single fully
+ * random token, e.g. "RPKHPOUJB" - no name, no sequence, nothing
+ * derived from anything attacker- or admin-visible. Every BA gets one
+ * unique code that no one else can ever hold.
  */
-const AMBIGUOUS_CHARS = /[0O1IL]/g; // excluded from the random suffix
-const RANDOM_SUFFIX_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 0/O/1/I/L removed
-const RANDOM_SUFFIX_LENGTH = 5;
-const NAME_SLUG_MAX_LENGTH = 12;
+const RANDOM_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 0/O/1/I/L removed to avoid visual ambiguity
+const RANDOM_CODE_LENGTH = 9;
 
-function slugifyBaName(fullName) {
-  const slug = String(fullName || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '') // strip spaces/punctuation entirely
-    .slice(0, NAME_SLUG_MAX_LENGTH);
-  return slug || 'BA'; // fallback if the name is empty or all-symbols
-}
-
-function randomSuffix() {
+function randomBaCode() {
   let out = '';
-  for (let i = 0; i < RANDOM_SUFFIX_LENGTH; i++) {
-    out += RANDOM_SUFFIX_ALPHABET[Math.floor(Math.random() * RANDOM_SUFFIX_ALPHABET.length)];
+  for (let i = 0; i < RANDOM_CODE_LENGTH; i++) {
+    out += RANDOM_CODE_ALPHABET[Math.floor(Math.random() * RANDOM_CODE_ALPHABET.length)];
   }
   return out;
 }
 
 /**
- * Generates `<SLUG>-<RANDOM5>` and regenerates the random half on any
- * uniqueness collision against existing ba_code/referral_code values
- * (both columns are always set to the same value, so checking one
- * checks both). Bounded retry loop - a collision on a 5-char,
- * 32-symbol alphabet (32^5 ≈ 33.5M combinations) is already
- * vanishingly unlikely; the cap just guards against an infinite loop
- * if something is structurally wrong (e.g. the table itself is
- * corrupted with duplicates).
+ * Generates a random code and regenerates it on any uniqueness
+ * collision against existing ba_code/referral_code values (both
+ * columns are always set to the same value, so checking one checks
+ * both). Bounded retry loop - a collision on a 9-char, 32-symbol
+ * alphabet (32^9 ≈ 3.5 * 10^13 combinations) is already vanishingly
+ * unlikely; the cap just guards against an infinite loop if something
+ * is structurally wrong (e.g. the table itself is corrupted with
+ * duplicates).
  */
-async function generateBaCode(fullName) {
-  const slug = slugifyBaName(fullName);
+async function generateBaCode() {
   const MAX_ATTEMPTS = 20;
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const candidate = `${slug}-${randomSuffix()}`;
+    const candidate = randomBaCode();
     const { data: existing, error } = await supabase
       .from('brand_ambassadors')
       .select('id')
@@ -789,7 +777,7 @@ async function approveBaApplication(req, res) {
       return res.status(400).json({ error: `This application is already ${application.status}, not pending approval.` });
     }
 
-    const baCode = await generateBaCode(application.full_name);
+    const baCode = await generateBaCode();
     const tempPassword = generateTempPassword();
     const passwordHash = await hashPassword(tempPassword);
 

@@ -39,7 +39,7 @@ const logger = require('../utils/logger');
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 const MAX_LOGIN_ATTEMPTS = 3;
-const LOCKOUT_MINUTES = 30;
+const LOCKOUT_MINUTES = 15;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_LOCKOUT_MINUTES = 15;
 
@@ -409,7 +409,9 @@ async function registerLandlord(req, res) {
       if (conflictEmail) return res.status(409).json({ error: conflictEmail });
     }
 
-    const { totalCost } = calculateSubscriptionCost(Number(unitsCount), Number(periodMonths));
+    // No landlordId yet - this is a brand-new signup, so there's no
+    // loyalty discount to look up.
+    const { totalCost } = await calculateSubscriptionCost(Number(unitsCount), Number(periodMonths));
     const passwordHash = await hashPassword(password);
 
     // PHASE 4 (BA referral-link signup): if a ?ref=BA-XXXX code rode
@@ -713,7 +715,7 @@ async function initiateLandlordSubscriptionPayment(req, res) {
 
     const unitsCount = landlord.unit_limit;
     const periodMonths = landlord.subscription_period_months;
-    const { totalCost } = calculateSubscriptionCost(Number(unitsCount), Number(periodMonths));
+    const { totalCost } = await calculateSubscriptionCost(Number(unitsCount), Number(periodMonths), landlordId);
 
     // Same "never hard-fail on a Daraja hiccup" behaviour this used to
     // have inline in registerLandlord - an STK failure falls back to
@@ -1159,7 +1161,13 @@ async function login(req, res) {
     }
 
     if (account.locked_until && new Date(account.locked_until) > new Date()) {
-      return res.status(423).json({ error: `Account locked due to repeated failed attempts. Try again after ${account.locked_until}.` });
+      // Structured `lockedUntil` (ISO) alongside the message so the
+      // frontend can render a plain-language, live-ticking countdown
+      // instead of parsing/displaying the raw timestamp itself.
+      return res.status(423).json({
+        error: 'Account temporarily locked due to repeated failed attempts.',
+        lockedUntil: account.locked_until,
+      });
     }
 
     const modSuspension = moderationSuspensionError(account);
@@ -1219,7 +1227,7 @@ async function login(req, res) {
       let amountDue = latestPayment?.amount ?? null;
       if (amountDue == null) {
         try {
-          amountDue = calculateSubscriptionCost(account.unit_limit, account.subscription_period_months).totalCost;
+          amountDue = (await calculateSubscriptionCost(account.unit_limit, account.subscription_period_months, account.id)).totalCost;
         } catch {
           amountDue = null;
         }
@@ -1538,7 +1546,13 @@ async function loginWithGoogle(req, res) {
     }
 
     if (account.locked_until && new Date(account.locked_until) > new Date()) {
-      return res.status(423).json({ error: `Account locked due to repeated failed attempts. Try again after ${account.locked_until}.` });
+      // Structured `lockedUntil` (ISO) alongside the message so the
+      // frontend can render a plain-language, live-ticking countdown
+      // instead of parsing/displaying the raw timestamp itself.
+      return res.status(423).json({
+        error: 'Account temporarily locked due to repeated failed attempts.',
+        lockedUntil: account.locked_until,
+      });
     }
 
     const googleModSuspension = moderationSuspensionError(account);

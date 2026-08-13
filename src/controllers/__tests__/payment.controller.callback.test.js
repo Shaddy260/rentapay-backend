@@ -29,9 +29,16 @@ jest.mock('../auth.controller', () => ({ activateLandlordAfterPayment: jest.fn()
 jest.mock('../property.controller', () => ({ processPropertyPaymentCallback: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../../utils/unitLimitEnforcement', () => ({ applyUnitLimitChange: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../../middleware/auth.middleware', () => ({ effectiveLandlordId: jest.fn((req) => req.user?.id) }));
+// P6 (loyalty-discount-roadmap.md): commission recording is a
+// separate concern from discount consumption - stubbed out here so
+// the loyalty-discount tests below don't also have to satisfy its
+// own DB shape (BA lookup, rate resolution, etc).
+jest.mock('../../services/baCommission.service', () => ({ recordCommissionForPayment: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../../services/landlordLoyalty.service', () => ({ consumeLoyaltyDiscount: jest.fn().mockResolvedValue(null) }));
 
 const supabase = require('../../config/supabase');
 const { notify } = require('../../services/notify.service');
+const { consumeLoyaltyDiscount } = require('../../services/landlordLoyalty.service');
 const { setupSupabaseMock } = require('../../test-utils/supabaseMock');
 const { handleSTKCallback } = require('../payment.controller');
 
@@ -197,5 +204,87 @@ describe('handleSTKCallback', () => {
     const res = mockRes();
     await handleSTKCallback(stkBody({ checkoutRequestId: 'CHK1' }), res);
     expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  // P6 (loyalty-discount-roadmap.md): "processSubscriptionPaymentCallback:
+  // discount NOT consumed when resultCode !== 0 (failed/abandoned STK)."
+  describe('loyalty discount consumption on subscription renewal', () => {
+    beforeEach(() => {
+      consumeLoyaltyDiscount.mockClear();
+    });
+
+    test('a failed STK push on a subscription renewal never consumes the attached loyalty discount', async () => {
+      setupSupabaseMock(supabase, {
+        payments: NOT_FOUND,
+        subscription_payments: {
+          data: {
+            id: 'S2',
+            status: 'pending',
+            landlord_id: 'L1',
+            loyalty_discount_id: 'disc-1',
+            period_months: 1,
+            units_count: 5,
+            landlords: { id: 'L1', subscription_status: 'active', subscription_expires_at: null },
+          },
+          error: null,
+        },
+      });
+      const res = mockRes();
+
+      await handleSTKCallback(stkBody({ checkoutRequestId: 'CHK-FAIL', resultCode: 1 }), res);
+
+      expect(consumeLoyaltyDiscount).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(200);
+    });
+
+    test('a successful subscription RENEWAL (not first payment) consumes the discount captured on the payment row', async () => {
+      setupSupabaseMock(supabase, {
+        payments: NOT_FOUND,
+        subscription_payments: {
+          data: {
+            id: 'S3',
+            status: 'pending',
+            landlord_id: 'L1',
+            loyalty_discount_id: 'disc-1',
+            period_months: 1,
+            units_count: 5,
+            amount: 1000,
+            landlords: { id: 'L1', subscription_status: 'active', subscription_expires_at: null, email: null },
+          },
+          error: null,
+        },
+      });
+      const res = mockRes();
+
+      await handleSTKCallback(stkBody({ checkoutRequestId: 'CHK-OK', resultCode: 0, metadata: [{ Name: 'MpesaReceiptNumber', Value: 'RCT1' }] }), res);
+
+      expect(consumeLoyaltyDiscount).toHaveBeenCalledWith('disc-1', { subscriptionPaymentId: 'S3' });
+      expect(res.status).toHaveBeenCalledWith(200);
+    });
+
+    test('a successful FIRST payment (subscription_status pending) never touches the discount (no renewal branch reached)', async () => {
+      setupSupabaseMock(supabase, {
+        payments: NOT_FOUND,
+        subscription_payments: {
+          data: {
+            id: 'S4',
+            status: 'pending',
+            landlord_id: 'L1',
+            loyalty_discount_id: 'disc-1',
+            period_months: 1,
+            units_count: 5,
+            amount: 1000,
+            landlords: { id: 'L1', subscription_status: 'pending' },
+          },
+          error: null,
+        },
+      });
+      const res = mockRes();
+
+      await handleSTKCallback(stkBody({ checkoutRequestId: 'CHK-FIRST', resultCode: 0 }), res);
+
+      expect(consumeLoyaltyDiscount).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(200);
+    });
   });
 });

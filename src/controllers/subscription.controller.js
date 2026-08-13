@@ -11,6 +11,7 @@ const { initiateSTKPush } = require('../services/daraja.service');
 const { logActivity } = require('../services/activityLog.service');
 const { effectiveLandlordId } = require('../middleware/auth.middleware');
 const { captureException } = require('../services/sentry.service');
+const loyaltyService = require('../services/landlordLoyalty.service');
 const logger = require('../utils/logger');
 
 // ---------------------------------------------------------------------
@@ -24,14 +25,26 @@ async function renewSubscription(req, res) {
     const { data: landlord, error: fetchError } = await supabase.from('landlords').select('*').eq('id', landlordId).single();
     if (fetchError || !landlord) return res.status(404).json({ error: 'Landlord not found.' });
 
-    const { totalCost } = calculateSubscriptionCost(Number(unitsCount), Number(periodMonths));
+    const { totalCost, loyaltyDiscountId } = await calculateSubscriptionCost(Number(unitsCount), Number(periodMonths), landlordId);
 
-    const stkResponse = await initiateSTKPush({
-      phoneNumber: landlord.phone,
-      amount: totalCost,
-      accountReference: `RENTAPAY-RENEW-${landlordId.slice(0, 8)}`,
-      transactionDesc: 'RentaPay subscription renewal',
-    });
+    // Same manual-payment fallback as the other STK entry points
+    // (signup, add/renew a property) - an STK failure here used to
+    // just 500, even though this page already has a manual-payment
+    // form sitting right below it that the landlord could use anyway.
+    let stkResponse = null;
+    let stkFailureReason = null;
+    try {
+      stkResponse = await initiateSTKPush({
+        phoneNumber: landlord.phone,
+        amount: totalCost,
+        accountReference: `RENTAPAY-RENEW-${landlordId.slice(0, 8)}`,
+        transactionDesc: 'RentaPay subscription renewal',
+      });
+    } catch (stkErr) {
+      logger.error('[subscription] STK push failed on renewal - falling back to manual payment:', stkErr.message);
+      captureException(stkErr);
+      stkFailureReason = stkErr.message;
+    }
 
     const { data: subPayment, error } = await supabase
       .from('subscription_payments')
@@ -41,8 +54,16 @@ async function renewSubscription(req, res) {
         period_months: periodMonths,
         units_count: unitsCount,
         amount: totalCost,
-        mpesa_checkout_request_id: stkResponse.CheckoutRequestID,
+        mpesa_checkout_request_id: stkResponse ? stkResponse.CheckoutRequestID : null,
         status: 'pending',
+        // ONE-TIME DISCOUNT CONSUMPTION: captures which loyalty
+        // discount (if any) was active at the moment this renewal was
+        // initiated. Only actually consumed once the Daraja callback
+        // confirms this payment completed - see
+        // processSubscriptionPaymentCallback in payment.controller.js
+        // - so a failed/abandoned STK push never costs the landlord
+        // their discount.
+        loyalty_discount_id: loyaltyDiscountId,
       })
       .select()
       .single();
@@ -50,10 +71,14 @@ async function renewSubscription(req, res) {
     if (error) throw error;
 
     return res.json({
-      message: 'M-Pesa prompt sent. Enter your PIN to complete renewal.',
-      checkoutRequestId: stkResponse.CheckoutRequestID,
+      message: stkResponse
+        ? 'M-Pesa prompt sent. Enter your PIN to complete renewal.'
+        : "We couldn't send the automatic M-Pesa prompt right now - pay manually below instead.",
+      checkoutRequestId: stkResponse ? stkResponse.CheckoutRequestID : null,
       amountDue: totalCost,
       subscriptionPaymentId: subPayment.id,
+      stkFailed: !stkResponse,
+      stkFailureReason: stkResponse ? undefined : stkFailureReason,
     });
   } catch (err) {
     logger.error('[subscription] renewSubscription error:', err.message);
@@ -84,7 +109,7 @@ async function addUnitsMidPeriod(req, res) {
     const remainingMs = new Date(landlord.subscription_expires_at).getTime() - Date.now();
     const remainingMonths = Math.max(1, Math.ceil(remainingMs / (1000 * 60 * 60 * 24 * 30)));
 
-    const cost = calculateAddUnitsCost(additionalUnits, remainingMonths);
+    const cost = await calculateAddUnitsCost(additionalUnits, remainingMonths, landlordId);
 
     const stkResponse = await initiateSTKPush({
       phoneNumber: landlord.phone,
@@ -190,4 +215,97 @@ async function getSubscriptionStatus(req, res) {
   }
 }
 
-module.exports = { renewSubscription, addUnitsMidPeriod, confirmAddUnits, getSubscriptionStatus };
+// ---------------------------------------------------------------------
+// LOYALTY DISCOUNT REMINDER POPUP (direct request: "should be sending
+// such landlords whose subscription is not ended that there is a
+// discount to their next renewal... reminding them... should be in
+// app and popup not email"). Polled by
+// LoyaltyDiscountReminderPopup.jsx, same pattern as the tenant-rating
+// reminder popup - the actual notify() call already fired once at
+// grant time (see landlordLoyalty.service.js's bulkGrantLoyaltyDiscount);
+// this is the recurring, dismissible on-screen nudge for as long as
+// the discount sits unused.
+// ---------------------------------------------------------------------
+async function getLoyaltyDiscountReminder(req, res) {
+  try {
+    const landlordId = effectiveLandlordId(req);
+
+    const { data: landlord, error } = await supabase
+      .from('landlords')
+      .select('subscription_status')
+      .eq('id', landlordId)
+      .maybeSingle();
+    if (error || !landlord) return res.status(404).json({ error: 'Landlord not found.' });
+
+    // Only surface the reminder while there's actually a subscription
+    // still running to renew - a landlord whose account has never been
+    // activated ('pending') or has already lapsed ('expired') gets the
+    // renewal/reactivation flow itself, not a "your renewal has a
+    // discount" nudge.
+    if (!['active', 'suspended'].includes(landlord.subscription_status)) {
+      return res.json({ reminder: null });
+    }
+
+    const reminder = await loyaltyService.getReminderForLandlord(landlordId);
+    return res.json({ reminder });
+  } catch (err) {
+    logger.error('[subscription] getLoyaltyDiscountReminder error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to fetch loyalty discount reminder.' });
+  }
+}
+
+async function snoozeLoyaltyDiscountReminder(req, res) {
+  try {
+    const { id } = req.params;
+    const { mode } = req.body; // 'later' | 'not_today'
+    await loyaltyService.snoozeReminder(id, mode);
+    return res.json({ message: 'Snoozed.' });
+  } catch (err) {
+    logger.error('[subscription] snoozeLoyaltyDiscountReminder error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to snooze reminder.' });
+  }
+}
+
+// ---------------------------------------------------------------------
+// SUBSCRIPTION QUOTE (P1 support: "Validate manual payment amounts
+// against the discounted price"). Lets the frontend show the true,
+// discount-inclusive expected total - the exact same number
+// calculateSubscriptionCost() would produce for an STK renewal -
+// BEFORE the landlord ever types an amount into the manual-payment
+// form, instead of the frontend guessing with its own hardcoded
+// rate/discount constants (which drift the moment an admin changes
+// pricing or a loyalty discount is granted/consumed).
+// ---------------------------------------------------------------------
+async function getSubscriptionQuote(req, res) {
+  try {
+    const landlordId = effectiveLandlordId(req);
+    const unitsCount = Number(req.query.unitsCount);
+    const periodMonths = Number(req.query.periodMonths);
+
+    if (!Number.isFinite(unitsCount) || unitsCount < 1) {
+      return res.status(400).json({ error: 'unitsCount must be a whole number, 1 or more.' });
+    }
+    if (!Number.isFinite(periodMonths) || periodMonths < 1) {
+      return res.status(400).json({ error: 'periodMonths must be a whole number, 1 or more.' });
+    }
+
+    const quote = await calculateSubscriptionCost(unitsCount, periodMonths, landlordId);
+    return res.json(quote);
+  } catch (err) {
+    logger.error('[subscription] getSubscriptionQuote error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to calculate subscription cost.' });
+  }
+}
+
+module.exports = {
+  renewSubscription,
+  addUnitsMidPeriod,
+  confirmAddUnits,
+  getSubscriptionStatus,
+  getSubscriptionQuote,
+  getLoyaltyDiscountReminder,
+  snoozeLoyaltyDiscountReminder,
+};

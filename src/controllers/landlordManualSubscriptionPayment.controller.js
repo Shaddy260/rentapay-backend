@@ -19,10 +19,13 @@ const { validatePositiveAmount } = require('../utils/validateAmount');
 const { notify } = require('../services/notify.service');
 const { logActivity } = require('../services/activityLog.service');
 const { activateLandlordAfterPayment } = require('./auth.controller');
+const { completePropertyPurchase } = require('./property.controller');
 const { signToken } = require('../middleware/auth.middleware');
 const { applyUnitLimitChange } = require('../utils/unitLimitEnforcement');
 const { sendEmail, wrapEmailHtml } = require('../services/email.service');
 const templates = require('../services/notificationTemplates');
+const { getActiveDiscountRecordForLandlord, consumeLoyaltyDiscount } = require('../services/landlordLoyalty.service');
+const { calculateSubscriptionCost } = require('../utils/pricing');
 const { PLATFORM_PAYBILL_NUMBER, PLATFORM_PAYBILL_ACCOUNT_NUMBER } = require('../constants/platformPaybill');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
@@ -43,6 +46,16 @@ function adminIdOrNull(id) {
   return UUID_RE.test(id || '') ? id : null;
 }
 
+// P1 (roadmap): "flag (not block) a submission where amount_paid
+// differs materially from the expected total". KES 1 covers rounding
+// noise from calculateSubscriptionCost's own rounding steps without
+// missing a genuine underpayment.
+const AMOUNT_MISMATCH_THRESHOLD = 1;
+function isAmountMismatch(amountPaid, expectedAmount) {
+  if (expectedAmount == null) return false;
+  return Math.abs(Number(amountPaid) - Number(expectedAmount)) > AMOUNT_MISMATCH_THRESHOLD;
+}
+
 // ---------------------------------------------------------------------
 // LANDLORD/MANAGER/CARETAKER: submit proof of a manual payment made
 // directly to RentaPay's platform paybill (no Daraja/STK involved).
@@ -50,10 +63,33 @@ function adminIdOrNull(id) {
 async function submitManualSubscriptionPayment(req, res) {
   try {
     const landlordId = effectiveLandlordId(req);
-    const { propertyId, transactionCode, amountPaid, mpesaPayerName, mpesaPayerPhone, mpesaSmsTimestamp, periodMonths, unitsCount } = req.body;
+    const { propertyId, propertyPaymentId, transactionCode, amountPaid, mpesaPayerName, mpesaPayerPhone, mpesaSmsTimestamp, periodMonths, unitsCount } = req.body;
 
     if (!transactionCode || amountPaid == null || !mpesaPayerName || !mpesaPayerPhone || !unitsCount) {
       return res.status(400).json({ error: 'transactionCode, amountPaid, mpesaPayerName, mpesaPayerPhone, and unitsCount are required.' });
+    }
+
+    // For the "add/renew a property" STK-failed fallback (see
+    // initiatePropertyPurchase / renewPropertySubscription's stkFailed),
+    // propertyPaymentId points at the already-created pending
+    // property_payments row - confirm the landlord actually owns it
+    // before letting them attach a manual payment submission to it.
+    // Also carries `amount`, the authoritative expected total already
+    // computed (discount included) when that property payment was
+    // initiated - reused below as this submission's expected_amount
+    // instead of recomputing, since a property purchase/renewal can
+    // use a chosen period that differs from the landlord-wide one.
+    let propPayment = null;
+    if (propertyPaymentId) {
+      const { data: fetchedPropPayment, error: propPaymentErr } = await supabase
+        .from('property_payments')
+        .select('id, landlord_id, amount')
+        .eq('id', propertyPaymentId)
+        .maybeSingle();
+      if (propPaymentErr || !fetchedPropPayment || fetchedPropPayment.landlord_id !== landlordId) {
+        return res.status(404).json({ error: 'Property payment not found on your account.' });
+      }
+      propPayment = fetchedPropPayment;
     }
     const normalizedPhone = normalizePhone(mpesaPayerPhone);
     if (!normalizedPhone) return res.status(400).json({ error: 'mpesaPayerPhone must be a valid phone number.' });
@@ -81,22 +117,57 @@ async function submitManualSubscriptionPayment(req, res) {
       .limit(1)
       .maybeSingle();
 
+    // ONE-TIME DISCOUNT CONSUMPTION: capture whichever loyalty discount
+    // is active for this landlord right now, at the moment this manual
+    // payment is SUBMITTED - mirrors renewSubscription's STK path. It's
+    // only actually consumed later, once an admin CONFIRMS this record
+    // (see confirmManualSubscriptionPayment) - a rejected or never-
+    // reviewed submission never touches the discount.
+    const discountRecord = await getActiveDiscountRecordForLandlord(landlordId);
+
+    // P1 (roadmap): "compute the expected total (calculateSubscriptionCost)
+    // and store it alongside the submitted amount". A property purchase/
+    // renewal already has its authoritative amount locked in on
+    // property_payments at initiation (propPayment.amount, above) - reuse
+    // that rather than recomputing, since it may use a different period
+    // than the landlord-wide subscription and its own captured discount.
+    // Otherwise (landlord-wide first payment or renewal) compute fresh
+    // against what was actually submitted, so a landlord who fabricates a
+    // smaller units/period pair to lower the "expected" number is still
+    // visible to the admin as amount_paid vs THIS (real) expected total.
+    let expectedAmount = null;
+    try {
+      if (propPayment) {
+        expectedAmount = propPayment.amount != null ? Number(propPayment.amount) : null;
+      } else {
+        const quote = await calculateSubscriptionCost(Number(unitsCount), Number(periodMonths) || 1, landlordId);
+        expectedAmount = quote.totalCost;
+      }
+    } catch (quoteErr) {
+      // Never block a submission over a pricing lookup hiccup - this is
+      // a review aid for the admin, not a gate on the landlord.
+      logger.warn('[landlordManualSubscriptionPayment] failed to compute expected amount:', quoteErr.message);
+    }
+
     const { data: record, error: insertErr } = await supabase
       .from('landlord_manual_subscription_payments')
       .insert({
         landlord_id: landlordId,
         property_id: propertyId || null,
+        property_payment_id: propertyPaymentId || null,
         submitted_by_role: submittedByRole,
         submitted_by_landlord_id: role === 'landlord' ? req.user.id : null,
         submitted_by_manager_id: role !== 'landlord' ? req.user.id : null,
         transaction_code: normalizedTxCode,
         amount_paid: validatedAmount,
+        expected_amount: expectedAmount,
         mpesa_payer_name: String(mpesaPayerName).trim(),
         mpesa_payer_phone: normalizedPhone,
         mpesa_sms_timestamp: mpesaSmsTimestamp || null,
         period_months: Number(periodMonths) || 1,
         units_count: Number(unitsCount),
         duplicate_of: existingConfirmed ? existingConfirmed.id : null,
+        loyalty_discount_id: discountRecord ? discountRecord.id : null,
       })
       .select()
       .single();
@@ -134,6 +205,8 @@ async function submitManualSubscriptionPayment(req, res) {
         : 'Submitted. Your payment will be reviewed and your subscription updated shortly.',
       isDuplicate: !!existingConfirmed,
       confirmation: record,
+      expectedAmount,
+      amountMismatch: isAmountMismatch(validatedAmount, expectedAmount),
       paybillNumber: PLATFORM_PAYBILL_NUMBER,
       accountNumber: PLATFORM_PAYBILL_ACCOUNT_NUMBER,
     });
@@ -180,7 +253,16 @@ async function listManualSubscriptionPayments(req, res) {
 
     const { data, error } = await query;
     if (error) throw error;
-    return res.json(data || []);
+    // P1: same "flag, don't block" treatment as the duplicate-
+    // transaction-code check - surface a material mismatch between
+    // what was submitted and what the system expected, without
+    // stopping the admin from confirming anyway if they judge it fine
+    // (e.g. a landlord who rounded up on the M-Pesa side).
+    const withMismatchFlag = (data || []).map((item) => ({
+      ...item,
+      amount_mismatch: isAmountMismatch(item.amount_paid, item.expected_amount),
+    }));
+    return res.json(withMismatchFlag);
   } catch (err) {
     logger.error('[landlordManualSubscriptionPayment] list error:', err.message);
     captureException(err);
@@ -203,7 +285,23 @@ async function confirmManualSubscriptionPayment(req, res) {
     const landlord = record.landlords;
     const isFirstPayment = landlord.subscription_status === 'pending';
 
-    if (record.property_id) {
+    if (record.property_payment_id) {
+      // "Add a property" or "renew a property" where the STK push
+      // itself failed to send (see initiatePropertyPurchase /
+      // renewPropertySubscription's stkFailed fallback). The pending
+      // property_payments row already has everything needed (new
+      // property's name/location/etc, or which property is renewing) -
+      // completePropertyPurchase is the same idempotent completion used
+      // by the Daraja callback and the self-heal poll, so this just
+      // triggers it manually instead of waiting on Safaricom.
+      const { data: propPayment, error: propPaymentErr } = await supabase
+        .from('property_payments')
+        .select('*')
+        .eq('id', record.property_payment_id)
+        .maybeSingle();
+      if (propPaymentErr || !propPayment) return res.status(404).json({ error: 'Underlying property payment not found.' });
+      await completePropertyPurchase(propPayment);
+    } else if (record.property_id) {
       // Renewing/activating one specific apartment's own clock.
       const now = new Date();
       const expiry = new Date(now);
@@ -246,6 +344,16 @@ async function confirmManualSubscriptionPayment(req, res) {
           'Your RentaPay subscription has been renewed',
           wrapEmailHtml(templates.subscriptionRenewed(currentExpiry.toLocaleDateString('en-GB')))
         );
+      }
+
+      // ONE-TIME DISCOUNT CONSUMPTION: this manual payment is being
+      // CONFIRMED right now by the admin - the discount captured at
+      // submission time (record.loyalty_discount_id) is deactivated
+      // here so it doesn't apply again on the landlord's next renewal.
+      // A rejected/pending record never reaches this branch, so an
+      // unconfirmed submission never costs the landlord their discount.
+      if (record.loyalty_discount_id) {
+        await consumeLoyaltyDiscount(record.loyalty_discount_id, { manualPaymentId: record.id });
       }
     }
 
@@ -375,6 +483,19 @@ async function submitRegistrationManualPayment(req, res) {
       .limit(1)
       .maybeSingle();
 
+    // P1: same expected-amount capture as the post-signup manual
+    // payment path - registration pricing is already locked in on the
+    // landlord row (unit_limit/subscription_period_months) at this
+    // point, so recompute against those rather than anything the
+    // caller sent.
+    let expectedAmount = null;
+    try {
+      const quote = await calculateSubscriptionCost(landlord.unit_limit, landlord.subscription_period_months || 1, landlordId);
+      expectedAmount = quote.totalCost;
+    } catch (quoteErr) {
+      logger.warn('[landlordManualSubscriptionPayment] failed to compute registration expected amount:', quoteErr.message);
+    }
+
     const { data: record, error: insertErr } = await supabase
       .from('landlord_manual_subscription_payments')
       .insert({
@@ -383,6 +504,7 @@ async function submitRegistrationManualPayment(req, res) {
         submitted_by_landlord_id: landlordId,
         transaction_code: normalizedTxCode,
         amount_paid: validatedAmount,
+        expected_amount: expectedAmount,
         mpesa_payer_name: String(mpesaPayerName).trim(),
         mpesa_payer_phone: normalizedPhone,
         mpesa_sms_timestamp: mpesaSmsTimestamp || null,

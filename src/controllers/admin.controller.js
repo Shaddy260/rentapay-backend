@@ -923,7 +923,7 @@ async function getRevenueDashboard(req, res) {
       const unitsCount = l.unit_limit || 0;
       if (unitsCount < 1) continue;
       try {
-        const { ratePerUnitPerMonth } = calculateSubscriptionCost(unitsCount, l.subscription_period_months || 1);
+        const { ratePerUnitPerMonth } = await calculateSubscriptionCost(unitsCount, l.subscription_period_months || 1, l.id);
         mrr += ratePerUnitPerMonth * unitsCount;
       } catch {
         // A malformed subscription_period_months on some old record

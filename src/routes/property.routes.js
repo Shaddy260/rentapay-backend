@@ -34,5 +34,9 @@ router.get(
 router.post('/purchase', requireRole('landlord'), propertyController.initiatePropertyPurchase);
 router.post('/:propertyId/renew', requireRole('landlord'), propertyController.renewPropertySubscription);
 router.get('/purchase-status/:checkoutRequestId', requireRole('landlord'), propertyController.checkPropertyPaymentStatus);
+// Manual-payment fallback poll (no checkoutRequestId exists yet when the
+// STK push itself failed to send) - see initiatePropertyPurchase's
+// stkFailed handling and landlordManualSubscriptionPayment.controller.js.
+router.get('/purchase-status-by-id/:propertyPaymentId', requireRole('landlord'), propertyController.checkPropertyPaymentStatusById);
 
 module.exports = router;

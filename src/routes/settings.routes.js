@@ -2,6 +2,7 @@
 const express = require('express');
 const { verifyToken, requireRole } = require('../middleware/auth.middleware');
 const ctrl = require('../controllers/settings.controller');
+const pricingCtrl = require('../controllers/subscriptionPricing.controller');
 
 // Public router - mount at /api/settings (no auth). Read by every
 // portal's Help modal, including the logged-out login screen.
@@ -19,5 +20,18 @@ adminRouter.get('/help-contacts/numbers', verifyToken, requireRole('admin'), ctr
 adminRouter.post('/help-contacts/numbers', verifyToken, requireRole('admin'), ctrl.createHelpContactNumber);
 adminRouter.patch('/help-contacts/numbers/:id', verifyToken, requireRole('admin'), ctrl.updateHelpContactNumber);
 adminRouter.delete('/help-contacts/numbers/:id', verifyToken, requireRole('admin'), ctrl.deleteHelpContactNumber);
+
+// Subscription fee (base rate + period discount tiers) - affects
+// signup, adding a property, adding units, and renewals everywhere,
+// since they all read from this via utils/pricing.js.
+adminRouter.get('/subscription-pricing', verifyToken, requireRole('admin'), pricingCtrl.getSubscriptionPricing);
+adminRouter.patch('/subscription-pricing', verifyToken, requireRole('admin'), pricingCtrl.updateSubscriptionPricing);
+
+// Loyalty discounts for landlords who've subscribed consecutively.
+adminRouter.get('/loyalty-discounts/candidates', verifyToken, requireRole('admin'), pricingCtrl.getLoyaltyCandidates);
+adminRouter.get('/loyalty-discounts/active', verifyToken, requireRole('admin'), pricingCtrl.getActiveLoyaltyDiscounts);
+adminRouter.get('/loyalty-discounts/history', verifyToken, requireRole('admin'), pricingCtrl.getLoyaltyDiscountHistory);
+adminRouter.post('/loyalty-discounts/bulk-grant', verifyToken, requireRole('admin'), pricingCtrl.bulkGrantLoyaltyDiscount);
+adminRouter.delete('/loyalty-discounts/:landlordId', verifyToken, requireRole('admin'), pricingCtrl.revokeLoyaltyDiscount);
 
 module.exports = { publicRouter, adminRouter };

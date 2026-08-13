@@ -13,6 +13,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { normalizePhoneOrThrow } = require('../utils/phone');
 const { initiateSTKPush, querySTKPushStatus } = require('../services/daraja.service');
 const { calculateAddUnitsCost, calculateSubscriptionCost } = require('../utils/pricing');
+const { consumeLoyaltyDiscount } = require('../services/landlordLoyalty.service');
 const { KENYA_CONSTITUENCIES } = require('../constants/kenyaConstituencies');
 const propertyReputationService = require('../services/propertyReputation.service');
 const { captureException } = require('../services/sentry.service');
@@ -356,14 +357,26 @@ async function initiatePropertyPurchase(req, res) {
     // Priced as its own real subscription (units x chosen months), not
     // prorated against a different property's remaining time - this
     // property's clock and unit count are now entirely its own.
-    const { totalCost } = calculateSubscriptionCost(Number(unitsCount), chosenPeriodMonths);
+    const { totalCost, loyaltyDiscountId } = await calculateSubscriptionCost(Number(unitsCount), chosenPeriodMonths, landlordId);
 
-    const stkResponse = await initiateSTKPush({
-      phoneNumber: landlord.phone,
-      amount: totalCost,
-      accountReference: `RENTAPAY-NEWPROP-${landlordId.slice(0, 8)}`,
-      transactionDesc: 'RentaPay new property + units',
-    });
+    // Same "never hard-fail on a Daraja hiccup" behaviour as
+    // auth.controller.js's initiateLandlordSubscriptionPayment - an STK
+    // failure falls back to manual payment (paybill + admin review)
+    // instead of blocking the landlord from adding the property at all.
+    let stkResponse = null;
+    let stkFailureReason = null;
+    try {
+      stkResponse = await initiateSTKPush({
+        phoneNumber: landlord.phone,
+        amount: totalCost,
+        accountReference: `RENTAPAY-NEWPROP-${landlordId.slice(0, 8)}`,
+        transactionDesc: 'RentaPay new property + units',
+      });
+    } catch (stkErr) {
+      logger.error('[property] STK push failed on new property purchase - falling back to manual payment:', stkErr.message);
+      captureException(stkErr);
+      stkFailureReason = stkErr.message;
+    }
 
     const { data: propPayment, error } = await supabase
       .from('property_payments')
@@ -380,8 +393,15 @@ async function initiatePropertyPurchase(req, res) {
         units_count: Number(unitsCount),
         period_months: chosenPeriodMonths,
         amount: totalCost,
-        mpesa_checkout_request_id: stkResponse.CheckoutRequestID,
+        mpesa_checkout_request_id: stkResponse ? stkResponse.CheckoutRequestID : null,
         status: 'pending',
+        // ONE-TIME DISCOUNT CONSUMPTION (P0 fix): captures which
+        // loyalty discount (if any) was active when this purchase was
+        // initiated - only consumed once completePropertyPurchase
+        // confirms the payment actually completed. See
+        // sql/2026-08-loyalty-discount-consumption-and-reminders.sql
+        // section 4 for why this was missing before.
+        loyalty_discount_id: loyaltyDiscountId,
       })
       .select()
       .single();
@@ -389,11 +409,15 @@ async function initiatePropertyPurchase(req, res) {
     if (error) throw error;
 
     return res.json({
-      message: 'M-Pesa prompt sent. Enter your PIN to add this property.',
-      checkoutRequestId: stkResponse.CheckoutRequestID,
+      message: stkResponse
+        ? 'M-Pesa prompt sent. Enter your PIN to add this property.'
+        : "We couldn't send the automatic M-Pesa prompt right now - pay manually below and this property will be added once verified.",
+      checkoutRequestId: stkResponse ? stkResponse.CheckoutRequestID : null,
       amountDue: totalCost,
       periodMonths: chosenPeriodMonths,
       propertyPaymentId: propPayment.id,
+      stkFailed: !stkResponse,
+      stkFailureReason: stkResponse ? undefined : stkFailureReason,
     });
   } catch (err) {
     logger.error('[property] initiatePropertyPurchase error:', err.message);
@@ -470,6 +494,16 @@ async function completePropertyPurchase(propPayment) {
       metadata: { landlordId: propPayment.landlord_id, newUnitLimit: propPayment.units_count, periodMonths },
     });
 
+    // ONE-TIME DISCOUNT CONSUMPTION (P0 fix): only reached because this
+    // property renewal payment just actually completed - a failed STK
+    // push or an unconfirmed manual submission never reaches this
+    // function's non-idempotent path. Whichever discount was active
+    // when renewPropertySubscription initiated this payment
+    // (propPayment.loyalty_discount_id) is deactivated now.
+    if (propPayment.loyalty_discount_id) {
+      await consumeLoyaltyDiscount(propPayment.loyalty_discount_id, { propertyPaymentId: propPayment.id });
+    }
+
     return propPayment.renews_property_id;
   }
 
@@ -519,6 +553,13 @@ async function completePropertyPurchase(propPayment) {
     metadata: { landlordId: propPayment.landlord_id, unitsCount: propPayment.units_count, periodMonths },
   });
 
+  // ONE-TIME DISCOUNT CONSUMPTION (P0 fix): same reasoning as the
+  // renewal branch above - only reached once this new-property
+  // purchase has actually completed.
+  if (propPayment.loyalty_discount_id) {
+    await consumeLoyaltyDiscount(propPayment.loyalty_discount_id, { propertyPaymentId: propPayment.id });
+  }
+
   return property.id;
 }
 
@@ -546,14 +587,23 @@ async function renewPropertySubscription(req, res) {
     const { data: landlord, error: fetchError } = await supabase.from('landlords').select('phone').eq('id', landlordId).single();
     if (fetchError || !landlord) return res.status(404).json({ error: 'Landlord not found.' });
 
-    const { totalCost } = calculateSubscriptionCost(Number(unitsCount), chosenPeriodMonths);
+    const { totalCost, loyaltyDiscountId } = await calculateSubscriptionCost(Number(unitsCount), chosenPeriodMonths, landlordId);
 
-    const stkResponse = await initiateSTKPush({
-      phoneNumber: landlord.phone,
-      amount: totalCost,
-      accountReference: `RENTAPAY-PROPRENEW-${propertyId.slice(0, 8)}`,
-      transactionDesc: 'RentaPay property subscription renewal',
-    });
+    // Same manual-payment fallback as initiatePropertyPurchase above.
+    let stkResponse = null;
+    let stkFailureReason = null;
+    try {
+      stkResponse = await initiateSTKPush({
+        phoneNumber: landlord.phone,
+        amount: totalCost,
+        accountReference: `RENTAPAY-PROPRENEW-${propertyId.slice(0, 8)}`,
+        transactionDesc: 'RentaPay property subscription renewal',
+      });
+    } catch (stkErr) {
+      logger.error('[property] STK push failed on property renewal - falling back to manual payment:', stkErr.message);
+      captureException(stkErr);
+      stkFailureReason = stkErr.message;
+    }
 
     const { data: propPayment, error } = await supabase
       .from('property_payments')
@@ -563,19 +613,26 @@ async function renewPropertySubscription(req, res) {
         units_count: Number(unitsCount),
         period_months: chosenPeriodMonths,
         amount: totalCost,
-        mpesa_checkout_request_id: stkResponse.CheckoutRequestID,
+        mpesa_checkout_request_id: stkResponse ? stkResponse.CheckoutRequestID : null,
         status: 'pending',
+        // ONE-TIME DISCOUNT CONSUMPTION (P0 fix): see the matching
+        // note in initiatePropertyPurchase above.
+        loyalty_discount_id: loyaltyDiscountId,
       })
       .select()
       .single();
     if (error) throw error;
 
     return res.json({
-      message: 'M-Pesa prompt sent. Enter your PIN to renew this property.',
-      checkoutRequestId: stkResponse.CheckoutRequestID,
+      message: stkResponse
+        ? 'M-Pesa prompt sent. Enter your PIN to renew this property.'
+        : "We couldn't send the automatic M-Pesa prompt right now - pay manually below and this property will be renewed once verified.",
+      checkoutRequestId: stkResponse ? stkResponse.CheckoutRequestID : null,
       amountDue: totalCost,
       periodMonths: chosenPeriodMonths,
       propertyPaymentId: propPayment.id,
+      stkFailed: !stkResponse,
+      stkFailureReason: stkResponse ? undefined : stkFailureReason,
     });
   } catch (err) {
     logger.error('[property] renewPropertySubscription error:', err.message);
@@ -644,6 +701,33 @@ async function checkPropertyPaymentStatus(req, res) {
   }
 }
 
+// Companion to checkPropertyPaymentStatus above, for the manual-payment
+// fallback path where there is no mpesa_checkout_request_id to query
+// Daraja with - just reports whatever completeManualSubscriptionPayment's
+// confirm step (or the STK path) has already set on this row.
+async function checkPropertyPaymentStatusById(req, res) {
+  try {
+    const { propertyPaymentId } = req.params;
+    if (!propertyPaymentId) return res.status(400).json({ error: 'propertyPaymentId is required.' });
+
+    const { data: propPayment, error } = await supabase.from('property_payments').select('*').eq('id', propertyPaymentId).maybeSingle();
+    if (error || !propPayment) return res.status(404).json({ error: 'No payment found for that id.' });
+    if (propPayment.landlord_id !== effectiveLandlordId(req)) return res.status(403).json({ error: 'Not your payment.' });
+
+    if (propPayment.status === 'completed') {
+      return res.json({ status: 'completed', propertyId: propPayment.created_property_id });
+    }
+    if (propPayment.status === 'failed') {
+      return res.json({ status: 'failed' });
+    }
+    return res.json({ status: 'pending' });
+  } catch (err) {
+    logger.error('[property] checkPropertyPaymentStatusById error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to check payment status.' });
+  }
+}
+
 module.exports = {
   listProperties,
   createProperty,
@@ -653,5 +737,7 @@ module.exports = {
   initiatePropertyPurchase,
   renewPropertySubscription,
   checkPropertyPaymentStatus,
+  checkPropertyPaymentStatusById,
   processPropertyPaymentCallback,
+  completePropertyPurchase,
 };

@@ -39,7 +39,7 @@ function makeBuilder(initialResult) {
   const builder = { __result: result, __thenResult: result };
   const chainMethods = [
     'select', 'insert', 'update', 'upsert', 'delete',
-    'eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'like', 'ilike', 'in', 'is',
+    'eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'like', 'ilike', 'in', 'is', 'or', 'not',
     'order', 'limit', 'range', 'contains',
   ];
   chainMethods.forEach((method) => {

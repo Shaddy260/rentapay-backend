@@ -22,6 +22,7 @@ router.post('/renew', requireRole('landlord', 'manager'), subController.renewSub
 router.post('/add-units', requireRole('landlord', 'manager'), subController.addUnitsMidPeriod);
 router.get('/status', requireRole('landlord', 'manager'), subController.getSubscriptionStatus);
 router.get('/status/:landlordId', requireRole('admin'), subController.getSubscriptionStatus);
+router.get('/quote', requireRole('landlord', 'manager'), subController.getSubscriptionQuote);
 
 // "Didn't receive the popup? Pay manually" fallback - direct request
 // that this should work for the landlord OR any of their subordinates
@@ -31,5 +32,9 @@ router.get('/status/:landlordId', requireRole('admin'), subController.getSubscri
 // requireRole('landlord', 'manager') already covers both.
 router.post('/manual-payment', requireRole('landlord', 'manager'), manualController.submitManualSubscriptionPayment);
 router.get('/manual-payment/mine', requireRole('landlord', 'manager'), manualController.getMyLatestManualSubscriptionPayment);
+
+// Loyalty discount reminder popup - in-app only, polled periodically.
+router.get('/loyalty-discount-reminder', requireRole('landlord', 'manager'), subController.getLoyaltyDiscountReminder);
+router.post('/loyalty-discount-reminder/:id/snooze', requireRole('landlord', 'manager'), subController.snoozeLoyaltyDiscountReminder);
 
 module.exports = router;
