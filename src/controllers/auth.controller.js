@@ -5,9 +5,10 @@
 // Note: tenant ACCOUNTS are created by landlords (see tenant.controller.js),
 // this file just handles their login + OTP verification.
 
+const crypto = require('crypto');
 const supabase = require('../config/supabase');
 const { hashPassword, comparePassword, validatePasswordStrength } = require('../utils/password');
-const { generateOTP, getOTPExpiry, getPasswordResetOTPExpiry, isOTPExpired } = require('../utils/otp');
+const { generateOTP, getOTPExpiry, getPasswordResetOTPExpiry, getEmailVerificationOTPExpiry, isOTPExpired } = require('../utils/otp');
 const { normalizePhone, normalizePhoneOrThrow } = require('../utils/phone');
 const { isValidEmail } = require('../utils/email');
 const { findPhoneConflict } = require('../utils/phoneUniqueness');
@@ -310,11 +311,127 @@ function accountTypeLabel(accountType, account) {
 // LANDLORD REGISTRATION (blueprint 3.1)
 // Step 1: collect details + chosen plan, trigger STK push for subscription
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// DIRECT REQUEST: a landlord must verify their email on the SAME page
+// as their details, before continuing to payment - same as how a
+// tenant confirms their email on the same page before submitting via
+// the onboarding link. This REPLACES the old flow where the account
+// was created first and an OTP was verified on a separate step/page
+// afterward. Mirrors requestBaEmailVerification /
+// confirmBaEmailVerification in brandAmbassador.controller.js exactly:
+// keyed by the raw email string in landlord_registration_email_otps
+// (see sql/add-landlord-registration-email-otps.sql), since no
+// landlords row exists yet - the person hasn't submitted the form.
+// ---------------------------------------------------------------------
+async function requestLandlordEmailVerification(req, res) {
+  try {
+    const { email } = req.body;
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    // Same courtesy as the old post-registration flow: catch an
+    // already-used email here, before any code is sent, rather than
+    // letting the landlord verify an address they can't register with
+    // anyway.
+    const conflictEmail = await findEmailConflict(normalizedEmail, 'landlord');
+    if (conflictEmail) return res.status(409).json({ error: conflictEmail });
+
+    const otp = generateOTP();
+    const expiresAt = getEmailVerificationOTPExpiry();
+
+    const { error: upsertErr } = await supabase
+      .from('landlord_registration_email_otps')
+      .upsert(
+        {
+          email: normalizedEmail,
+          otp_code: otp,
+          expires_at: expiresAt.toISOString(),
+          verified: false,
+          verification_token: null,
+          failed_attempts: 0,
+          locked_until: null,
+        },
+        { onConflict: 'email' }
+      );
+    if (upsertErr) throw upsertErr;
+
+    try {
+      await sendEmail(
+        normalizedEmail,
+        'Verify your RentaPay email',
+        wrapEmailHtml(`Your RentaPay verification code is: ${otp}\n\nThis code expires in 10 minutes. Enter it on the signup page to verify your email.`)
+      );
+    } catch (emailErr) {
+      logger.error('[auth] requestLandlordEmailVerification: failed to send:', emailErr.message);
+      captureException(emailErr);
+      return res.status(502).json({ error: 'Could not send the verification email. Please check the address and try again.' });
+    }
+
+    return res.json({ message: 'Verification code sent to your email.' });
+  } catch (err) {
+    logger.error('[auth] requestLandlordEmailVerification error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to send verification code.' });
+  }
+}
+
+// PUBLIC - step 2: confirm the code. Returns a short-lived opaque
+// token (NOT the OTP itself) the frontend must send back on
+// registerLandlord - proves this exact email was confirmed in this
+// same flow.
+async function confirmLandlordEmailVerification(req, res) {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ error: 'Email and code are required.' });
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const { data: record, error: recordErr } = await supabase
+      .from('landlord_registration_email_otps')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .maybeSingle();
+    if (recordErr) throw recordErr;
+    if (!record) return res.status(400).json({ error: 'Request a verification code for this email first.' });
+
+    if (record.locked_until && new Date(record.locked_until) > new Date()) {
+      return res.status(423).json({ error: `Too many incorrect codes. Try again after ${record.locked_until}, or request a new code.` });
+    }
+    if (isOTPExpired(record.expires_at)) {
+      return res.status(400).json({ error: 'That code has expired. Request a new one.' });
+    }
+    if (record.otp_code !== String(otp).trim()) {
+      const failedAttempts = (record.failed_attempts || 0) + 1;
+      const update = { failed_attempts: failedAttempts };
+      if (failedAttempts >= 5) {
+        const lockUntil = new Date();
+        lockUntil.setMinutes(lockUntil.getMinutes() + 15);
+        update.locked_until = lockUntil.toISOString();
+      }
+      await supabase.from('landlord_registration_email_otps').update(update).eq('id', record.id);
+      return res.status(400).json({ error: 'Incorrect code. Please try again.' });
+    }
+
+    const verificationToken = crypto.randomBytes(24).toString('hex');
+    await supabase
+      .from('landlord_registration_email_otps')
+      .update({ verified: true, verification_token: verificationToken, failed_attempts: 0, locked_until: null })
+      .eq('id', record.id);
+
+    return res.json({ verified: true, emailVerification: verificationToken });
+  } catch (err) {
+    logger.error('[auth] confirmLandlordEmailVerification error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to verify code.' });
+  }
+}
+
 async function registerLandlord(req, res) {
   let insertedLandlordId = null; // tracked so we can roll back on failure
 
   try {
-    let { fullName, phone, email, password, gender, unitsCount, periodMonths, whatsappNumber, refCode } = req.body;
+    let { fullName, phone, email, password, gender, unitsCount, periodMonths, whatsappNumber, refCode, emailVerification } = req.body;
 
     // DIRECT REQUEST: email is now mandatory during setup - it's the
     // only channel OTPs, password resets, and every other account
@@ -327,6 +444,29 @@ async function registerLandlord(req, res) {
     email = email.trim();
     if (!isValidEmail(email)) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+
+    // DIRECT REQUEST: the landlord must verify their email on the SAME
+    // page as their details, before continuing to payment - just like
+    // a tenant confirms on the same page before submitting via the
+    // onboarding link. So by the time this endpoint is called, the
+    // email must already have been confirmed via
+    // requestLandlordEmailVerification / confirmLandlordEmailVerification
+    // above, for this EXACT address, and the frontend must echo back
+    // the token that proved it - same pattern as submitBaOnboarding's
+    // emailVerification check.
+    const normalizedEmail = email.toLowerCase();
+    if (!emailVerification) {
+      return res.status(400).json({ error: 'Please verify your email address before submitting.', emailNotVerified: true });
+    }
+    const { data: emailOtpRecord, error: emailOtpErr } = await supabase
+      .from('landlord_registration_email_otps')
+      .select('verified, verification_token')
+      .eq('email', normalizedEmail)
+      .maybeSingle();
+    if (emailOtpErr) throw emailOtpErr;
+    if (!emailOtpRecord?.verified || emailOtpRecord.verification_token !== emailVerification) {
+      return res.status(400).json({ error: 'Please verify your email address before submitting.', emailNotVerified: true });
     }
 
     // Optional - direct request to ask gender during setup so the
@@ -452,6 +592,11 @@ async function registerLandlord(req, res) {
         unit_limit: unitsCount,
         subscription_status: 'pending',
         ba_id: referredByBaId,
+        // Email was already confirmed on the details page, before this
+        // account row ever existed (see the emailVerification check
+        // above) - so there's nothing left for a later OTP step to
+        // prove after the fact.
+        email_verified: true,
       })
       .select()
       .single();
@@ -472,33 +617,12 @@ async function registerLandlord(req, res) {
     // landlordLead.controller.js for details.
     await convertMatchingLeadForPhone(phone, landlord.id);
 
-    // DIRECT REQUEST: landlord should get an OTP by email to verify
-    // the email address at signup. Deliberately separate from
-    // is_verified (see 2026-07-landlord-email-verification.sql) -
-    // this only proves the email works, it doesn't activate the
-    // account (payment still does that, unchanged). Never blocks
-    // registration if the send fails - sendEmail() never throws, and
-    // the landlord can always request a fresh code via
-    // resendLandlordEmailOTP.
-    const emailOtp = generateOTP();
-    const emailOtpExpiresAt = getOTPExpiry();
-    await supabase
-      .from('landlords')
-      .update({ email_otp_code: emailOtp, email_otp_expires_at: emailOtpExpiresAt.toISOString() })
-      .eq('id', landlord.id);
-    await sendEmail(
-      email,
-      'Verify your RentaPay email',
-      wrapEmailHtml(`Hi ${fullName},\n\nYour RentaPay email verification code is: ${emailOtp}\n\nThis code expires in 24 hours.`)
-    );
-
-    // DIRECT REQUEST (reordered flow): registration no longer triggers
-    // the M-Pesa STK push here. Email verification now sits BETWEEN
-    // account creation and payment - a landlord must verify their email
-    // first, and only then lands on the Payment step, which is what
-    // actually calls initiateLandlordSubscriptionPayment below. This
-    // also means a mistyped email can be corrected before any payment
-    // attempt is ever made, instead of racing a live M-Pesa prompt.
+    // DIRECT REQUEST (reordered flow): registration no longer creates
+    // its own email OTP here - verification already happened on the
+    // details page before submission (see emailVerification check
+    // above). The landlord goes straight from "Your details" to the
+    // Payment step now, with no separate "Verify email" step/page in
+    // between.
     logActivity({
       actorType: 'system',
       action: 'landlord_registration_initiated',
@@ -508,7 +632,7 @@ async function registerLandlord(req, res) {
     });
 
     return res.status(201).json({
-      message: 'Registration saved. Please verify your email to continue to payment.',
+      message: 'Registration saved. Continue to payment.',
       landlordId: landlord.id,
       amountDue: totalCost,
     });
@@ -2754,6 +2878,8 @@ async function resetPassword(req, res) {
 
 module.exports = {
   registerLandlord,
+  requestLandlordEmailVerification,
+  confirmLandlordEmailVerification,
   activateLandlordAfterPayment,
   verifyOTP,
   verifyLandlordEmailOTP,

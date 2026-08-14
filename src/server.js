@@ -56,6 +56,7 @@ const { startBaQualificationJob } = require('./jobs/baQualification.job');
 const { startNotificationBatchFlushJob } = require('./jobs/notificationBatchFlush.job');
 const { startLoyaltyDiscountExpiryJob } = require('./jobs/loyaltyDiscountExpiry.job');
 const { startLoyaltyCandidateDetectionJob } = require('./jobs/loyaltyCandidateDetection.job'); // P5
+const { startIncompleteSignupReminderJob } = require('./jobs/incompleteSignupReminder.job');
 const { initSentry, captureException } = require('./services/sentry.service');
 const logger = require('./utils/logger');
 const requestLoggerMiddleware = require('./middleware/requestLogger.middleware');
@@ -293,4 +294,5 @@ app.listen(PORT, () => {
   startNotificationBatchFlushJob();
   startLoyaltyDiscountExpiryJob();
   startLoyaltyCandidateDetectionJob(); // P5
+  startIncompleteSignupReminderJob();
 });

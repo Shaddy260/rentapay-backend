@@ -272,6 +272,30 @@ async function runQualificationDryRun(req, res) {
   }
 }
 
+// FIX (direct request: landlords stuck showing "Pending" in a BA's
+// dashboard with "0 qualifying" - the nightly cron only runs at
+// 00:05, so anyone who paid earlier today has to wait until then).
+// Lets admin trigger the SAME check the nightly cron runs, for real
+// (not a dry-run) - useful right after deploying this fix, to
+// immediately qualify + backfill commission for landlords whose first
+// payment completed before the fix existed, without waiting for the
+// next scheduled run.
+async function runQualificationNow(req, res) {
+  try {
+    const result = await runBaQualificationCheck();
+    return res.json({
+      checked: result.checked,
+      qualified: result.qualified,
+      skippedInactiveBa: result.skippedInactiveBa,
+      errors: result.errors,
+    });
+  } catch (err) {
+    logger.error('[payoutRules] runQualificationNow error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to run the qualification check.' });
+  }
+}
+
 function csvEscape(value) {
   return `"${String(value ?? '').replace(/"/g, '""')}"`;
 }
@@ -282,7 +306,7 @@ async function downloadQualificationDryRunCsv(req, res) {
     const rows = result.report || [];
 
     const lines = [
-      ['Landlord ID', 'BA Code', 'BA Name', 'Landlord Name', 'Would-be Qualified Unit Count'].join(','),
+      ['Landlord ID', 'BA Code', 'BA Name', 'Landlord Name'].join(','),
     ];
     for (const r of rows) {
       lines.push(
@@ -291,7 +315,6 @@ async function downloadQualificationDryRunCsv(req, res) {
           csvEscape(r.baCode),
           csvEscape(r.baName),
           csvEscape(r.landlordName),
-          Number(r.wouldBeQualifiedUnitCount || 0),
         ].join(',')
       );
     }
@@ -316,5 +339,6 @@ module.exports = {
   setBaPayoutOverride,
   getPayoutRuleHistory,
   runQualificationDryRun,
+  runQualificationNow,
   downloadQualificationDryRunCsv,
 };

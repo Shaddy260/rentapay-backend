@@ -7,7 +7,7 @@ const { captureException } = require('./sentry.service');
 const logger = require('../utils/logger');
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'noreply@rentapay.co.ke';
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM || 'RentaPay <rentapay@rentapay.co.ke>';
 
 // Single source of truth for the platform's support address (direct
 // request: "update the support emails across the platform to

@@ -93,6 +93,7 @@ router.get('/payout-rules/history', verifyToken, requireRole('admin'), payoutRul
 // safe to call as often as needed (e.g. right after a rate/tier
 // change) without touching the live scheduled job.
 router.post('/qualification/dry-run', verifyToken, requireRole('admin'), payoutRulesCtrl.runQualificationDryRun);
+router.post('/qualification/run-now', verifyToken, requireRole('admin'), payoutRulesCtrl.runQualificationNow);
 router.get('/qualification/dry-run.csv', verifyToken, requireRole('admin'), payoutRulesCtrl.downloadQualificationDryRunCsv);
 
 // PHASE 11 - Admin: Payout Review, Reconciliation & Cross-BA Security

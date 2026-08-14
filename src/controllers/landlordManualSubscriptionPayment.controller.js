@@ -19,6 +19,7 @@ const { validatePositiveAmount } = require('../utils/validateAmount');
 const { notify } = require('../services/notify.service');
 const { logActivity } = require('../services/activityLog.service');
 const { activateLandlordAfterPayment } = require('./auth.controller');
+const { recordCommissionForPayment } = require('../services/baCommission.service');
 const { completePropertyPurchase } = require('./property.controller');
 const { signToken } = require('../middleware/auth.middleware');
 const { applyUnitLimitChange } = require('../utils/unitLimitEnforcement');
@@ -338,6 +339,72 @@ async function confirmManualSubscriptionPayment(req, res) {
       // flips status to active - no OTP involved).
       await supabase.from('landlords').update({ unit_limit: record.units_count }).eq('id', landlord.id);
       await activateLandlordAfterPayment(landlord.id, record.period_months);
+
+      // FIX (direct request: "the system doesn't seem to be picking up
+      // the data automatically... resolve that, to match percentage of
+      // what is set in admin portal" - "0 qualifying"): a landlord who
+      // pays via manual confirmation (STK popup never arrived) used to
+      // never qualify their referring BA for commission at all - this
+      // whole branch never touched ba_qualification_status or wrote
+      // any ba_commission_earnings row, unlike the Daraja auto-confirm
+      // path in payment.controller.js. Mirrors that path exactly now:
+      // insert the subscription_payments row this manual flow never
+      // created (needed since ba_commission_earnings.subscription_payment_id
+      // is a foreign key into that table), qualify the BA immediately
+      // (no unit-count requirement, no waiting on the nightly cron),
+      // then record a ONE-TIME commission against this first payment.
+      const plan = record.units_count <= 10 ? 'starter' : record.units_count <= 50 ? 'standard' : 'premium';
+      const paidAtIso = new Date().toISOString();
+      const { data: subPaymentRow, error: subPaymentErr } = await supabase
+        .from('subscription_payments')
+        .insert({
+          landlord_id: landlord.id,
+          plan,
+          period_months: record.period_months,
+          units_count: record.units_count,
+          amount: record.amount_paid,
+          mpesa_transaction_id: record.transaction_code,
+          mpesa_phone: record.mpesa_payer_phone,
+          status: 'completed',
+          paid_at: paidAtIso,
+        })
+        .select()
+        .maybeSingle();
+      if (subPaymentErr) {
+        logger.error(`[landlordManualSubscriptionPayment] Failed to record subscription_payments row for manual payment ${record.id}:`, subPaymentErr.message);
+        captureException(subPaymentErr);
+      }
+
+      if (landlord.ba_id && landlord.ba_qualification_status === 'pending') {
+        const qualifiedAt = new Date().toISOString();
+        const { error: qualifyErr } = await supabase
+          .from('landlords')
+          .update({ ba_qualification_status: 'qualified', ba_qualified_at: qualifiedAt })
+          .eq('id', landlord.id)
+          .eq('ba_qualification_status', 'pending');
+        if (qualifyErr) {
+          logger.error(`[landlordManualSubscriptionPayment] Failed to qualify BA landlord ${landlord.id} inline:`, qualifyErr.message);
+          captureException(qualifyErr);
+        } else {
+          landlord.ba_qualification_status = 'qualified';
+          logActivity({
+            actorType: 'system',
+            action: 'ba_landlord_qualified',
+            targetType: 'landlord',
+            targetId: landlord.id,
+            metadata: { baId: landlord.ba_id, trigger: 'first_payment_manual' },
+          });
+        }
+      }
+
+      if (subPaymentRow) {
+        await recordCommissionForPayment({
+          id: subPaymentRow.id,
+          landlord_id: landlord.id,
+          amount: record.amount_paid,
+          paid_at: paidAtIso,
+        });
+      }
     } else {
       let currentExpiry = landlord.subscription_expires_at ? new Date(landlord.subscription_expires_at) : new Date();
       if (currentExpiry < new Date()) currentExpiry = new Date();

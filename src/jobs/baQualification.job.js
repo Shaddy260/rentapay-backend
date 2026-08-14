@@ -1,38 +1,32 @@
 // src/jobs/baQualification.job.js
 //
 // SECTION C (consolidated change instructions) - REPLACES the old
-// claims-based qualification trigger entirely. The daily job now
-// queries `landlords` directly:
+// claims-based qualification trigger entirely.
 //
-//   ba_id is not null AND a completed payment exists AND at least
-//   one unit is set up
-//
-// The moment both conditions are true, the landlord flips from
-// ba_qualification_status = 'pending' to 'qualified' - automatically,
-// no admin action, no ba_landlord_claims table involved (that table,
-// and everything built on it, was removed in Section A - see
-// 2026-08-remove-manual-ba-claims.sql).
-//
-// Qualification remains a ONE-TIME GATE per landlord (not
-// re-evaluated repeatedly): once qualified, it stays qualified even if
-// the landlord's subscription later lapses. If it lapses and later
-// restarts, qualification is NOT re-run - per Section C, "earning
-// simply resumes on their next completed payment" once the payout
-// system (Section E, percentage commission - not yet implemented)
-// exists to act on it.
+// FIX (direct request: "no matter how much a landlord first signs up
+// with, that account qualifies for payment... right now all are just
+// saying 0 qualifying"): qualification and commission are now
+// primarily handled INLINE, the instant a landlord's first
+// subscription payment completes - see the ba_qualification_status /
+// recordCommissionForPayment block in payment.controller.js
+// (processSubscriptionPaymentCallback) and
+// landlordManualSubscriptionPayment.controller.js
+// (confirmManualSubscriptionPayment). This job now exists as a
+// SAFETY NET / BACKFILL only - it catches:
+//   (a) any landlord who somehow still has ba_qualification_status =
+//       'pending' despite a completed payment (e.g. the inline update
+//       failed, or a payment completed before this fix was deployed -
+//       exactly the "Pending" landlords stuck in a BA's dashboard
+//       that prompted this fix), and
+//   (b) commission that was never recorded for that landlord's first
+//       payment, for the same reason.
+// The unit-count requirement the old version of this job had ("at
+// least one unit set up") is REMOVED per direct instruction -
+// qualification is based on signing up and paying, nothing else.
 //
 // Keeps the same schedule and heartbeat/logging pattern as before
-// (node-cron, upsert into system_heartbeats every run, same
-// pending-record fan-out shape via runInBatches) - see Section C's
-// "Keep unchanged" note.
-//
-// NOTE ON SCOPE: commission-tier / payout-amount computation (the old
-// job's Phase 10 logic) is NOT reproduced here. That belongs to
-// Section E (percentage-based commission, replacing commission_tiers
-// entirely) and Section F (Payout Run), neither of which is part of
-// this change set. This job's only job now is the qualification flip
-// itself - computing and recording what a qualified landlord actually
-// EARNS is a separate, not-yet-implemented piece of work.
+// (node-cron, upsert into system_heartbeats every run) - see Section
+// C's "Keep unchanged" note.
 //
 // DRY_RUN (kept from the prior implementation): set
 // BA_QUALIFICATION_DRY_RUN=true to compute who WOULD qualify and log
@@ -45,6 +39,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { notify } = require('../services/notify.service');
 const { queueBatchedNotification } = require('../services/notificationBatch.service');
 const { runInBatches } = require('../utils/concurrency');
+const { recordCommissionForPayment } = require('../services/baCommission.service');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
 
@@ -154,30 +149,32 @@ async function runBaQualificationCheck(options = {}) {
       return eligible;
     });
 
-    // Bulk-fetch unit counts and completed-payment existence so each
-    // landlord's check below is pure in-memory work, no per-landlord
-    // round trip.
+    // Bulk-fetch each eligible landlord's EARLIEST completed payment -
+    // used both to gate qualification (hasCompletedPayment) and, for
+    // any landlord this flips to qualified below, to backfill a
+    // commission record if payment.controller.js's inline path never
+    // got the chance to (e.g. this landlord's first payment completed
+    // before that fix was deployed). No unit-count fetch/gate anymore -
+    // removed per direct instruction, see the top-of-file comment.
     const landlordIds = eligibleLandlords.map((l) => l.id);
-    let unitsCountByLandlord = new Map();
-    let hasCompletedPaymentByLandlord = new Set();
+    let earliestPaymentByLandlord = new Map();
     if (landlordIds.length > 0) {
-      const [{ data: units, error: unitsErr }, { data: payments, error: paymentsErr }] = await Promise.all([
-        supabase.from('units').select('id, landlord_id').in('landlord_id', landlordIds),
-        supabase
-          .from('subscription_payments')
-          .select('landlord_id')
-          .in('landlord_id', landlordIds)
-          .eq('status', 'completed'),
-      ]);
-      if (unitsErr) throw unitsErr;
+      const { data: payments, error: paymentsErr } = await supabase
+        .from('subscription_payments')
+        .select('id, landlord_id, amount, paid_at')
+        .in('landlord_id', landlordIds)
+        .eq('status', 'completed')
+        .order('paid_at', { ascending: true });
       if (paymentsErr) throw paymentsErr;
 
-      unitsCountByLandlord = (units || []).reduce((map, u) => {
-        map.set(u.landlord_id, (map.get(u.landlord_id) || 0) + 1);
-        return map;
-      }, new Map());
-
-      hasCompletedPaymentByLandlord = new Set((payments || []).map((p) => p.landlord_id));
+      for (const p of payments || []) {
+        // First row wins per landlord_id, since the query is already
+        // ordered ascending by paid_at - later rows for the same
+        // landlord are renewals, not their qualifying payment.
+        if (!earliestPaymentByLandlord.has(p.landlord_id)) {
+          earliestPaymentByLandlord.set(p.landlord_id, p);
+        }
+      }
     }
 
     // Notifications to send at the end (batched per BA - Phase 20
@@ -190,15 +187,12 @@ async function runBaQualificationCheck(options = {}) {
       eligibleLandlords,
       async (landlord) => {
         const ba = baById.get(landlord.ba_id);
-        const unitsCount = unitsCountByLandlord.get(landlord.id) || 0;
-        const hasCompletedPayment = hasCompletedPaymentByLandlord.has(landlord.id);
+        const earliestPayment = earliestPaymentByLandlord.get(landlord.id);
 
-        // SECTION C: the ONLY gate - payment completed AND at least
-        // one unit set up. No consecutive-months requirement, no
-        // unit-volume bracket, no commission-tier lookup (those
-        // belong to the not-yet-implemented Section E/F payout
-        // system).
-        if (!hasCompletedPayment || unitsCount < 1) return;
+        // FIX (direct request): the ONLY gate now is a completed
+        // payment - no unit-count requirement, no consecutive-months
+        // requirement, no commission-tier lookup.
+        if (!earliestPayment) return;
 
         const qualifiedAt = new Date().toISOString();
 
@@ -210,10 +204,9 @@ async function runBaQualificationCheck(options = {}) {
             baCode: ba.ba_code,
             baName: ba.full_name,
             landlordName: landlord.full_name,
-            wouldBeQualifiedUnitCount: unitsCount,
           });
           logger.info(
-            `[cron] baQualification DRY RUN: landlord ${landlord.id} (BA ${landlord.ba_id}) would qualify - units=${unitsCount}, hasCompletedPayment=true`
+            `[cron] baQualification DRY RUN: landlord ${landlord.id} (BA ${landlord.ba_id}) would qualify - hasCompletedPayment=true`
           );
           return;
         }
@@ -228,12 +221,25 @@ async function runBaQualificationCheck(options = {}) {
           .eq('ba_qualification_status', 'pending'); // idempotency guard against a double-run
         if (updateErr) throw updateErr;
 
+        // BACKFILL: this landlord's first payment may have completed
+        // before the inline qualify-and-record fix existed (or the
+        // inline attempt failed) - recordCommissionForPayment is
+        // idempotent (unique index on subscription_payment_id), so
+        // calling it here is always safe even if it was already
+        // recorded inline.
+        await recordCommissionForPayment({
+          id: earliestPayment.id,
+          landlord_id: landlord.id,
+          amount: earliestPayment.amount,
+          paid_at: earliestPayment.paid_at,
+        });
+
         logActivity({
           actorType: 'system',
           action: 'ba_landlord_qualified',
           targetType: 'landlord',
           targetId: landlord.id,
-          metadata: { baId: landlord.ba_id, unitsCount },
+          metadata: { baId: landlord.ba_id, trigger: 'qualification_job_backfill' },
         });
 
         summary.qualified += 1;

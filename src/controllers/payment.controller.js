@@ -481,13 +481,6 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
     })
     .eq('id', subPayment.id);
 
-  // SECTION E: every completed landlord subscription payment
-  // independently computes and records BA commission (percentage of
-  // this payment, not a one-off amount at qualification) - a no-op if
-  // this landlord has no BA or isn't qualified yet. Never blocks
-  // activation/renewal below on a bookkeeping failure.
-  await recordCommissionForPayment({ id: subPayment.id, landlord_id: subPayment.landlord_id, amount: subPayment.amount, paid_at: paidAtIso });
-
   const landlord = subPayment.landlords;
   if (!landlord) {
     // Should be impossible given the foreign key + join in
@@ -503,6 +496,48 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
   }
 
   const isFirstPayment = landlord.subscription_status === 'pending';
+
+  // FIX (direct request: "no matter how much a landlord first signs
+  // up with, that account qualifies for payment... right now all are
+  // just saying 0 qualifying"): a BA-referred landlord now qualifies
+  // the INSTANT their first subscription payment completes - right
+  // here, synchronously - rather than waiting for the once-daily
+  // baQualification cron job, which also used to require at least one
+  // unit to be set up first. Neither delay nor unit-count is part of
+  // the qualification bar anymore: signing up and paying is enough.
+  if (isFirstPayment && landlord.ba_id && landlord.ba_qualification_status === 'pending') {
+    const qualifiedAt = new Date().toISOString();
+    const { error: qualifyErr } = await supabase
+      .from('landlords')
+      .update({ ba_qualification_status: 'qualified', ba_qualified_at: qualifiedAt })
+      .eq('id', landlord.id)
+      .eq('ba_qualification_status', 'pending'); // idempotency guard, same convention as the cron job
+    if (qualifyErr) {
+      logger.error(`[payment] Failed to qualify BA landlord ${landlord.id} inline:`, qualifyErr.message);
+      captureException(qualifyErr);
+    } else {
+      landlord.ba_qualification_status = 'qualified';
+      logActivity({
+        actorType: 'system',
+        action: 'ba_landlord_qualified',
+        targetType: 'landlord',
+        targetId: landlord.id,
+        metadata: { baId: landlord.ba_id, trigger: 'first_payment' },
+      });
+    }
+  }
+
+  // FIX (direct request: "it should only be one time, the moment a
+  // landlord signs up and pays the subscription fee" - NOT recurring
+  // for as long as they stay subscribed): commission is now only ever
+  // computed on a landlord's FIRST subscription payment, not on every
+  // renewal. subscription_payment_id still carries a unique index on
+  // ba_commission_earnings as a belt-and-suspenders idempotency guard,
+  // but the isFirstPayment check here is what actually makes this
+  // one-time rather than recurring.
+  if (isFirstPayment) {
+    await recordCommissionForPayment({ id: subPayment.id, landlord_id: subPayment.landlord_id, amount: subPayment.amount, paid_at: paidAtIso });
+  }
 
   if (isFirstPayment) {
     // First-ever payment completes registration (blueprint 3.1)

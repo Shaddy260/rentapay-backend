@@ -6,6 +6,14 @@ const { verifyToken, requireRole, requireNotCaretaker } = require('../middleware
 router.post('/landlord/register', authController.registerLandlord);
 router.post('/verify-otp', authController.verifyOTP);
 router.post('/resend-otp', authController.resendOTP);
+// DIRECT REQUEST (same-page verification): verify email BEFORE the
+// account is created, on the same "Your details" page as everything
+// else - see requestLandlordEmailVerification / confirmLandlordEmailVerification.
+router.post('/landlord/send-registration-email-otp', authController.requestLandlordEmailVerification);
+router.post('/landlord/verify-registration-email-otp', authController.confirmLandlordEmailVerification);
+// Legacy post-registration endpoints - kept only for any landlord
+// account that predates this change and might still have
+// email_verified = false; no longer called by the current signup flow.
 router.post('/verify-landlord-email', authController.verifyLandlordEmailOTP);
 router.post('/resend-landlord-email-otp', authController.resendLandlordEmailOTP);
 router.post('/update-landlord-registration-email', authController.updateLandlordRegistrationEmail);

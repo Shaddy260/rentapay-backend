@@ -101,12 +101,20 @@ async function isTenantOwnerSubscriptionExpired(tenantId, propertyIdHint) {
 // to get one. Passwords/OTPs/password-resets never went through this
 // function at all (they call sendEmail() directly in
 // auth.controller.js) so they're completely unaffected by this
-// change. The only caller that sets `allowEmail: true` is the
-// automated rent-reminder cron job (rentReminders.job.js), and even
-// there it's throttled to at most once every 5 days per tenant - see
-// that file. A landlord manually clicking "Remind" (single or bulk)
-// explicitly does NOT set allowEmail, so those stay in-app + push
-// only, per the direct request.
+// change.
+//
+// UPDATE (direct request: "shift them from email to in app
+// notifications and push notifications... shifting from email to in
+// app notifications means we are going to remind them everyday"):
+// rentReminders.job.js and subscriptionReminders.job.js no longer set
+// `allowEmail: true` at all - both now rely entirely on this
+// function's default in-app inbox + push behaviour, running daily
+// instead of a throttled email cadence. No call site currently passes
+// `allowEmail: true` through notify() any more; email delivery for
+// reminders now only happens via the small number of one-off,
+// critical account-status emails (e.g. the actual subscription-expiry
+// transition) that call sendEmail() directly alongside notify(), not
+// through the allowEmail flag.
 async function notify(recipientType, recipientId, phone, message, opts = {}) {
   const category = opts.category || 'general';
   const title = opts.title || defaultTitle(category);

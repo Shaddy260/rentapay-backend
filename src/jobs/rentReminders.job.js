@@ -4,9 +4,17 @@
 //   3 days before due -> friendly reminder
 //   on due date        -> "pay today" reminder
 //   1 day after due     -> overdue notice
-//   every 3 days late   -> outstanding balance update
+//   every day while overdue -> balance update
 // No interest/late-fee is ever added (removed per direct request) -
 // this only tracks days late for reminder cadence, not for billing.
+//
+// DIRECT REQUEST: "shift them from email to in app notifications and
+// push notifications... shifting from email to in app notifications
+// means we are going to remind them everyday" - every notify() call
+// below is in-app inbox + push only (allowEmail is never set), and
+// once a tenant is overdue they get a reminder every single day
+// (previously only day 1, then every 3rd day) for as long as they
+// still owe something.
 
 const cron = require('node-cron');
 const supabase = require('../config/supabase');
@@ -21,30 +29,10 @@ const logger = require('../utils/logger');
 async function runDailyRentCheck() {
   logger.info('[cron] Running rent reminder check...', new Date().toISOString());
 
-  // FIX (direct request: "rent reminders should be sent once after
-  // every 5 days" via email - the in-app/push side of this job keeps
-  // its existing finer-grained cadence, due-soon/due-today/overdue,
-  // unchanged, since only the EMAIL channel is being restricted here.
-  // Every tenant-facing notify() call below decides allowEmail from
-  // this, and only actually updates the timestamp when an email was
-  // genuinely allowed to go out this run - so a run that's skipped
-  // (already emailed within 5 days) doesn't reset anyone's clock.
-  const EMAIL_THROTTLE_MS = 5 * 24 * 60 * 60 * 1000;
-  async function shouldEmailAndMark(tenant) {
-    const last = tenant.last_rent_reminder_emailed_at ? new Date(tenant.last_rent_reminder_emailed_at).getTime() : 0;
-    if (Date.now() - last < EMAIL_THROTTLE_MS) return false;
-    const { error: updateErr } = await supabase.from('tenants').update({ last_rent_reminder_emailed_at: new Date().toISOString() }).eq('id', tenant.id);
-    if (updateErr) {
-      logger.error(`[cron] rentReminders: failed to update email-throttle timestamp for tenant ${tenant.id}:`, updateErr.message);
-      return false; // fail closed - better to skip an email than double up because we couldn't record it
-    }
-    return true;
-  }
-
   const { data: tenants, error } = await supabase
     .from('tenants')
     .select(
-      '*, last_rent_reminder_emailed_at, units(unit_name, rent_amount, due_day_of_month, property_id, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number)), landlords(phone, payment_method, paybill_number, paybill_account_number, till_number)'
+      '*, units(unit_name, rent_amount, due_day_of_month, property_id, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number)), landlords(phone, payment_method, paybill_number, paybill_account_number, till_number)'
     )
     .eq('is_active', true);
 
@@ -108,27 +96,28 @@ async function runDailyRentCheck() {
 
       if (diffDays === 3) {
         const msg = `${templates.rentDueSoon(tenant.full_name, rentAmount, dueDate.toLocaleDateString('en-GB'))} ${payInfo.text}`;
-        await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'rent_reminder', title: 'Rent Due Soon', allowEmail: await shouldEmailAndMark(tenant) });
+        await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'rent_reminder', title: 'Rent Due Soon' });
       } else if (diffDays === 0) {
         const msg = `${templates.rentDueToday(tenant.full_name, rentAmount)} ${payInfo.text}`;
-        await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'rent_reminder', title: 'Rent Due Today', allowEmail: await shouldEmailAndMark(tenant) });
+        await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'rent_reminder', title: 'Rent Due Today' });
       } else if (diffDays < 0) {
         const overdue = daysOverdue(dueDate, today);
+        const totalDue = Number(tenant.balance_due || 0);
 
         // No more interest - tenant.balance_due is the plain amount
         // owed, never inflated with a late-payment penalty.
         if (overdue === 1) {
           const msg = `${templates.rentOverdue(tenant.full_name, rentAmount)} ${payInfo.text}`;
-          await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'overdue', title: 'Rent Overdue', allowEmail: await shouldEmailAndMark(tenant) });
-        } else if (overdue % 3 === 0) {
-          const totalDue = Number(tenant.balance_due || 0);
+          await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'overdue', title: 'Rent Overdue' });
+        } else {
+          // Every day after the first (previously only every 3rd
+          // day) - daily is the whole point of moving this off email.
           const msg = `${templates.overdueUpdate(tenant.full_name, totalDue.toFixed(2), overdue)} ${payInfo.text}`;
-          await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'overdue', title: 'Balance Update', allowEmail: await shouldEmailAndMark(tenant) });
+          await notify('tenant', tenant.id, tenant.primary_phone, msg, { category: 'overdue', title: 'Balance Update' });
         }
 
         // Landlord alerts at 3 and 7 days overdue (blueprint 10.2)
         if ([3, 7].includes(overdue) && tenant.landlords) {
-          const totalDue = Number(tenant.balance_due || 0);
           await notify(
             'landlord',
             tenant.landlord_id,
