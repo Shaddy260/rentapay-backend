@@ -6,7 +6,7 @@ const { effectiveLandlordId, getManagerAssignedPropertyIds, checkLandlordOwnersh
 // transitions, and the actions listed in 7.3.
 
 const supabase = require('../config/supabase');
-const { generateUnitCode, regenerateUnitCode } = require('../utils/unitCode');
+const { generateUnitCode, regenerateUnitCode, escapeLikePattern } = require('../utils/unitCode');
 const { logActivity } = require('../services/activityLog.service');
 const { blockIfSubscriptionExpired } = require('../utils/subscriptionGate');
 const { notify } = require('../services/notify.service');
@@ -85,7 +85,7 @@ async function createUnit(req, res) {
       .from('units')
       .select('id')
       .eq('landlord_id', landlordId)
-      .ilike('unit_name', trimmedUnitName)
+      .ilike('unit_name', escapeLikePattern(trimmedUnitName))
       .maybeSingle();
     if (existingUnit) {
       return res.status(409).json({ error: `A unit named "${trimmedUnitName}" already exists.` });
@@ -1416,74 +1416,11 @@ async function getUnit(req, res) {
 }
 
 // ---------------------------------------------------------------------
-// RENAME UNIT - previously there was no way to change unit_name after
-// creation at all (it was write-once). Note: renaming does NOT change
-// the unit's code (RPA-A1-001 etc stays fixed per blueprint
-// 4.2 - "the code is fixed to the ROOM, not the tenant" - and by
-// extension shouldn't silently change just because the display name
-// did, since tenants/landlords may already be referencing the code).
+// NOTE: unit renaming was removed by direct request - unit_name is
+// write-once again (set at creation, no PATCH .../name route exists
+// anymore). See git history for the old renameUnit if it's ever
+// needed again.
 // ---------------------------------------------------------------------
-async function renameUnit(req, res) {
-  try {
-    const { unitId } = req.params;
-    const { newUnitName } = req.body;
-    const landlordId = effectiveLandlordId(req);
-
-    if (!newUnitName || !newUnitName.trim()) {
-      return res.status(400).json({ error: 'newUnitName is required.' });
-    }
-
-    const { data: unit, error: fetchError } = await supabase.from('units').select('landlord_id, unit_payment_code, is_frozen, property_id').eq('id', unitId).single();
-    if (fetchError || !unit) return res.status(404).json({ error: 'Unit not found.' });
-    if (unit.landlord_id !== landlordId && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'You do not own this unit.' });
-    }
-    const propertyAccessError = await checkManagerPropertyAccess(req, unit.property_id);
-    if (propertyAccessError) return res.status(propertyAccessError.statusCode).json(propertyAccessError);
-    if (unit.is_frozen) {
-      return res.status(400).json({ error: 'This unit is frozen because your current subscription covers fewer units than you have. Renew or upgrade your subscription to unlock it.' });
-    }
-
-    const trimmedNewName = newUnitName.trim();
-    const { data: nameClash } = await supabase
-      .from('units')
-      .select('id')
-      .eq('landlord_id', landlordId)
-      .ilike('unit_name', trimmedNewName)
-      .neq('id', unitId)
-      .maybeSingle();
-    if (nameClash) {
-      return res.status(409).json({ error: `A unit named "${trimmedNewName}" already exists.` });
-    }
-
-    // Renaming a unit changes its code too (blueprint 4.2's
-    // RPA-[UnitName]-[Number] format), so tenants and M-Pesa STK
-    // account references always reflect the current name. The
-    // sequence number itself is preserved - see regenerateUnitCode.
-    const newUnitPaymentCode = regenerateUnitCode(unit.unit_payment_code, trimmedNewName);
-
-    const { error } = await supabase
-      .from('units')
-      .update({ unit_name: trimmedNewName, unit_payment_code: newUnitPaymentCode })
-      .eq('id', unitId);
-    if (error) throw error;
-
-    logActivity({
-      actorType: req.user.role,
-      actorId: landlordId,
-      action: 'unit_renamed',
-      targetType: 'unit',
-      targetId: unitId,
-      metadata: { newUnitName, oldUnitPaymentCode: unit.unit_payment_code, newUnitPaymentCode },
-    });
-
-    return res.json({ message: 'Unit renamed.', unitPaymentCode: newUnitPaymentCode });
-  } catch (err) {
-    logger.error('[unit] renameUnit error:', err.message);
-    captureException(err);
-    return res.status(500).json({ error: 'Failed to rename unit.' });
-  }
-}
 
 // ---------------------------------------------------------------------
 // UNIT-LEVEL PAYMENT METHOD OVERRIDE
@@ -1800,7 +1737,6 @@ module.exports = {
   verifyUnit,
   removeUnit,
   addExtraCharge,
-  renameUnit,
   updatePaymentOverride,
   updatePublicListing,
   updateListingStatus,

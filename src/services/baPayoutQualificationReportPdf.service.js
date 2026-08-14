@@ -210,4 +210,91 @@ function generateCombinedPayoutQualificationPdf(res, report) {
 module.exports = {
   generateSingleBaPayoutQualificationPdf,
   generateCombinedPayoutQualificationPdf,
+  generateCompletedPayoutLinkPdf,
 };
+
+// =====================================================================
+// BA Monthly Payment Details & Payout Workflow - Phase 4.
+//
+// Reuses this file's header/table look (same RentaPay banner, ink/
+// green palette, page-break handling) for the Completed-tab payout
+// PDF - fed from ba_payment_submissions ("paid") + the same owed-
+// amount computation as Pending/Completed, rather than from the
+// ba_payout_qualification_reports snapshot the functions above read.
+// All rows here are already paid, so there's no green/orange
+// qualifying split - just one clean table plus a paid-date column and
+// the M-Pesa number actually sent to.
+// =====================================================================
+
+function generateCompletedPayoutLinkPdf(res, { periodKey, generatedAt, cards, totals }) {
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  doc.pipe(res);
+
+  doc.fontSize(20).fillColor(INK).text('RentaPay', { continued: true }).fillColor(GREEN).text(' — BA Payout (Completed)');
+  doc.moveDown(0.2);
+  doc.fontSize(11).fillColor('#555').text(periodKey ? `Cycle ${periodKey}` : 'All completed cycles');
+  doc.fontSize(9).fillColor(MUTED).text(`Generated ${new Date(generatedAt).toLocaleString('en-GB')}`);
+  doc.moveDown(0.8);
+  doc.strokeColor(RULE).moveTo(PAGE_LEFT, doc.y).lineTo(PAGE_RIGHT, doc.y).stroke();
+  doc.moveDown(0.7);
+
+  doc.font('Helvetica').fontSize(9).fillColor('#333').text(
+    `${totals.count} paid  ·  ${fmtKes(totals.totalAmount)} disbursed`,
+    PAGE_LEFT
+  );
+  doc.moveDown(0.8);
+
+  if (!cards || cards.length === 0) {
+    doc.font('Helvetica').fontSize(10).fillColor('#666').text('No completed payments for this selection.', PAGE_LEFT);
+    doc.end();
+    return;
+  }
+
+  const colX = { name: PAGE_LEFT, mpesa: 175, month: 275, landlords: 320, rate: 365, amount: 405, paid: 480 };
+  function drawTableHeader() {
+    const headerY = doc.y;
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#555');
+    doc.text('Brand Ambassador', colX.name, headerY, { width: 120 });
+    doc.text('M-Pesa', colX.mpesa, headerY, { width: 95 });
+    doc.text('Month', colX.month, headerY, { width: 40 });
+    doc.text('Onbrd', colX.landlords, headerY, { width: 40 });
+    doc.text('Rate', colX.rate, headerY, { width: 35 });
+    doc.text('Amount', colX.amount, headerY, { width: 70 });
+    doc.text('Paid', colX.paid, headerY, { width: 65 });
+    doc.moveDown(0.35);
+    doc.strokeColor(RULE).moveTo(PAGE_LEFT, doc.y).lineTo(PAGE_RIGHT, doc.y).stroke();
+    doc.moveDown(0.2);
+  }
+
+  drawTableHeader();
+
+  cards.forEach((c) => {
+    if (doc.y + 18 > 780) {
+      doc.addPage();
+      doc.y = 50;
+      drawTableHeader();
+    }
+    const rowY = doc.y;
+    doc.fillColor('#222').font('Helvetica').fontSize(8);
+    doc.text(`${c.baName}${c.baCode ? ` (${c.baCode})` : ''}`, colX.name, rowY, { width: 120 });
+    doc.text(c.mpesaNumber || '—', colX.mpesa, rowY, { width: 95 });
+    doc.text(c.periodKey || '—', colX.month, rowY, { width: 40 });
+    doc.text(String(c.landlordsOnboarded ?? '—'), colX.landlords, rowY, { width: 40 });
+    doc.text(c.commissionPercentage != null ? `${c.commissionPercentage}%` : '—', colX.rate, rowY, { width: 35 });
+    doc.font('Helvetica-Bold').text(fmtKes(c.amountOwed), colX.amount, rowY, { width: 70 });
+    doc.font('Helvetica').text(c.paidAt ? new Date(c.paidAt).toLocaleDateString('en-GB') : '—', colX.paid, rowY, { width: 65 });
+    doc.moveDown(0.85);
+  });
+
+  ensureSpace(doc, 40);
+  doc.moveDown(0.3);
+  doc.strokeColor(RULE).moveTo(PAGE_LEFT, doc.y).lineTo(PAGE_RIGHT, doc.y).stroke();
+  doc.moveDown(0.6);
+  doc.font('Helvetica-Bold').fontSize(13).fillColor(INK).text(
+    `Total disbursed: ${fmtKes(totals.totalAmount)}`,
+    PAGE_LEFT
+  );
+  doc.font('Helvetica').fontSize(9).fillColor(MUTED).text(`(${totals.count} payment${totals.count === 1 ? '' : 's'})`, PAGE_LEFT);
+
+  doc.end();
+}

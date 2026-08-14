@@ -18,7 +18,6 @@ router.get('/pending-rent-changes', requireRole('landlord', 'manager', 'admin'),
 router.get('/:unitId', requireRole('landlord', 'manager', 'admin'), unitController.getUnit);
 router.patch('/:unitId/rent', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot change rent amounts. Contact the landlord or property manager.'), unitController.updateRent);
 router.post('/bulk-rent', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot change rent amounts. Contact the landlord or property manager.'), unitController.bulkUpdateRent);
-router.patch('/:unitId/name', requireRole('landlord', 'manager', 'admin'), unitController.renameUnit);
 // Caretakers ARE allowed to change due dates (only rent amounts,
 // deletions, and other destructive/financial actions are blocked for
 // them) - see requireNotCaretaker's usage on the other routes below.

@@ -77,4 +77,20 @@ function regenerateUnitCode(oldCode, newUnitName) {
   return `RPA-${cleanUnitName}-${number}`;
 }
 
-module.exports = { generateUnitCode, regenerateUnitCode };
+/**
+ * Escapes Postgres ILIKE wildcard characters (% and _) plus the
+ * backslash escape character itself, so a unit name typed by a
+ * landlord is matched LITERALLY (case-insensitively) rather than as a
+ * pattern. Without this, a name containing "_" or "%" (e.g.
+ * "Block_A1") silently matches OTHER unit names too - causing false
+ * "a unit with this name already exists" clashes on create/rename, or
+ * missed clashes, depending on what else happens to exist. This bug
+ * is what made renames look like they "didn't take" - the request was
+ * being rejected (or mismatched) by this check before ever reaching
+ * the actual update.
+ */
+function escapeLikePattern(value) {
+  return String(value).replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+module.exports = { generateUnitCode, regenerateUnitCode, escapeLikePattern };

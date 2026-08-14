@@ -42,6 +42,7 @@ const brandAmbassadorRoutes = require('./routes/brandAmbassador.routes');
 const assistantRoutes = require('./routes/assistant.routes');
 const settingsRoutes = require('./routes/settings.routes');
 const baPayoutQualificationReportRoutes = require('./routes/baPayoutQualificationReport.routes');
+const baPayoutLinkCycleRoutes = require('./routes/baPayoutLinkCycle.routes');
 
 const { startSubscriptionReminderJob } = require('./jobs/subscriptionReminders.job');
 const { startRentReminderJob } = require('./jobs/rentReminders.job');
@@ -251,6 +252,7 @@ app.use('/api/admin/settings', settingsRoutes.adminRouter);
 // /api/brand-ambassadors mount, alongside payout-review,
 // reconciliation, qualification dry-run, etc.
 app.use('/api/brand-ambassadors', baPayoutQualificationReportRoutes);
+app.use('/api/brand-ambassadors', baPayoutLinkCycleRoutes);
 
 // DEV-ONLY: lets MOCK_DARAJA=true testing complete the payment flow
 // without a real Safaricom callback ever arriving. Hard-gated so this
