@@ -2285,16 +2285,34 @@ async function updateMyContact(req, res) {
     const landlordId = req.user.id;
     const { fullName, gender, notificationStyle } = req.body;
     let { phone, whatsappNumber } = req.body;
-    // FEATURE (direct request: "users should not be able to edit their
-    // primary phone number or email after registration"). Enforced
-    // here too, not just by disabling the input client-side, since
-    // this is the actual login identifier - a direct API call must not
-    // be able to slip past a UI-only lock.
+
+    // FIX (adopt the same pattern updateMyProfile in
+    // brandAmbassador.controller.js already uses): reject only an
+    // actual CHANGE to phone/email, not merely their presence in the
+    // body. The old version 400'd on presence alone, so any form that
+    // shows phone/email as pre-filled read-only fields (which is how
+    // every one of these forms is built - see Settings.jsx) failed to
+    // save ANYTHING, even an unrelated field like the KRA PIN, purely
+    // because phone/email rode along unchanged in the payload.
     if (req.body.email !== undefined) {
-      return res.status(400).json({ error: 'Your primary email cannot be changed after registration. Contact support if you need to update it.' });
+      const { data: current, error: fetchErr } = await supabase.from('landlords').select('email').eq('id', landlordId).maybeSingle();
+      if (fetchErr) throw fetchErr;
+      if (String(req.body.email).trim().toLowerCase() !== (current?.email || '').toLowerCase()) {
+        return res.status(400).json({ error: 'Your primary email cannot be changed after registration. Contact support if you need to update it.' });
+      }
     }
     if (phone !== undefined) {
-      return res.status(400).json({ error: 'Your primary phone number cannot be changed after registration. Contact support if you need to update it.' });
+      const { data: current, error: fetchErr } = await supabase.from('landlords').select('phone').eq('id', landlordId).maybeSingle();
+      if (fetchErr) throw fetchErr;
+      let normalizedPhone;
+      try {
+        normalizedPhone = normalizePhoneOrThrow(phone, 'Phone number');
+      } catch (phoneErr) {
+        return res.status(400).json({ error: phoneErr.message });
+      }
+      if (normalizedPhone !== current?.phone) {
+        return res.status(400).json({ error: 'Your primary phone number cannot be changed after registration. Contact support if you need to update it.' });
+      }
     }
 
     const updateFields = {};

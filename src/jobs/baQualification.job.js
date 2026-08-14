@@ -308,12 +308,162 @@ async function runBaQualificationCheck(options = {}) {
 
     await recordHeartbeat('ok', null, startedAt);
     logger.info(`[cron] BA qualification check complete.${dryRun ? ' (DRY RUN - nothing written)' : ''}`, summary);
-    return { ...summary, report: reportRows };
+
+    // ---- DIRECT REQUEST: BA attribution/qualification is now
+    // per-PROPERTY for any property added via "add a property" (see
+    // sql/2026-08-per-property-ba-attribution.sql and
+    // property.controller.js's completePropertyPurchase, which
+    // qualifies these inline the moment that property's own payment
+    // completes). This second pass is the same safety-net/backfill
+    // role as the landlord pass above, just scoped to properties.ba_id
+    // instead of landlords.ba_id - it never touches the landlord pass's
+    // results and the two are independent (a landlord can have one
+    // property qualified under BA-A here and their original property
+    // qualified under BA-B above). ----
+    const propertySummary = await runPropertyQualificationBackfill(dryRun, reportRows);
+    logger.info(`[cron] BA property-level qualification backfill complete.${dryRun ? ' (DRY RUN)' : ''}`, propertySummary);
+
+    return {
+      ...summary,
+      propertiesChecked: propertySummary.checked,
+      propertiesQualified: propertySummary.qualified,
+      propertiesErrors: propertySummary.errors,
+      report: reportRows,
+    };
   } catch (err) {
     logger.error('[cron] baQualification: job failed:', err.message);
     captureException(err);
     await recordHeartbeat('error', err.message, startedAt);
     return { ...summary, report: reportRows };
+  }
+}
+
+// Property-scoped counterpart to the landlord-level pass above. Same
+// role (safety net/backfill for the inline qualify-on-payment path,
+// this time in property.controller.js's completePropertyPurchase),
+// same idempotency guard (only updates rows still 'pending'), same
+// dry-run behaviour (nothing written, rows appended to the same
+// report). Kept as a separate function so the two passes stay easy to
+// reason about independently.
+async function runPropertyQualificationBackfill(dryRun, reportRows) {
+  const summary = { checked: 0, qualified: 0, errors: 0 };
+  try {
+    const { data: pendingProperties, error: propsErr } = await supabase
+      .from('properties')
+      .select('id, landlord_id, name, ba_id, created_at')
+      .not('ba_id', 'is', null)
+      .eq('ba_qualification_status', 'pending');
+    if (propsErr) throw propsErr;
+
+    const properties = pendingProperties || [];
+    summary.checked = properties.length;
+    if (properties.length === 0) return summary;
+
+    const baIds = [...new Set(properties.map((p) => p.ba_id))];
+    const { data: bas, error: basErr } = await supabase
+      .from('brand_ambassadors')
+      .select('id, ba_code, full_name, status')
+      .in('id', baIds);
+    if (basErr) throw basErr;
+    const baById = new Map((bas || []).map((b) => [b.id, b]));
+
+    const eligibleProperties = properties.filter((p) => {
+      const ba = baById.get(p.ba_id);
+      return ba && (ba.status === 'active' || ba.status === 'suspended');
+    });
+
+    // Each property's own completed purchase/renewal payment(s) -
+    // property_payments rows pointing back at it via created_property_id
+    // or renews_property_id, same "earliest completed payment"
+    // qualifying evidence as the landlord pass, just scoped per property.
+    const propertyIds = eligibleProperties.map((p) => p.id);
+    let earliestPaymentByProperty = new Map();
+    if (propertyIds.length > 0) {
+      const { data: payments, error: paymentsErr } = await supabase
+        .from('property_payments')
+        .select('id, created_property_id, renews_property_id, amount, ba_id, paid_at')
+        .eq('status', 'completed')
+        .or(`created_property_id.in.(${propertyIds.join(',')}),renews_property_id.in.(${propertyIds.join(',')})`)
+        .order('paid_at', { ascending: true });
+      if (paymentsErr) throw paymentsErr;
+
+      for (const p of payments || []) {
+        const propertyId = p.created_property_id || p.renews_property_id;
+        if (!propertyId) continue;
+        if (!earliestPaymentByProperty.has(propertyId)) {
+          earliestPaymentByProperty.set(propertyId, p);
+        }
+      }
+    }
+
+    await runInBatches(
+      eligibleProperties,
+      async (property) => {
+        const earliestPayment = earliestPaymentByProperty.get(property.id);
+        if (!earliestPayment) return;
+
+        const qualifiedAt = new Date().toISOString();
+
+        if (dryRun) {
+          summary.qualified += 1;
+          const ba = baById.get(property.ba_id);
+          reportRows.push({
+            propertyId: property.id,
+            landlordId: property.landlord_id,
+            baId: property.ba_id,
+            baCode: ba?.ba_code,
+            baName: ba?.full_name,
+            propertyName: property.name,
+          });
+          logger.info(`[cron] baQualification DRY RUN: property ${property.id} (BA ${property.ba_id}) would qualify.`);
+          return;
+        }
+
+        const { error: updateErr } = await supabase
+          .from('properties')
+          .update({ ba_qualification_status: 'qualified', ba_qualified_at: qualifiedAt })
+          .eq('id', property.id)
+          .eq('ba_qualification_status', 'pending'); // idempotency guard against a double-run
+        if (updateErr) throw updateErr;
+
+        // BACKFILL, same reasoning as the landlord pass: this
+        // property's inline qualify-and-record attempt in
+        // completePropertyPurchase may have failed or predated this
+        // fix. recordCommissionForPayment(..., { baId, qualificationStatus })
+        // is idempotent (unique index on subscription_payment_id) once
+        // that payment type is wired into commission recording - safe
+        // to call here in the meantime with no effect if it isn't yet.
+        await recordCommissionForPayment(
+          { id: earliestPayment.id, landlord_id: property.landlord_id, amount: earliestPayment.amount, paid_at: earliestPayment.paid_at },
+          { baId: property.ba_id, qualificationStatus: 'qualified' }
+        );
+
+        logActivity({
+          actorType: 'system',
+          action: 'ba_property_qualified',
+          targetType: 'property',
+          targetId: property.id,
+          metadata: { baId: property.ba_id, landlordId: property.landlord_id, trigger: 'qualification_job_backfill' },
+        });
+
+        summary.qualified += 1;
+      },
+      {
+        concurrency: 5,
+        onError: (err, property) => {
+          summary.errors += 1;
+          logger.error(`[cron] baQualification: failed to process property ${property.id}:`, err.message);
+          captureException(err);
+        },
+      }
+    );
+
+    return summary;
+  } catch (err) {
+    summary.errors += 1;
+    logger.error('[cron] baQualification: property-level backfill failed:', err.message);
+    captureException(err);
+    return summary;
   }
 }
 

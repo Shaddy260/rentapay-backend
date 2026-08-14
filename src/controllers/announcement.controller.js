@@ -17,6 +17,7 @@ const { blockIfSubscriptionExpired } = require('../utils/subscriptionGate');
 function recipientTypeFor(role) {
   if (role === 'tenant') return 'tenant';
   if (role === 'manager') return 'manager';
+  if (role === 'brand_ambassador') return 'brand_ambassador';
   return 'landlord';
 }
 
@@ -82,6 +83,13 @@ async function fanOutAnnouncementPush(announcement) {
         for (const l of landlords || []) jobs.push(notify('landlord', l.id, l.phone, message, { title, category: 'announcement', urgent: true }));
         const { data: managers } = await supabase.from('property_managers').select('id, phone');
         for (const m of managers || []) jobs.push(notify('manager', m.id, m.phone, message, { title, category: 'announcement', urgent: true }));
+      }
+      // Brand ambassadors are a separate recipient pool entirely (not
+      // landlords/managers/tenants) - reached by 'all' same as
+      // everyone else, or on their own via the dedicated 'ba' group.
+      if (group === 'all' || group === 'ba') {
+        const { data: bas } = await supabase.from('brand_ambassadors').select('id, phone');
+        for (const b of bas || []) jobs.push(notify('brand_ambassador', b.id, b.phone, message, { title, category: 'announcement', urgent: true }));
       }
       await Promise.allSettled(jobs);
       return;
@@ -177,7 +185,7 @@ async function createPlatformAnnouncement(req, res) {
     if (!message || !message.trim()) {
       return res.status(400).json({ error: 'Announcement message is required.' });
     }
-    const group = ['all', 'tenants', 'landlord_team'].includes(targetGroup) ? targetGroup : 'all';
+    const group = ['all', 'tenants', 'landlord_team', 'ba'].includes(targetGroup) ? targetGroup : 'all';
 
     const { data: announcement, error } = await supabase
       .from('announcements')
@@ -259,7 +267,19 @@ async function listAnnouncements(req, res) {
     let tenantCreatedAt = null;
     let viewerCreatedAt = null;
 
-    if (role === 'tenant') {
+    // BAs aren't attached to any landlord_id - they're a separate
+    // recipient pool entirely (see fanOutAnnouncementPush above), so
+    // the only announcements that can ever apply to them are
+    // platform-wide broadcasts targeted at group 'ba' or 'all'. This
+    // is the small BA-scoped branch mentioned when the BA broadcast
+    // feature first shipped: BAs previously only got these via
+    // SMS/push (notify()), with nothing to see inside the BA portal
+    // itself - this is what lets them see the same messages in-portal.
+    let baCreatedAt = null;
+    if (role === 'brand_ambassador') {
+      const { data: ba } = await supabase.from('brand_ambassadors').select('created_at').eq('id', id).maybeSingle();
+      baCreatedAt = ba?.created_at || null;
+    } else if (role === 'tenant') {
       const { data: tenant, error: tErr } = await supabase
         .from('tenants')
         .select('landlord_id, unit_id, created_at, units(property_id)')
@@ -292,10 +312,14 @@ async function listAnnouncements(req, res) {
       viewerCreatedAt = viewer?.created_at || null;
     }
 
+    // A BA has no landlord_id to scope by at all (see comment above) -
+    // only platform-wide broadcasts can ever reach them, so the query
+    // is narrowed to those instead of the landlord_id-or-platform
+    // filter every other role uses.
     const { data: announcements, error } = await supabase
       .from('announcements')
       .select('*, units(property_id)')
-      .or(`landlord_id.eq.${landlordId},is_platform.eq.true`)
+      .or(role === 'brand_ambassador' ? 'is_platform.eq.true' : `landlord_id.eq.${landlordId},is_platform.eq.true`)
       .order('created_at', { ascending: false })
       .limit(50);
     if (error) throw error;
@@ -342,6 +366,7 @@ async function listAnnouncements(req, res) {
       if (group === 'all') return true;
       if (group === 'tenants') return role === 'tenant';
       if (group === 'landlord_team') return role === 'landlord' || role === 'manager';
+      if (group === 'ba') return role === 'brand_ambassador';
       return true;
     };
 
@@ -365,7 +390,9 @@ async function listAnnouncements(req, res) {
     // still shows normally.
     const visible = role === 'tenant'
       ? (announcements || []).filter((a) => (!tenantCreatedAt || new Date(a.created_at) >= new Date(tenantCreatedAt)) && (a.is_platform ? isInTargetGroup(a) : (a.audience === 'all' || (a.audience === 'property' && a.property_id === tenantPropertyId) || (a.audience === 'unit' && a.unit_id === tenantUnitId))))
-      : (announcements || []).filter((a) => (!viewerCreatedAt || new Date(a.created_at) >= new Date(viewerCreatedAt)) && (!a.is_platform || isInTargetGroup(a)) && inManagerScope(a) && inActivePropertyScope(a));
+      : role === 'brand_ambassador'
+        ? (announcements || []).filter((a) => (!baCreatedAt || new Date(a.created_at) >= new Date(baCreatedAt)) && isInTargetGroup(a))
+        : (announcements || []).filter((a) => (!viewerCreatedAt || new Date(a.created_at) >= new Date(viewerCreatedAt)) && (!a.is_platform || isInTargetGroup(a)) && inManagerScope(a) && inActivePropertyScope(a));
 
     const recipientType = recipientTypeFor(role);
 
@@ -435,8 +462,10 @@ async function deleteAnnouncement(req, res) {
       .single();
     if (fetchError || !announcement) return res.status(404).json({ error: 'Announcement not found.' });
 
-    // A tenant can only ever delete for themselves.
-    const scope = (role === 'tenant') ? 'self' : requestedScope;
+    // A tenant or BA can only ever delete for themselves - a BA has
+    // no "own account" of landlord/manager/caretaker peers to delete
+    // a platform broadcast for, so 'all' never makes sense for them.
+    const scope = (role === 'tenant' || role === 'brand_ambassador') ? 'self' : requestedScope;
 
     if (scope === 'all') {
       if (role !== 'admin') {

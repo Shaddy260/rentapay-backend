@@ -483,18 +483,23 @@ async function listBrandAmbassadors(req, res) {
     if (error) throw error;
 
     // Summary counts per BA (landlords onboarded, qualified-pending
-    // payout) - SECTION B/C: sourced directly from `landlords` (ba_id
-    // + ba_qualification_status) now, not ba_landlord_claims. A
-    // single grouped query rather than N+1 per row.
+    // payout) - SECTION B/C: sourced from `landlords` (ba_id +
+    // ba_qualification_status) for signup-time attribution, PLUS
+    // `properties` (ba_id + ba_qualification_status) for the DIRECT
+    // REQUEST per-property attribution added later ("add a
+    // property"). A landlord onboarded at signup by BA-A who later
+    // adds a property with BA-B's code counts once toward each -
+    // that's intentional, they're two independent attributions.
     const ids = (bas || []).map((b) => b.id);
     let claimCounts = {};
     if (ids.length) {
-      const { data: landlordRows, error: landlordsErr } = await supabase
-        .from('landlords')
-        .select('ba_id, ba_qualification_status')
-        .in('ba_id', ids);
+      const [{ data: landlordRows, error: landlordsErr }, { data: propertyRows, error: propertiesErr }] = await Promise.all([
+        supabase.from('landlords').select('ba_id, ba_qualification_status').in('ba_id', ids),
+        supabase.from('properties').select('ba_id, ba_qualification_status').in('ba_id', ids),
+      ]);
       if (landlordsErr) throw landlordsErr;
-      claimCounts = (landlordRows || []).reduce((acc, l) => {
+      if (propertiesErr) throw propertiesErr;
+      claimCounts = [...(landlordRows || []), ...(propertyRows || [])].reduce((acc, l) => {
         acc[l.ba_id] = acc[l.ba_id] || { landlordsOnboarded: 0, qualifiedPendingPayout: 0 };
         acc[l.ba_id].landlordsOnboarded += 1;
         if (l.ba_qualification_status === 'qualified') acc[l.ba_id].qualifiedPendingPayout += 1;
@@ -1084,25 +1089,55 @@ async function resolveReferralCode(req, res) {
 // landlords.ba_id is the only source of truth, set exactly once, at
 // signup, via the referral link/code.
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// SECTION B - "My Onboarded Landlords", now sourced from TWO places
+// merged into one list (DIRECT REQUEST: BA attribution moved from
+// landlords.ba_id-only to per-property, see
+// sql/2026-08-per-property-ba-attribution.sql):
+//   1. `landlords` filtered by ba_id - landlords onboarded via the
+//      referral link/code at SIGNUP (their original/day-one property).
+//   2. `properties` filtered by ba_id - properties added LATER via
+//      "Add a property" with this BA's referral code, independent of
+//      whichever BA (if any) is on the landlord's original signup.
+// A landlord who has worked with this BA both ways (onboarded at
+// signup AND added a later property with the same BA's code) shows up
+// as two separate rows here, same shape they'd have if two different
+// BAs were involved - each row is its own attribution, not a
+// deduplicated landlord. `entryType` tells the frontend which case a
+// row is; `propertyName`/`propertyId` are only present for property
+// rows.
+// ---------------------------------------------------------------------
 async function listMyOnboardedLandlords(req, res) {
   try {
     const baId = req.user.id;
     const { from, to } = req.query;
 
-    let query = supabase
+    let signupQuery = supabase
       .from('landlords')
       .select('id, full_name, phone, email, county, constituency, subscription_status, ba_qualification_status, ba_qualified_at, created_at')
       .eq('ba_id', baId)
       .order('created_at', { ascending: false });
+    if (from) signupQuery = signupQuery.gte('created_at', from);
+    if (to) signupQuery = signupQuery.lte('created_at', to);
 
-    if (from) query = query.gte('created_at', from);
-    if (to) query = query.lte('created_at', to);
+    let propertyQuery = supabase
+      .from('properties')
+      .select(
+        'id, name, county, constituency, subscription_status, ba_qualification_status, ba_qualified_at, created_at, landlord_id, landlords(id, full_name, phone, email)'
+      )
+      .eq('ba_id', baId)
+      .order('created_at', { ascending: false });
+    if (from) propertyQuery = propertyQuery.gte('created_at', from);
+    if (to) propertyQuery = propertyQuery.lte('created_at', to);
 
-    const { data: landlordRows, error } = await query;
-    if (error) throw error;
+    const [{ data: landlordRows, error: landlordErr }, { data: propertyRows, error: propertyErr }] = await Promise.all([signupQuery, propertyQuery]);
+    if (landlordErr) throw landlordErr;
+    if (propertyErr) throw propertyErr;
 
-    const landlords = (landlordRows || []).map((l) => ({
+    const signupEntries = (landlordRows || []).map((l) => ({
+      entryType: 'landlord_signup',
       id: l.id,
+      landlordId: l.id,
       fullName: l.full_name,
       // Masked middle digits (e.g. 254***325966) - same
       // maskPhoneMiddle utility/style used everywhere else this
@@ -1115,6 +1150,25 @@ async function listMyOnboardedLandlords(req, res) {
       qualifiedAt: l.ba_qualified_at,
       onboardedAt: l.created_at,
     }));
+
+    const propertyEntries = (propertyRows || []).map((p) => ({
+      entryType: 'property',
+      id: p.id,
+      propertyId: p.id,
+      propertyName: p.name,
+      landlordId: p.landlord_id,
+      fullName: p.landlords?.full_name || null,
+      phone: p.landlords?.phone ? maskPhoneMiddle(p.landlords.phone) : null,
+      email: p.landlords?.email || null,
+      location: [p.constituency, p.county].filter(Boolean).join(', ') || null,
+      subscriptionStatus: p.subscription_status,
+      qualificationStatus: p.ba_qualification_status || 'pending',
+      qualifiedAt: p.ba_qualified_at,
+      onboardedAt: p.created_at,
+    }));
+
+    const landlords = [...signupEntries, ...propertyEntries].sort((a, b) => new Date(b.onboardedAt) - new Date(a.onboardedAt));
+
     return res.json({ landlords });
   } catch (err) {
     logger.error('[brandAmbassador] listMyOnboardedLandlords error:', err.message);
@@ -1153,7 +1207,8 @@ async function listMyOnboardedLandlords(req, res) {
 const SHARE_REPORT_MAX_LISTED_LANDLORDS = 50;
 
 function formatLandlordLine(l, index) {
-  return `${index + 1}. ${l.full_name} — ${l.phone} — ${l.ba_qualification_status || 'pending'}`;
+  const label = l.entryType === 'property' ? `${l.full_name || 'Unknown landlord'} (${l.property_name})` : l.full_name;
+  return `${index + 1}. ${label} — ${l.phone} — ${l.ba_qualification_status || 'pending'}`;
 }
 
 function buildOnboardedLandlordsReportSummary(ba, landlords, { from, to } = {}) {
@@ -1182,16 +1237,37 @@ async function shareClaimsReport(req, res) {
     if (baErr) throw baErr;
     if (!ba) return res.status(404).json({ error: 'Brand Ambassador profile not found.' });
 
-    let query = supabase
+    let signupQuery = supabase
       .from('landlords')
       .select('full_name, phone, ba_qualification_status, created_at')
       .eq('ba_id', baId)
       .order('created_at', { ascending: false });
-    if (from) query = query.gte('created_at', from);
-    if (to) query = query.lte('created_at', to);
+    if (from) signupQuery = signupQuery.gte('created_at', from);
+    if (to) signupQuery = signupQuery.lte('created_at', to);
 
-    const { data: landlords, error: landlordsErr } = await query;
-    if (landlordsErr) throw landlordsErr;
+    let propertyQuery = supabase
+      .from('properties')
+      .select('id, name, ba_qualification_status, created_at, landlords(full_name, phone)')
+      .eq('ba_id', baId)
+      .order('created_at', { ascending: false });
+    if (from) propertyQuery = propertyQuery.gte('created_at', from);
+    if (to) propertyQuery = propertyQuery.lte('created_at', to);
+
+    const [{ data: signupRows, error: signupErr }, { data: propertyRows, error: propertyErr }] = await Promise.all([signupQuery, propertyQuery]);
+    if (signupErr) throw signupErr;
+    if (propertyErr) throw propertyErr;
+
+    const landlords = [
+      ...(signupRows || []).map((l) => ({ entryType: 'landlord_signup', ...l })),
+      ...(propertyRows || []).map((p) => ({
+        entryType: 'property',
+        full_name: p.landlords?.full_name,
+        phone: p.landlords?.phone,
+        ba_qualification_status: p.ba_qualification_status,
+        created_at: p.created_at,
+        property_name: p.name,
+      })),
+    ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
     if (!landlords || landlords.length === 0) {
       return res.status(400).json({ error: 'No onboarded landlords in this period to share.' });
@@ -1299,7 +1375,7 @@ async function getBaStats(req, res) {
     const windowStart = new Date();
     windowStart.setUTCDate(windowStart.getUTCDate() - STATS_WINDOW_DAYS);
 
-    const [{ data: ba, error: baErr }, { data: landlordRows, error: landlordsErr }] = await Promise.all([
+    const [{ data: ba, error: baErr }, { data: landlordRows, error: landlordsErr }, { data: propertyRows, error: propertiesErr }] = await Promise.all([
       supabase
         .from('brand_ambassadors')
         .select('id, current_commission_percent')
@@ -1317,11 +1393,23 @@ async function getBaStats(req, res) {
         .eq('ba_id', baId)
         .gte('created_at', windowStart.toISOString())
         .order('created_at', { ascending: true }),
+      // DIRECT REQUEST: BA attribution is per-property now too (see
+      // sql/2026-08-per-property-ba-attribution.sql) - a property
+      // added later via "Add a property" with this BA's code counts
+      // toward these same onboarding/qualification stats, independent
+      // of whichever BA (if any) is on the landlord's original signup.
+      supabase
+        .from('properties')
+        .select('id, created_at, ba_qualification_status')
+        .eq('ba_id', baId)
+        .gte('created_at', windowStart.toISOString())
+        .order('created_at', { ascending: true }),
     ]);
     if (baErr) throw baErr;
     if (landlordsErr) throw landlordsErr;
+    if (propertiesErr) throw propertiesErr;
 
-    const landlordsInWindow = landlordRows || [];
+    const landlordsInWindow = [...(landlordRows || []), ...(propertyRows || [])].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
     const qualifiedRows = landlordsInWindow.filter((l) => l.ba_qualification_status === 'qualified');
 
     const now = new Date();
@@ -1478,20 +1566,34 @@ async function getLeaderboard(req, res) {
     const activeBas = bas || [];
     const activeIds = activeBas.map((b) => b.id);
 
-    // SECTION B/C: qualified counts now come straight from
-    // `landlords` (ba_id + ba_qualification_status/ba_qualified_at) -
-    // no more ba_landlord_claims join.
-    let qualifiedQuery = supabase
+    // SECTION B/C: qualified counts come from `landlords` (ba_id +
+    // ba_qualification_status/ba_qualified_at) PLUS `properties`
+    // (same columns) - DIRECT REQUEST: a property added later with a
+    // BA's code counts toward that BA's leaderboard total too, same
+    // as an onboarded-at-signup landlord.
+    let qualifiedLandlordsQuery = supabase
       .from('landlords')
       .select('ba_id, ba_qualification_status, ba_qualified_at')
       .in('ba_id', activeIds.length ? activeIds : ['00000000-0000-0000-0000-000000000000'])
       .eq('ba_qualification_status', 'qualified');
-    if (periodStart) qualifiedQuery = qualifiedQuery.gte('ba_qualified_at', periodStart.toISOString());
-    const { data: qualifiedLandlords, error: qualifiedErr } = await qualifiedQuery;
+    if (periodStart) qualifiedLandlordsQuery = qualifiedLandlordsQuery.gte('ba_qualified_at', periodStart.toISOString());
+
+    let qualifiedPropertiesQuery = supabase
+      .from('properties')
+      .select('ba_id, ba_qualification_status, ba_qualified_at')
+      .in('ba_id', activeIds.length ? activeIds : ['00000000-0000-0000-0000-000000000000'])
+      .eq('ba_qualification_status', 'qualified');
+    if (periodStart) qualifiedPropertiesQuery = qualifiedPropertiesQuery.gte('ba_qualified_at', periodStart.toISOString());
+
+    const [{ data: qualifiedLandlords, error: qualifiedErr }, { data: qualifiedProperties, error: qualifiedPropsErr }] = await Promise.all([
+      qualifiedLandlordsQuery,
+      qualifiedPropertiesQuery,
+    ]);
     if (qualifiedErr) throw qualifiedErr;
+    if (qualifiedPropsErr) throw qualifiedPropsErr;
 
     const countByBa = new Map();
-    for (const l of qualifiedLandlords || []) {
+    for (const l of [...(qualifiedLandlords || []), ...(qualifiedProperties || [])]) {
       countByBa.set(l.ba_id, (countByBa.get(l.ba_id) || 0) + 1);
     }
 

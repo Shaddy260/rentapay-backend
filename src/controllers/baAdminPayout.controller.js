@@ -157,13 +157,20 @@ async function getPayoutReview(req, res) {
     const rosterCountByBa = new Map();
     const qualifyingCountByBa = new Map();
     if (baIds.length > 0) {
-      const { data: rosterLandlords, error: rosterErr } = await supabase
-        .from('landlords')
-        .select('id, ba_id, ba_qualification_status')
-        .in('ba_id', baIds);
+      // DIRECT REQUEST: roster/qualifying counts include per-property
+      // attributions now too (sql/2026-08-per-property-ba-attribution.sql),
+      // not just landlords onboarded at signup - a property added
+      // later via "Add a property" with a BA's code counts toward
+      // that BA's roster independently of the landlord's original
+      // signup attribution (if any).
+      const [{ data: rosterLandlords, error: rosterErr }, { data: rosterProperties, error: rosterPropsErr }] = await Promise.all([
+        supabase.from('landlords').select('id, ba_id, ba_qualification_status').in('ba_id', baIds),
+        supabase.from('properties').select('id, ba_id, ba_qualification_status').in('ba_id', baIds),
+      ]);
       if (rosterErr) throw rosterErr;
+      if (rosterPropsErr) throw rosterPropsErr;
 
-      for (const l of rosterLandlords || []) {
+      for (const l of [...(rosterLandlords || []), ...(rosterProperties || [])]) {
         rosterCountByBa.set(l.ba_id, (rosterCountByBa.get(l.ba_id) || 0) + 1);
         if (l.ba_qualification_status === 'qualified') {
           qualifyingCountByBa.set(l.ba_id, (qualifyingCountByBa.get(l.ba_id) || 0) + 1);

@@ -1224,13 +1224,20 @@ async function editOwnProfile(req, res) {
     const tenantId = effectiveLandlordId(req); // role === 'tenant' -> req.user.id
     const { secondaryPhone, email, emergencyContactName, emergencyContactPhone } = req.body;
 
-    // FEATURE (direct request: "users should not be able to edit their
-    // primary phone number or email after registration"). The primary
-    // phone was already landlord-managed only; email is the other
-    // login identifier and needs the same lock, enforced here too so a
-    // direct API call can't slip past the disabled input client-side.
+    // FIX (adopt the same pattern updateMyProfile in
+    // brandAmbassador.controller.js already uses): reject only an
+    // actual CHANGE to email, not merely its presence in the body.
+    // The old version 400'd on presence alone, so the tenant portal's
+    // self-edit form - which shows email as a pre-filled read-only
+    // field - failed to save ANYTHING, even just a secondary phone or
+    // emergency contact update, purely because email rode along
+    // unchanged in the payload.
     if (email !== undefined) {
-      return res.status(400).json({ error: 'Your primary email cannot be changed after registration. Contact your landlord if you need to update it.' });
+      const { data: current, error: fetchErr } = await supabase.from('tenants').select('email').eq('id', tenantId).maybeSingle();
+      if (fetchErr) throw fetchErr;
+      if (String(email).trim().toLowerCase() !== (current?.email || '').toLowerCase()) {
+        return res.status(400).json({ error: 'Your primary email cannot be changed after registration. Contact your landlord if you need to update it.' });
+      }
     }
 
     const updateFields = {};

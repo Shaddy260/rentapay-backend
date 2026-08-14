@@ -86,27 +86,64 @@ async function resolveApplicableRate(baId, atDate) {
  * that triggered it; errors are logged/captured and swallowed, same
  * convention as the notify() calls right next to this call site.
  *
- * @param {object} subPayment - a subscription_payments row, must
- *   include: id, landlord_id, amount, paid_at
+ * BA attribution is per-PROPERTY now (see
+ * sql/2026-08-per-property-ba-attribution.sql), not per-landlord
+ * account - `landlords.ba_id` only ever meant "who onboarded this
+ * landlord's original/day-one property," and that's still exactly
+ * what it's used for below by default. Every existing call site
+ * (subscription_payments renewals of that original property, the
+ * manual-payment flow, and the qualification backfill job) is about
+ * that same original property, so the default landlord-lookup path
+ * is unchanged and still correct for them.
+ *
+ * A caller working with a DIFFERENT property (e.g. a later "add a
+ * property" purchase, which carries its own independent ba_id/
+ * ba_qualification_status on the properties row - see
+ * property.controller.js) should pass `baId` and
+ * `qualificationStatus` explicitly instead of relying on the
+ * landlord-lookup default, once that payment type is wired into
+ * commission recording. This function does not do that wiring itself
+ * yet - ba_commission_earnings.subscription_payment_id is a NOT NULL
+ * FK to subscription_payments, so recording commission for a
+ * property_payments purchase needs its own schema decision (new
+ * column vs. new table) before this can be pointed at that flow.
+ *
+ * @param {object} subPayment - the payment row, must include: id,
+ *   landlord_id, amount, paid_at
+ * @param {object} [attribution] - optional explicit override
+ * @param {string} [attribution.baId] - BA to credit, bypassing the
+ *   landlords.ba_id lookup
+ * @param {string} [attribution.qualificationStatus] - 'qualified' |
+ *   'pending', bypassing landlords.ba_qualification_status
  */
-async function recordCommissionForPayment(subPayment) {
+async function recordCommissionForPayment(subPayment, attribution = {}) {
   try {
-    const { data: landlord, error: landlordErr } = await supabase
-      .from('landlords')
-      .select('id, ba_id, ba_qualification_status, full_name')
-      .eq('id', subPayment.landlord_id)
-      .maybeSingle();
-    if (landlordErr) throw landlordErr;
+    let baId = attribution.baId;
+    let qualificationStatus = attribution.qualificationStatus;
+    let landlordId = subPayment.landlord_id;
+
+    if (!baId) {
+      const { data: landlord, error: landlordErr } = await supabase
+        .from('landlords')
+        .select('id, ba_id, ba_qualification_status, full_name')
+        .eq('id', subPayment.landlord_id)
+        .maybeSingle();
+      if (landlordErr) throw landlordErr;
+      if (!landlord) return null;
+      baId = landlord.ba_id;
+      qualificationStatus = landlord.ba_qualification_status;
+      landlordId = landlord.id;
+    }
 
     // Section E: "percentage commission only applies to landlords
     // that have already qualified" - Section C's gate, read here, not
     // re-derived.
-    if (!landlord || !landlord.ba_id || landlord.ba_qualification_status !== 'qualified') return null;
+    if (!baId || qualificationStatus !== 'qualified') return null;
 
     const paidAt = subPayment.paid_at || new Date().toISOString();
-    const rate = await resolveApplicableRate(landlord.ba_id, paidAt);
+    const rate = await resolveApplicableRate(baId, paidAt);
     if (!rate) {
-      logger.warn(`[baCommission] no payout_rules rate resolvable for BA ${landlord.ba_id} as of ${paidAt} - skipping commission for payment ${subPayment.id}.`);
+      logger.warn(`[baCommission] no payout_rules rate resolvable for BA ${baId} as of ${paidAt} - skipping commission for payment ${subPayment.id}.`);
       return null;
     }
 
@@ -116,8 +153,8 @@ async function recordCommissionForPayment(subPayment) {
     const { data: inserted, error: insertErr } = await supabase
       .from('ba_commission_earnings')
       .insert({
-        ba_id: landlord.ba_id,
-        landlord_id: landlord.id,
+        ba_id: baId,
+        landlord_id: landlordId,
         subscription_payment_id: subPayment.id,
         payment_amount: paymentAmount,
         percentage_applied: rate.percentage,
@@ -141,9 +178,9 @@ async function recordCommissionForPayment(subPayment) {
       actorType: 'system',
       action: 'ba_commission_recorded',
       targetType: 'brand_ambassador',
-      targetId: landlord.ba_id,
+      targetId: baId,
       metadata: {
-        landlordId: landlord.id,
+        landlordId,
         subscriptionPaymentId: subPayment.id,
         paymentAmount,
         percentageApplied: rate.percentage,

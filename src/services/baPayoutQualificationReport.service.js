@@ -47,13 +47,40 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
   // run's roster, even if nothing qualifies or paid this specific
   // cycle (so the not-qualifying count stays visible) - mirrors the
   // "empty run" handling below.
-  const { data: rosterLandlords, error: rosterErr } = await supabase
-    .from('landlords')
-    .select('id, full_name, phone, county, ba_id, ba_qualification_status')
-    .not('ba_id', 'is', null);
+  //
+  // DIRECT REQUEST: roster is now landlords onboarded at SIGNUP
+  // (landlords.ba_id) PLUS properties attributed LATER via "Add a
+  // property" (properties.ba_id) - see
+  // sql/2026-08-per-property-ba-attribution.sql. Each shows as its
+  // own roster entry; a landlord who appears under two different BAs
+  // (one per attribution) is intentional, not a duplicate.
+  const [{ data: rosterLandlords, error: rosterErr }, { data: rosterProperties, error: rosterPropsErr }] = await Promise.all([
+    supabase
+      .from('landlords')
+      .select('id, full_name, phone, county, ba_id, ba_qualification_status')
+      .not('ba_id', 'is', null),
+    supabase
+      .from('properties')
+      .select('id, name, county, ba_id, ba_qualification_status, landlord_id, landlords(full_name, phone)')
+      .not('ba_id', 'is', null),
+  ]);
   if (rosterErr) throw rosterErr;
+  if (rosterPropsErr) throw rosterPropsErr;
 
-  const roster = rosterLandlords || [];
+  const landlordRoster = (rosterLandlords || []).map((l) => ({ entryType: 'landlord_signup', ...l }));
+  const propertyRoster = (rosterProperties || []).map((p) => ({
+    entryType: 'property',
+    id: p.landlord_id, // landlord_id for the earnings-join key below (commission is still recorded per landlord's payment)
+    full_name: p.landlords?.full_name || null,
+    phone: p.landlords?.phone || null,
+    county: p.county,
+    ba_id: p.ba_id,
+    ba_qualification_status: p.ba_qualification_status,
+    propertyId: p.id,
+    propertyName: p.name,
+  }));
+
+  const roster = [...landlordRoster, ...propertyRoster];
 
   if (roster.length === 0) {
     return persistEmptyReport({ periodType, periodKey, adminId, adminName });
@@ -107,11 +134,25 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
       baMap.set(ba.id, { baId: ba.id, baName: ba.full_name, baCode: ba.ba_code, landlords: [] });
     }
 
-    const earning = earningsByLandlord.get(`${l.ba_id}:${l.id}`);
+    // ba_commission_earnings is only ever written for the landlord's
+    // ORIGINAL/day-one property's subscription payments (Step 3 of
+    // the per-property-attribution work left property-purchase
+    // commission recording unwired - see baCommission.service.js).
+    // A 'property' roster entry must therefore never look itself up
+    // in earningsByLandlord: if this property happens to share the
+    // same ba_id as the landlord's original attribution, that lookup
+    // would incorrectly show the ORIGINAL property's earning against
+    // THIS property's row too, double-counting one real payment as
+    // two. Property rows always show as qualified-but-not-yet-earning
+    // until that commission wiring exists.
+    const earning = l.entryType === 'property' ? null : earningsByLandlord.get(`${l.ba_id}:${l.id}`);
     const qualifiesThisCycle = l.ba_qualification_status === 'qualified' && !!earning;
 
     baMap.get(ba.id).landlords.push({
       landlordId: l.id,
+      entryType: l.entryType,
+      propertyId: l.propertyId || null,
+      propertyName: l.propertyName || null,
       name: l.full_name,
       phone: l.phone,
       county: l.county,
@@ -179,13 +220,17 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
         landlord_name: l.name,
         landlord_phone_masked: maskPhoneMiddle(l.phone),
         county: l.county || null,
+        property_id: l.propertyId || null,
+        property_name: l.propertyName || null,
         onboarded_at: null,
         qualifies: l.qualifiesThisCycle,
         reason: l.qualifiesThisCycle
           ? null
           : l.qualificationStatus !== 'qualified'
             ? 'Not yet qualified'
-            : 'No completed payment in this cycle',
+            : l.entryType === 'property'
+              ? 'Qualified, but commission recording for added properties is not yet wired'
+              : 'No completed payment in this cycle',
         payment_amount: l.paymentAmount,
         percentage_applied: l.percentageApplied,
         commission_amount: l.commissionAmount,
@@ -300,6 +345,8 @@ async function getReportById(reportId) {
       name: e.landlord_name,
       maskedPhone: e.landlord_phone_masked,
       county: e.county,
+      propertyId: e.property_id || null,
+      propertyName: e.property_name || null,
       qualifiesThisCycle: e.qualifies,
       reason: e.reason,
       paymentAmount: Number(e.payment_amount || 0),

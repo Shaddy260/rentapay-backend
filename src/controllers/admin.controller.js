@@ -278,20 +278,49 @@ async function getLandlordProperties(req, res) {
 
     const { data: landlord, error: landlordError } = await supabase
       .from('landlords')
-      .select('id, full_name, estate_name, location, county, unit_limit, subscription_plan, subscription_expires_at')
+      .select('id, full_name, estate_name, location, county, unit_limit, subscription_plan, subscription_expires_at, ba_id')
       .eq('id', landlordId)
       .maybeSingle();
     if (landlordError) throw landlordError;
     if (!landlord) return res.status(404).json({ error: 'Landlord not found.' });
 
+    // DIRECT REQUEST: BA attribution is per-PROPERTY (see
+    // sql/2026-08-per-property-ba-attribution.sql) - each property is
+    // its own entity here, shown independently with its own BA (or
+    // none), separate from whichever BA (if any) is on the landlord's
+    // original signup. Same login/account either way - this is purely
+    // about which BA gets credit for which entity.
     const { data: properties, error: propError } = await supabase
       .from('properties')
-      .select('id, name, location, county, unit_limit, subscription_period_months, subscription_expires_at, subscription_status')
+      .select(
+        'id, name, location, county, unit_limit, subscription_period_months, subscription_expires_at, subscription_status, ba_id, ba_qualification_status'
+      )
       .eq('landlord_id', landlordId)
       .order('created_at', { ascending: true });
     if (propError) throw propError;
 
-    return res.json({ landlord, properties: properties || [] });
+    const baIds = [...new Set([landlord.ba_id, ...(properties || []).map((p) => p.ba_id)].filter(Boolean))];
+    let baById = {};
+    if (baIds.length > 0) {
+      const { data: bas, error: baErr } = await supabase.from('brand_ambassadors').select('id, full_name, ba_code').in('id', baIds);
+      if (baErr) throw baErr;
+      baById = Object.fromEntries((bas || []).map((b) => [b.id, b]));
+    }
+
+    return res.json({
+      landlord: {
+        ...landlord,
+        baId: landlord.ba_id,
+        baName: landlord.ba_id ? baById[landlord.ba_id]?.full_name || null : null,
+        baCode: landlord.ba_id ? baById[landlord.ba_id]?.ba_code || null : null,
+      },
+      properties: (properties || []).map((p) => ({
+        ...p,
+        baId: p.ba_id,
+        baName: p.ba_id ? baById[p.ba_id]?.full_name || null : null,
+        baCode: p.ba_id ? baById[p.ba_id]?.ba_code || null : null,
+      })),
+    });
   } catch (err) {
     logger.error('[admin] getLandlordProperties error:', err.message);
     captureException(err);

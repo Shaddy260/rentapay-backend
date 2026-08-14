@@ -119,7 +119,7 @@ async function listProperties(req, res) {
 async function createProperty(req, res) {
   try {
     const landlordId = effectiveLandlordId(req);
-    const { name, location, county, constituency, description, mapsLink } = req.body;
+    const { name, location, county, constituency, description, mapsLink, refCode } = req.body;
     let { caretakerName, caretakerPhone } = req.body;
 
     if (!name) return res.status(400).json({ error: 'name is required.' });
@@ -140,6 +140,30 @@ async function createProperty(req, res) {
       }
     }
 
+    // DIRECT REQUEST: BA attribution is per-PROPERTY, not per-landlord
+    // account. An optional referral code on this form links THIS
+    // property (and only this property) to whichever BA's code was
+    // entered right now - never the landlord row, never any other
+    // property this landlord owns. No code entered (or a bad/inactive
+    // one) simply leaves this property's ba_id null - it never falls
+    // back to whichever BA onboarded the landlord originally. Same
+    // silent-on-miss behaviour as every other referral lookup in this
+    // codebase: a bad code never blocks the property from being
+    // created.
+    let propertyBaId = null;
+    if (refCode && typeof refCode === 'string' && refCode.trim()) {
+      try {
+        const { data: referringBa } = await supabase
+          .from('brand_ambassadors')
+          .select('id, status')
+          .eq('referral_code', refCode.trim())
+          .maybeSingle();
+        if (referringBa && referringBa.status === 'active') propertyBaId = referringBa.id;
+      } catch (refLookupErr) {
+        logger.warn('[property] createProperty: referral code lookup failed (non-fatal):', refLookupErr.message);
+      }
+    }
+
     const { data: property, error } = await supabase
       .from('properties')
       .insert({
@@ -152,6 +176,7 @@ async function createProperty(req, res) {
         maps_link: mapsLink || null,
         caretaker_name: caretakerName || null,
         caretaker_phone: caretakerPhone || null,
+        ba_id: propertyBaId,
       })
       .select()
       .single();
@@ -322,7 +347,7 @@ async function assignUnitToProperty(req, res) {
 async function initiatePropertyPurchase(req, res) {
   try {
     const landlordId = effectiveLandlordId(req);
-    const { name, location, county, constituency, description, mapsLink, unitsCount, periodMonths } = req.body;
+    const { name, location, county, constituency, description, mapsLink, unitsCount, periodMonths, refCode } = req.body;
     let { caretakerName, caretakerPhone } = req.body;
 
     if (!name || !name.trim()) return res.status(400).json({ error: 'Property name is required.' });
@@ -353,6 +378,40 @@ async function initiatePropertyPurchase(req, res) {
 
     const { data: landlord, error: fetchError } = await supabase.from('landlords').select('*').eq('id', landlordId).single();
     if (fetchError || !landlord) return res.status(404).json({ error: 'Landlord not found.' });
+
+    // DIRECT REQUEST: some landlords only meet/start working with a BA
+    // after their first property already exists (e.g. onboarded
+    // themselves, then a BA later helps them add a second property -
+    // or a landlord who already has a BA meets a *different* BA and
+    // wants THIS new property credited to them instead). This is a
+    // manual, OPTIONAL slot on the "Add a property" form - never
+    // auto-filled or auto-linked from anything.
+    //
+    // BA attribution here is per-PROPERTY, not per-landlord-account:
+    // whatever code is entered links ONLY this specific property
+    // purchase, and is completely independent of landlords.ba_id and
+    // of any other property this landlord owns (existing or future).
+    // It is never written onto the landlords row, and it never reads
+    // the landlord's existing ba_id either - so a landlord who already
+    // has a BA on their original property can freely bring in a
+    // second, different BA for a new property, and a landlord adding a
+    // property with NO code entered gets no BA on it at all (never
+    // silently falls back to whoever onboarded them originally). Same
+    // silent-on-miss behaviour as every other referral lookup in this
+    // codebase: a bad/expired/inactive code never blocks the purchase.
+    let propertyBaId = null;
+    if (refCode && typeof refCode === 'string' && refCode.trim()) {
+      try {
+        const { data: referringBa } = await supabase
+          .from('brand_ambassadors')
+          .select('id, status')
+          .eq('referral_code', refCode.trim())
+          .maybeSingle();
+        if (referringBa && referringBa.status === 'active') propertyBaId = referringBa.id;
+      } catch (refLookupErr) {
+        logger.warn('[property] initiatePropertyPurchase: referral code lookup failed (non-fatal):', refLookupErr.message);
+      }
+    }
 
     // Priced as its own real subscription (units x chosen months), not
     // prorated against a different property's remaining time - this
@@ -395,6 +454,7 @@ async function initiatePropertyPurchase(req, res) {
         amount: totalCost,
         mpesa_checkout_request_id: stkResponse ? stkResponse.CheckoutRequestID : null,
         status: 'pending',
+        ba_id: propertyBaId,
         // ONE-TIME DISCOUNT CONSUMPTION (P0 fix): captures which
         // loyalty discount (if any) was active when this purchase was
         // initiated - only consumed once completePropertyPurchase
@@ -535,6 +595,10 @@ async function completePropertyPurchase(propPayment) {
       subscription_started_at: now.toISOString(),
       subscription_expires_at: expiresAt.toISOString(),
       subscription_status: 'active',
+      // Per-property BA attribution, captured at initiatePropertyPurchase
+      // time - independent of landlords.ba_id and of any other property
+      // this landlord owns. See sql/2026-08-per-property-ba-attribution.sql.
+      ba_id: propPayment.ba_id || null,
     })
     .select()
     .single();
@@ -552,6 +616,43 @@ async function completePropertyPurchase(propPayment) {
     targetId: property.id,
     metadata: { landlordId: propPayment.landlord_id, unitsCount: propPayment.units_count, periodMonths },
   });
+
+  // DIRECT REQUEST: BA attribution/qualification is per-PROPERTY now
+  // (see sql/2026-08-per-property-ba-attribution.sql), not per-landlord
+  // account. This property's own ba_id (captured at
+  // initiatePropertyPurchase time, independent of landlords.ba_id and
+  // of any other property this landlord owns) is what qualifies here -
+  // NOT the landlord row's ba_id. A landlord can have one property
+  // attributed to BA-A and another to BA-B (or none); each is tracked
+  // and qualified independently, on this property's own
+  // ba_qualification_status/ba_qualified_at columns.
+  //
+  // NOTE for the Step 5/6 follow-up (BA dashboards, admin landlord
+  // search, payout/qualification reporting): those still read
+  // landlords.ba_id today and need to be moved onto properties.ba_id
+  // to actually see this. This block only writes the correct
+  // property-scoped qualification state - it doesn't yet change what
+  // the dashboards display.
+  try {
+    if (property.ba_id && property.ba_qualification_status === 'pending') {
+      const { error: qualifyErr } = await supabase
+        .from('properties')
+        .update({ ba_qualification_status: 'qualified', ba_qualified_at: new Date().toISOString() })
+        .eq('id', property.id)
+        .eq('ba_qualification_status', 'pending');
+      if (!qualifyErr) {
+        logActivity({
+          actorType: 'system',
+          action: 'ba_property_qualified',
+          targetType: 'property',
+          targetId: property.id,
+          metadata: { baId: property.ba_id, landlordId: propPayment.landlord_id, trigger: 'property_purchase_payment' },
+        });
+      }
+    }
+  } catch (qualifyLookupErr) {
+    logger.warn('[property] completePropertyPurchase: BA qualification check failed (non-fatal):', qualifyLookupErr.message);
+  }
 
   // ONE-TIME DISCOUNT CONSUMPTION (P0 fix): same reasoning as the
   // renewal branch above - only reached once this new-property

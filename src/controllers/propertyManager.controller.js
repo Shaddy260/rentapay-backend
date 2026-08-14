@@ -375,14 +375,29 @@ async function updateManager(req, res) {
       return res.status(403).json({ error: 'You can only edit caretakers assigned to the same apartment(s) as you.' });
     }
 
-    // FEATURE (direct request: "users should not be able to edit their
-    // primary phone number or email after registration"). Only when
-    // it's a genuine self-edit - a landlord/admin fixing a manager or
-    // caretaker's record (e.g. a typo'd email at onboarding) is not
-    // the account holder editing their own login identifier, so that
-    // path is left alone.
-    if (isSelf && (email !== undefined || phone)) {
+    // FIX (adopt the same pattern updateMyProfile in
+    // brandAmbassador.controller.js already uses): reject only an
+    // actual CHANGE to phone/email, not merely their presence in the
+    // body - `manager` above already has the current row, so no
+    // extra fetch is needed. The old version 400'd on presence
+    // alone, so a self-edit form that shows phone/email as
+    // pre-filled read-only fields (every one of these forms is built
+    // that way - see Settings.jsx) failed to save ANYTHING, even an
+    // unrelated field, purely because phone/email rode along
+    // unchanged in the payload.
+    if (isSelf && email !== undefined && String(email).trim().toLowerCase() !== (manager.email || '').toLowerCase()) {
       return res.status(400).json({ error: 'Your primary phone number and email cannot be changed after registration. Contact the landlord or support if you need to update them.' });
+    }
+    if (isSelf && phone) {
+      let normalizedPhone;
+      try {
+        normalizedPhone = normalizePhoneOrThrow(phone, 'Property manager phone number');
+      } catch (phoneErr) {
+        return res.status(400).json({ error: phoneErr.message });
+      }
+      if (normalizedPhone !== manager.phone) {
+        return res.status(400).json({ error: 'Your primary phone number and email cannot be changed after registration. Contact the landlord or support if you need to update them.' });
+      }
     }
 
     const updateFields = {};
