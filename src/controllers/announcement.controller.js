@@ -76,20 +76,20 @@ async function fanOutAnnouncementPush(announcement) {
       const jobs = [];
       if (group === 'all' || group === 'tenants') {
         const { data: tenants } = await supabase.from('tenants').select('id, primary_phone');
-        for (const t of tenants || []) jobs.push(notify('tenant', t.id, t.primary_phone, message, { title, category: 'announcement', urgent: true }));
+        for (const t of tenants || []) jobs.push(notify('tenant', t.id, t.primary_phone, message, { title, category: 'announcement', urgent: true, skipInbox: true }));
       }
       if (group === 'all' || group === 'landlord_team') {
         const { data: landlords } = await supabase.from('landlords').select('id, phone');
-        for (const l of landlords || []) jobs.push(notify('landlord', l.id, l.phone, message, { title, category: 'announcement', urgent: true }));
+        for (const l of landlords || []) jobs.push(notify('landlord', l.id, l.phone, message, { title, category: 'announcement', urgent: true, skipInbox: true }));
         const { data: managers } = await supabase.from('property_managers').select('id, phone');
-        for (const m of managers || []) jobs.push(notify('manager', m.id, m.phone, message, { title, category: 'announcement', urgent: true }));
+        for (const m of managers || []) jobs.push(notify('manager', m.id, m.phone, message, { title, category: 'announcement', urgent: true, skipInbox: true }));
       }
       // Brand ambassadors are a separate recipient pool entirely (not
       // landlords/managers/tenants) - reached by 'all' same as
       // everyone else, or on their own via the dedicated 'ba' group.
       if (group === 'all' || group === 'ba') {
         const { data: bas } = await supabase.from('brand_ambassadors').select('id, phone');
-        for (const b of bas || []) jobs.push(notify('brand_ambassador', b.id, b.phone, message, { title, category: 'announcement', urgent: true }));
+        for (const b of bas || []) jobs.push(notify('brand_ambassador', b.id, b.phone, message, { title, category: 'announcement', urgent: true, skipInbox: true }));
       }
       await Promise.allSettled(jobs);
       return;
@@ -105,7 +105,15 @@ async function fanOutAnnouncementPush(announcement) {
       if (announcement.audience === 'property') return t.units?.property_id === announcement.property_id;
       return true; // 'all'
     });
-    await Promise.allSettled(scoped.map((t) => notify('tenant', t.id, t.primary_phone, message, { title, category: 'announcement', urgent: true })));
+    // FIX (direct request: "shows two same messages...drop one"):
+    // skipInbox: true - this announcement is already its own row in
+    // `announcements`, which AnnouncementBell.jsx merges into the same
+    // feed as `notifications` rows. Without skipInbox, every tenant
+    // saw this exact message twice (once as the announcement, once as
+    // a duplicate `notifications` row this call used to also create).
+    // Email/push still go out as normal - only the redundant inbox row
+    // is skipped.
+    await Promise.allSettled(scoped.map((t) => notify('tenant', t.id, t.primary_phone, message, { title, category: 'announcement', urgent: true, skipInbox: true })));
   } catch (err) {
     // Never let a notification-delivery problem surface as a failure
     // of the announcement itself - it's already saved and visible in

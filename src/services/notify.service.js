@@ -91,6 +91,16 @@ async function isTenantOwnerSubscriptionExpired(tenantId, propertyIdHint) {
  *   user" - so this now defaults to true for EVERY notification, not
  *   just payment/vacate/message events. Pass `urgent: false`
  *   explicitly for the rare case something should stay inbox-only.
+ * @param {boolean} [opts.skipInbox] - skips writing the separate
+ *   `notifications` inbox row (email/push, if enabled, still go out
+ *   as normal). Use this when the caller already has its own
+ *   user-visible record the recipient will see elsewhere in the same
+ *   merged feed - e.g. announcement.controller.js's
+ *   fanOutAnnouncementPush, where the `announcements` row itself is
+ *   already what AnnouncementBell.jsx shows; without this, every
+ *   broadcast showed up twice in the bell (once from `announcements`,
+ *   once from the `notifications` row this function used to always
+ *   also write).
  */
 // FIX (direct request: "the things needed to be sent using email
 // should be passwords, otps... and for password resets... and rent
@@ -120,6 +130,18 @@ async function notify(recipientType, recipientId, phone, message, opts = {}) {
   const title = opts.title || defaultTitle(category);
   const urgent = opts.urgent !== false;
   let allowEmail = opts.allowEmail === true;
+  // FIX (direct request: "shows two same messages...drop one"): an
+  // announcement broadcast (see announcement.controller.js's
+  // fanOutAnnouncementPush) already has its own row in the
+  // `announcements` table, which AnnouncementBell.jsx already merges
+  // into the same feed as `notifications` rows. notify() used to
+  // ALWAYS write a second, separate `notifications` row too (for SMS/
+  // push delivery), which - now that both feeds are merged into one
+  // bell - showed up as the exact same message appearing twice.
+  // opts.skipInbox lets a caller that already has its own
+  // user-visible record (announcements) skip just the inbox-row
+  // leg while still getting email/push delivery.
+  const skipInbox = opts.skipInbox === true;
 
   // DIRECT REQUEST: "no emails should be sent to his tenants...only
   // in app notification (during this period when account subscription
@@ -143,34 +165,44 @@ async function notify(recipientType, recipientId, phone, message, opts = {}) {
   // skip the extra lookup query; otherwise resolve it here.
   const email = !allowEmail ? null : (opts.email || (await resolveRecipientEmail(recipientType, recipientId)));
 
-  const tasks = [
-    email ? sendEmail(email, title, wrapEmailHtml(message)) : Promise.resolve({ skipped: true, sent: false, intentional: !allowEmail }),
-    // FIX: this insert used to be considered "fine" by the caller
-    // even when it returned a Supabase error object - .insert() does
-    // NOT throw on a DB error, it resolves with { error }. Wrapped so
-    // a real error (bad recipientId, RLS block, missing migration,
-    // etc.) is actually thrown and shows up as a rejection below
-    // instead of silently vanishing while callers assume it worked.
-    supabase
-      .from('notifications')
-      .insert({ recipient_type: recipientType, recipient_id: recipientId, title, body: message, category, property_id: opts.propertyId || null })
-      .then(({ error }) => { if (error) throw error; }),
+  // Named so status/logging below stay correct regardless of which
+  // legs are actually included (skipInbox removes one, !urgent
+  // removes another) - previously this assumed a fixed
+  // [email, inbox, push] array shape, which silently misattributed
+  // results the moment any leg was conditionally skipped.
+  const legs = [
+    { label: 'email', promise: email ? sendEmail(email, title, wrapEmailHtml(message)) : Promise.resolve({ skipped: true, sent: false, intentional: !allowEmail }) },
   ];
+  if (!skipInbox) {
+    legs.push({
+      label: 'inbox',
+      // FIX: this insert used to be considered "fine" by the caller
+      // even when it returned a Supabase error object - .insert() does
+      // NOT throw on a DB error, it resolves with { error }. Wrapped so
+      // a real error (bad recipientId, RLS block, missing migration,
+      // etc.) is actually thrown and shows up as a rejection below
+      // instead of silently vanishing while callers assume it worked.
+      promise: supabase
+        .from('notifications')
+        .insert({ recipient_type: recipientType, recipient_id: recipientId, title, body: message, category, property_id: opts.propertyId || null })
+        .then(({ error }) => { if (error) throw error; }),
+    });
+  }
   if (urgent) {
-    tasks.push(sendPushToRecipient(recipientType, recipientId, { title, body: message }));
+    legs.push({ label: 'push', promise: sendPushToRecipient(recipientType, recipientId, { title, body: message }) });
   }
 
-  const results = await Promise.allSettled(tasks);
+  const results = await Promise.allSettled(legs.map((l) => l.promise));
 
-  const labels = ['Email', 'inbox', 'push'];
   const status = {};
   results.forEach((r, i) => {
+    const { label } = legs[i];
     // sendEmail() never throws (see email.service.js) - it resolves
     // with { sent: false } on failure/skip instead, so a fulfilled
     // promise alone doesn't mean the email actually went out.
-    status[labels[i].toLowerCase()] = r.status === 'fulfilled' && (labels[i] !== 'Email' || r.value?.sent === true);
+    status[label] = r.status === 'fulfilled' && (label !== 'email' || r.value?.sent === true);
     if (r.status === 'rejected') {
-      logger.error(`[notify] ${labels[i]} delivery failed for ${recipientType} ${recipientId}:`, r.reason?.message || r.reason);
+      logger.error(`[notify] ${label} delivery failed for ${recipientType} ${recipientId}:`, r.reason?.message || r.reason);
     }
   });
 
@@ -179,10 +211,13 @@ async function notify(recipientType, recipientId, phone, message, opts = {}) {
   // previously this function never threw, so ANY caller doing
   // Promise.allSettled(items.map(notify)) counted every recipient as
   // a success no matter what actually happened. Now it throws when
-  // BOTH the email and the in-portal inbox row failed - the recipient
-  // got nothing, anywhere - so callers that use allSettled/try-catch
-  // per recipient can report a real, accurate delivered count.
-  if (!status.email && !status.inbox) {
+  // every leg that was actually attempted failed - the recipient got
+  // nothing, anywhere - so callers that use allSettled/try-catch per
+  // recipient can report a real, accurate delivered count. Checks
+  // push too (not just email/inbox) now that skipInbox can leave push
+  // as the only attempted leg - otherwise a skipInbox call would
+  // always throw even when the push itself succeeded.
+  if (!status.email && !status.inbox && !status.push) {
     throw new Error(`Delivery failed on all channels for ${recipientType} ${recipientId}`);
   }
 

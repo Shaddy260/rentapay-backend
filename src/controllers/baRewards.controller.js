@@ -35,9 +35,22 @@ async function reward(req, res) {
     res.json({
       batch: result.batch,
       rewards: result.rewards,
+      // FIX (direct request: "he's supposed to be notified... it just
+      // says he's notified but ... none is"): this used to hardcode
+      // `done: true` for the "notified" line no matter what actually
+      // happened - rewardBAs() now awaits the notify() calls and
+      // reports back how many of the selected BAs actually received
+      // something (in-app inbox row or push), so a real delivery
+      // failure shows up here instead of a false "notified" claim.
       whatHappensNext: [
         { key: 'pdf', label: 'PDF report generated', done: true },
-        { key: 'notified', label: `${result.bas.length} rewarded Brand Ambassador${result.bas.length === 1 ? '' : 's'} notified`, done: true },
+        {
+          key: 'notified',
+          label: result.notifiedCount === result.bas.length
+            ? `${result.bas.length} rewarded Brand Ambassador${result.bas.length === 1 ? '' : 's'} notified`
+            : `${result.notifiedCount} of ${result.bas.length} rewarded Brand Ambassador${result.bas.length === 1 ? '' : 's'} notified`,
+          done: result.notifiedCount === result.bas.length,
+        },
         { key: 'broadcast', label: 'Broadcast sent to the rest of the BA base', done: true },
       ],
     });

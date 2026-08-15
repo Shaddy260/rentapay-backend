@@ -160,6 +160,7 @@ async function listPendingPayments() {
 // ---------------------------------------------------------------------
 async function listAwaitingDetails() {
   const { currentPeriodKey } = require('./baPayoutLinkCycle.service');
+  const { submissionLinkForToken } = require('./baPayoutSubmissionLink.service');
   const currentPeriod = currentPeriodKey();
 
   const { data: earnings, error: earningsErr } = await supabase
@@ -194,6 +195,12 @@ async function listAwaitingDetails() {
     periodKey: currentPeriod,
     estimatedAmountOwed: truncateKes(owedByBa.get(b.id) || 0),
     hasSubmissionLink: !!b.payout_submission_token,
+    // FIX (missing UI to send a BA their one-time submission link):
+    // the token has existed since approval (see approveBaApplication /
+    // issueSubmissionToken), but nothing ever surfaced the built URL to
+    // the admin - only the fact that a token existed. Build it here so
+    // the Payouts screen can offer a Copy/Share action per BA.
+    submissionLink: b.payout_submission_token ? submissionLinkForToken(b.payout_submission_token) : null,
   }));
 }
 

@@ -241,36 +241,48 @@ async function rewardBAs({ baIds, newPercentage, startAt, endAt, adminId = ADMIN
     });
   }
 
-  // Notify rewarded BAs (in-app + push) and broadcast a motivational
-  // nudge to the wider BA base not selected this round - both
-  // fire-and-forget-with-logging so a notification hiccup never blocks
-  // the reward itself from having already been saved.
-  notifyRewardedBas(bas || [], { percentage, defaultPercentage, start, end }).catch((err) => {
-    logger.error('[baRewards] notifyRewardedBas failed:', err.message);
-    captureException(err);
-  });
+  // Notify rewarded BAs (in-app + push) - awaited (not fire-and-forget)
+  // so the response can report how many actually got through, rather
+  // than the caller/UI unconditionally claiming success (see FIX
+  // below in the controller - this mirrors the exact bug notify.service.js
+  // already documents fixing for tenant-facing sends: "the message
+  // does not reach... while the sender's UI claimed success"). The
+  // wider "everyone else" motivational nudge stays fire-and-forget -
+  // it's a nice-to-have broadcast, not something the confirmation
+  // screen makes a specific claim about.
+  const notifiedCount = await notifyRewardedBas(bas || [], { percentage, defaultPercentage, start, end });
   broadcastMotivationalNudge(baIds).catch((err) => {
     logger.error('[baRewards] broadcastMotivationalNudge failed:', err.message);
     captureException(err);
   });
 
-  return { batch, rewards: rewardRows, bas: bas || [] };
+  return { batch, rewards: rewardRows, bas: bas || [], notifiedCount };
 }
 
+// Returns how many of `bas` actually received at least one delivery
+// channel (in-app inbox row or push - see notify()'s own all-channels-
+// failed check), instead of assuming every attempt succeeded.
 async function notifyRewardedBas(bas, { percentage, defaultPercentage, start, end }) {
   const periodLabel = `${start.toLocaleDateString('en-GB')} – ${end.toLocaleDateString('en-GB')}`;
   const message = `You've been rewarded a custom commission rate of ${percentage}% (default is ${defaultPercentage}%) from ${periodLabel}. Keep up the great work!`;
-  await Promise.all(
+  const results = await Promise.allSettled(
     bas.map((b) =>
       notify('brand_ambassador', b.id, null, message, {
         category: 'ba_reward_granted',
         title: 'You\u2019ve been rewarded!',
-      }).catch((err) => {
-        logger.error(`[baRewards] reward notify failed for BA ${b.id}:`, err.message);
-        captureException(err);
       })
     )
   );
+  let notifiedCount = 0;
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') {
+      notifiedCount += 1;
+    } else {
+      logger.error(`[baRewards] reward notify failed for BA ${bas[i].id}:`, r.reason?.message || r.reason);
+      captureException(r.reason instanceof Error ? r.reason : new Error(String(r.reason)));
+    }
+  });
+  return notifiedCount;
 }
 
 /**

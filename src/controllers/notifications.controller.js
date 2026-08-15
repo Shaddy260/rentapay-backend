@@ -19,6 +19,17 @@ function recipientFor(req) {
   // 'super-admin' isn't even a valid landlord uuid, so it silently
   // saw an empty inbox forever.
   if (req.user.role === 'admin') return { type: 'admin', id: 'super-admin' };
+  // BUG FIX (direct request: "push notifications are not reaching
+  // [brand ambassadors]"): brand_ambassador used to fall through to
+  // the landlord default below, which looked up recipient_type=
+  // 'landlord' with recipient_id = the BA's own id - a bucket that
+  // never has anything in it, since notify('brand_ambassador', ...)
+  // (see notify.service.js) always writes recipient_type=
+  // 'brand_ambassador'. Every BA's actual notifications (reward
+  // confirmations, payout runs, etc.) existed in the table but could
+  // never be found by this query. Same bug shape as the admin fix
+  // above.
+  if (req.user.role === 'brand_ambassador') return { type: 'brand_ambassador', id: req.user.id };
   return { type: 'landlord', id: req.user.id };
 }
 
@@ -31,7 +42,7 @@ function recipientFor(req) {
 // was created and filters the inbox query to that cutoff onward.
 async function recipientCreatedAt(type, id) {
   if (type === 'admin') return null; // no "account creation" concept for the single super-admin account - never filter its inbox
-  const table = type === 'landlord' ? 'landlords' : type === 'manager' ? 'property_managers' : 'tenants';
+  const table = type === 'landlord' ? 'landlords' : type === 'manager' ? 'property_managers' : type === 'brand_ambassador' ? 'brand_ambassadors' : 'tenants';
   const { data } = await supabase.from(table).select('created_at').eq('id', id).maybeSingle();
   return data?.created_at || null;
 }

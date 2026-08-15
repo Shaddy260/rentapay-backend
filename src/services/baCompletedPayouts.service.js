@@ -17,7 +17,7 @@ function truncateKes(amount) {
 
 async function baInfoMap(baIds) {
   if (!baIds.length) return new Map();
-  const { data, error } = await supabase.from('brand_ambassadors').select('id, full_name, ba_code').in('id', baIds);
+  const { data, error } = await supabase.from('brand_ambassadors').select('id, full_name, ba_code, phone').in('id', baIds);
   if (error) throw error;
   return new Map((data || []).map((b) => [b.id, b]));
 }
@@ -83,6 +83,10 @@ async function listCompleted({ periodKey } = {}) {
       periodKey: p.period_key,
       baName: ba ? ba.full_name : 'Unknown BA',
       baCode: ba ? ba.ba_code : null,
+      // FIX: needed so the admin can share a generated 24h edit link
+      // straight to the BA's WhatsApp, same pattern as the awaiting-
+      // submission list uses.
+      baPhone: ba ? ba.phone : null,
       mpesaNumber: submission ? submission.mpesa_number : null,
       submittedName: submission ? submission.submitted_name : null,
       submittedEmail: submission ? submission.submitted_email : null,
