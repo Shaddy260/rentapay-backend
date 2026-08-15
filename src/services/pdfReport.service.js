@@ -446,11 +446,83 @@ function generateEarningsStatementPdf(res, { ba, claims, totals, periodLabel, ge
   doc.end();
 }
 
+// PREMIUM REDESIGN PLAN - PHASE 8: after admin confirms a BA reward
+// (single or bulk), a downloadable, branded PDF lists the rewarded
+// BAs - name, new commission rate, reward period, contact details.
+// Net contribution is deliberately NOT included in this export (per
+// spec). Same branded-header convention as the statements above
+// (RentaPay wordmark + report title, generated-at metadata) so it
+// reads as an official RentaPay document rather than a bare table.
+function generateBaRewardReportPdf(res, { batch, rewards, generatedAt }) {
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  doc.pipe(res);
+
+  // --- Branded header band ---------------------------------------
+  doc.rect(0, 0, doc.page.width, 90).fillColor('#0F3D3E').fill();
+  doc.fontSize(22).fillColor('#FFFFFF').text('RentaPay', 50, 26, { continued: true });
+  doc.fillColor('#C9A24B').text(' — Brand Ambassador Reward Report');
+  doc.fontSize(9).fillColor('#E8CE8B').text(
+    `Reward period ${new Date(batch.start_at).toLocaleDateString('en-GB')} – ${new Date(batch.end_at).toLocaleDateString('en-GB')}  ·  Generated ${generatedAt.toLocaleString('en-GB')}  ·  Report ID ${batch.id.slice(0, 8).toUpperCase()}`,
+    50,
+    58,
+    { width: doc.page.width - 100 }
+  );
+
+  doc.y = 115;
+  doc.fontSize(11).fillColor('#1a1a1a').text(
+    `New commission rate: ${Number(batch.new_percentage)}% (default was ${Number(batch.default_percentage_at_time)}%)  ·  ${rewards.length} Brand Ambassador${rewards.length === 1 ? '' : 's'} rewarded`,
+    50
+  );
+  doc.moveDown(1);
+  doc.strokeColor('#e0e0e0').moveTo(50, doc.y).lineTo(545, doc.y).stroke();
+  doc.moveDown(0.6);
+
+  const colX = { name: 50, rate: 220, period: 300, phone: 400, email: 480 };
+  const headerY = doc.y;
+  doc.fontSize(9).font('Helvetica-Bold').fillColor('#1a1a1a');
+  doc.text('Brand Ambassador', colX.name, headerY, { width: 165 });
+  doc.text('New Rate', colX.rate, headerY, { width: 75 });
+  doc.text('Reward Period', colX.period, headerY, { width: 95 });
+  doc.text('Phone', colX.phone, headerY, { width: 75 });
+  doc.moveDown(0.5);
+  doc.strokeColor('#e0e0e0').moveTo(50, doc.y).lineTo(545, doc.y).stroke();
+  doc.moveDown(0.3);
+
+  doc.font('Helvetica').fontSize(9).fillColor('#333');
+  rewards.forEach((r, i) => {
+    if (doc.y > 720) {
+      doc.addPage();
+      doc.y = 50;
+    }
+    const rowY = doc.y;
+    if (i % 2 === 0) doc.rect(50, rowY - 2, 495, 30).fillColor('#f7f9f7').fill();
+    doc.fillColor('#333');
+    doc.text(`${r.baName}${r.baCode ? ` (${r.baCode})` : ''}`, colX.name, rowY, { width: 165 });
+    doc.fillColor('#0F3D3E').font('Helvetica-Bold').text(`${Number(r.new_percentage)}%`, colX.rate, rowY, { width: 75 });
+    doc.font('Helvetica').fillColor('#333');
+    doc.text(`${new Date(r.start_at).toLocaleDateString('en-GB')} – ${new Date(r.end_at).toLocaleDateString('en-GB')}`, colX.period, rowY, { width: 95 });
+    doc.text(r.baPhone || '—', colX.phone, rowY, { width: 75 });
+    doc.text(r.baEmail || '—', colX.email, rowY + 12, { width: 460 });
+    doc.moveDown(1.6);
+  });
+
+  doc.moveDown(1);
+  doc.fontSize(8).fillColor('#aaa').text(
+    'RentaPay · This report lists rewarded Brand Ambassadors only. Commission rates revert automatically to the default rate at the end of the reward period.',
+    50,
+    doc.page.height - 60,
+    { width: 495, align: 'center' }
+  );
+
+  doc.end();
+}
+
 module.exports = {
   generateCollectionSummaryPdf,
   generatePaymentReceiptPdf,
   generatePaymentReceiptPdfBuffer,
   generatePaymentHistoryPdf,
   generateEarningsStatementPdf,
+  generateBaRewardReportPdf,
   receiptNumber,
 };

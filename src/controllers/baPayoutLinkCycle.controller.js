@@ -15,11 +15,8 @@
 // views (Phase 3/4) are separate, later phases - this controller only
 // covers cycle lifecycle + link validation.
 
-const {
-  getOrCreateCurrentCycle,
-  validateSubmissionToken,
-  publicLinkForToken,
-} = require('../services/baPayoutLinkCycle.service');
+const { getOrCreateCurrentCycle } = require('../services/baPayoutLinkCycle.service');
+const { validateSubmissionAttempt, validateEditLink } = require('../services/baPayoutSubmissionLink.service');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
 
@@ -31,13 +28,17 @@ const logger = require('../utils/logger');
 async function getCurrentCycleStatus(req, res) {
   try {
     const cycle = await getOrCreateCurrentCycle(req.user?.id || null);
+    // BUILD SPEC PHASE 10: there is no shared per-cycle submission
+    // link anymore - each BA gets their own one-time submission link,
+    // issued once at approval (see approveBaApplication). This
+    // endpoint now only reports the current calendar period used to
+    // group commission earnings for the Pending/Completed views.
     return res.json({
       cycle: {
         id: cycle.id,
         periodKey: cycle.period_key,
         status: cycle.status,
         generatedAt: cycle.generated_at,
-        link: publicLinkForToken(cycle.token),
       },
     });
   } catch (err) {
@@ -48,16 +49,26 @@ async function getCurrentCycleStatus(req, res) {
 }
 
 // ---------------------------------------------------------------------
-// PUBLIC - validate a ?token= before the submission form renders.
+// PUBLIC - validate a ?token= (one-time submission link) or ?edit=
+// (24h admin-issued correction link) before the form renders. A
+// duplicate-attempt on an already-used submission token is reported
+// clearly rather than silently rendering a form that would only fail
+// at submit time.
 // ---------------------------------------------------------------------
 async function validatePayoutLinkToken(req, res) {
   try {
-    const { token } = req.query;
-    const result = await validateSubmissionToken(token);
-    if (!result.ok) {
-      return res.status(410).json({ valid: false, error: result.error });
+    const { token, edit } = req.query;
+    if (edit) {
+      const result = await validateEditLink(edit);
+      if (!result.ok) return res.status(410).json({ valid: false, error: result.error });
+      return res.json({ valid: true, mode: 'edit', baName: result.ba.full_name });
     }
-    return res.json({ valid: true, periodKey: result.cycle.period_key });
+
+    const result = await validateSubmissionAttempt(token);
+    if (!result.ok) {
+      return res.status(410).json({ valid: false, error: result.error, duplicateSubmission: !!result.duplicate });
+    }
+    return res.json({ valid: true, mode: 'submit', baName: result.ba.full_name });
   } catch (err) {
     logger.error('[baPayoutLinkCycle] validatePayoutLinkToken error:', err.message);
     captureException(err);

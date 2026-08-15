@@ -1,8 +1,7 @@
 // src/routes/baPayoutLinkCycle.routes.js
 //
-// Mounted at /api/brand-ambassadors in server.js, alongside the rest
-// of the existing BA routes. Phase 1 of the BA Monthly Payment
-// Details & Payout Workflow - see ba-payout-link-plan.md.
+// Mounted at /api/brand-ambassadors in server.js. BUILD SPEC PHASE 10
+// - Fix: BA Payout Submission Overwrite Bug.
 const express = require('express');
 const { verifyToken, requireRole } = require('../middleware/auth.middleware');
 const ctrl = require('../controllers/baPayoutLinkCycle.controller');
@@ -12,27 +11,38 @@ const completedCtrl = require('../controllers/baCompletedPayouts.controller');
 
 const router = express.Router();
 
-// PUBLIC - the payment-details submission page validates its ?token=
-// on load, before rendering the form (Phase 2 builds the form itself).
+// PUBLIC - the one-time submission page validates its ?token= on
+// load. Kept for informational period bookkeeping only - see the
+// controller; BA-level submission gating now happens in
+// baPayoutSubmissionLink.service, not here.
 router.get('/payout-link/validate', ctrl.validatePayoutLinkToken);
 
-// PUBLIC - Phase 2: the actual submission form (M-Pesa number, name,
-// account email) and the "look my submission back up" endpoint used
-// by the confirmation view.
+// PUBLIC - the ONE-TIME submission (no resubmission UI anywhere), the
+// "look my on-file submission back up" endpoint, and the ONLY
+// correction path (a distinct, admin-issued, 24h edit link).
 router.post('/payout-link/submit', submissionCtrl.submitPayoutLinkDetails);
+router.post('/payout-link/edit-submit', submissionCtrl.editPayoutLinkDetails);
 router.get('/payout-link/my-submission', submissionCtrl.getMyPayoutLinkSubmission);
 
-// ADMIN - current month's cycle status + shareable public link.
+// ADMIN - current period bookkeeping (informational only - earnings
+// grouping, not a shareable per-BA submission link anymore).
 router.get('/payout-link/current', verifyToken, requireRole('admin'), ctrl.getCurrentCycleStatus);
 
-// ADMIN - Phase 3: Pending Payments view + mark-as-paid.
+// ADMIN - Pending tab + mark-as-paid.
 router.get('/payout-link/pending', verifyToken, requireRole('admin'), pendingCtrl.getPendingPayments);
 router.get('/payout-link/awaiting-details', verifyToken, requireRole('admin'), pendingCtrl.getAwaitingDetails);
 router.post('/payout-link/mark-paid', verifyToken, requireRole('admin'), pendingCtrl.postMarkPaid);
 
-// ADMIN - Phase 4: Completed list (read-only) + PDF export.
+// ADMIN - Completed tab (read-only, browsable by month) + PDF export.
 router.get('/payout-link/completed-periods', verifyToken, requireRole('admin'), completedCtrl.getCompletedPeriods);
 router.get('/payout-link/completed/pdf', verifyToken, requireRole('admin'), completedCtrl.downloadCompletedPdf);
 router.get('/payout-link/completed', verifyToken, requireRole('admin'), completedCtrl.getCompleted);
+
+// ADMIN - Payment history tab: the full, append-only, all-time log.
+router.get('/payout-link/history', verifyToken, requireRole('admin'), completedCtrl.getPaymentHistory);
+
+// ADMIN - generate a 24h edit link for a BA who has already submitted
+// once. This is the only route back into their details.
+router.post('/:id/payout-link/generate-edit-link', verifyToken, requireRole('admin'), submissionCtrl.postGenerateEditLink);
 
 module.exports = router;

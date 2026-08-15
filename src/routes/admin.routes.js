@@ -8,6 +8,7 @@ const manualSubPaymentController = require('../controllers/landlordManualSubscri
 const ratingFlagController = require('../controllers/ratingFlag.controller');
 const moderationController = require('../controllers/moderation.controller');
 const landlordLeadController = require('../controllers/landlordLead.controller');
+const financialOverviewController = require('../controllers/adminFinancialOverview.controller');
 const { verifyToken, requireRole } = require('../middleware/auth.middleware');
 
 router.use(verifyToken, requireRole('admin'));
@@ -26,6 +27,14 @@ router.get('/units', adminController.listAllUnits);
 router.get('/revenue', adminController.getRevenueBreakdown);
 router.get('/revenue-trend', adminController.getRevenueTrend);
 router.get('/revenue-dashboard', adminController.getRevenueDashboard);
+
+// PREMIUM REDESIGN PLAN - PHASE 9: Admin Financial Overview & Expense
+// Tracking. Scoped to one month at a time (?month=YYYY-MM, defaults
+// to the current month).
+router.get('/financial-overview', financialOverviewController.getOverview);
+router.post('/financial-overview/expenses', financialOverviewController.addExpense);
+router.post('/financial-overview/expenses/:id/stop', financialOverviewController.stopExpense);
+router.delete('/financial-overview/expenses/:id', financialOverviewController.deleteExpense);
 router.get('/growth-statistics', adminController.getGrowthStatistics);
 router.get('/expiring-landlords', adminController.getExpiringLandlords);
 router.post('/expiring-landlords/remind', adminController.sendRenewalReminders);

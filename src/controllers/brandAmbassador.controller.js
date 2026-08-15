@@ -786,6 +786,12 @@ async function approveBaApplication(req, res) {
     const tempPassword = generateTempPassword();
     const passwordHash = await hashPassword(tempPassword);
 
+    // BUILD SPEC PHASE 10: the one-time, non-expiring payout
+    // submission token is established right here, at the point the BA
+    // account becomes active - not a recurring per-cycle link. This is
+    // the only time this token is ever generated for this BA.
+    const payoutSubmissionToken = require('crypto').randomBytes(20).toString('hex');
+
     const { data: approved, error: updateErr } = await supabase
       .from('brand_ambassadors')
       .update({
@@ -797,6 +803,8 @@ async function approveBaApplication(req, res) {
         onboarded_at: new Date().toISOString(),
         reviewed_by_admin_id: 'super-admin',
         reviewed_at: new Date().toISOString(),
+        payout_submission_token: payoutSubmissionToken,
+        payout_submission_token_generated_at: new Date().toISOString(),
       })
       .eq('id', id)
       .select()

@@ -3,6 +3,7 @@ const router = express.Router();
 const ctrl = require('../controllers/brandAmbassador.controller');
 const payoutRulesCtrl = require('../controllers/payoutRules.controller');
 const baAdminPayoutCtrl = require('../controllers/baAdminPayout.controller');
+const baRewardsCtrl = require('../controllers/baRewards.controller');
 const { verifyToken, requireRole } = require('../middleware/auth.middleware');
 
 // PUBLIC - the one generic "Become a Brand Ambassador" link
@@ -114,5 +115,16 @@ router.get('/security-report', verifyToken, requireRole('admin'), baAdminPayoutC
 router.get('/:baId/earnings-statement', verifyToken, requireRole('admin'), baAdminPayoutCtrl.getBaEarningsStatement);
 router.get('/:baId/earnings-statement.pdf', verifyToken, requireRole('admin'), baAdminPayoutCtrl.downloadBaEarningsStatementPdf);
 router.get('/:baId/earnings-statement.csv', verifyToken, requireRole('admin'), baAdminPayoutCtrl.downloadBaEarningsStatementCsv);
+
+// PREMIUM REDESIGN PLAN - PHASE 8: Admin BA Performance & Rewards
+// Dashboard. Leaderboard ranked by net revenue contribution (not
+// landlord count); single/bulk time-bound custom-commission rewards
+// that auto-revert; PDF export of a reward batch; running reward
+// history; standing "challenge" broadcast.
+router.get('/rewards/leaderboard', verifyToken, requireRole('admin'), baRewardsCtrl.getLeaderboard);
+router.post('/rewards', verifyToken, requireRole('admin'), baRewardsCtrl.reward);
+router.get('/rewards/history', verifyToken, requireRole('admin'), baRewardsCtrl.getHistory);
+router.get('/rewards/:batchId/pdf', verifyToken, requireRole('admin'), baRewardsCtrl.downloadRewardPdf);
+router.post('/rewards/challenge-broadcast', verifyToken, requireRole('admin'), baRewardsCtrl.sendChallengeBroadcast);
 
 module.exports = router;

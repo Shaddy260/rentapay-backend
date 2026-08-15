@@ -1,28 +1,30 @@
 // src/controllers/baPaymentSubmission.controller.js
 //
-// BA Monthly Payment Details & Payout Workflow - Phase 2.
+// BUILD SPEC PHASE 10 - Fix: BA Payout Submission Overwrite Bug.
 //
-// Two PUBLIC endpoints, mounted alongside the Phase 1 payout-link
-// routes:
-//   POST /api/brand-ambassadors/payout-link/submit   - BA submits
-//        (or resubmits/overwrites) their M-Pesa number, name, and
-//        account email for the current month's active cycle.
+// PUBLIC endpoints:
+//   POST /api/brand-ambassadors/payout-link/submit
+//        - the BA's ONE-TIME submission (M-Pesa number, name, account
+//          email). No resubmission - see the service for the full
+//          server-side duplicate guard.
 //   GET  /api/brand-ambassadors/payout-link/my-submission
-//        ?token=...&email=...  - lets the BA re-open the confirmation
-//        view later in the same month to see what they submitted.
+//        ?token=...&email=...  - re-open the confirmation view.
+//   POST /api/brand-ambassadors/payout-link/edit-submit
+//        - the ONLY correction path: requires a valid, unexpired,
+//          unused 24h admin-issued edit link (?editToken=).
 //
-// Both require the ?token= to still match the current active cycle
-// (see baPayoutLinkCycle.service.validateSubmissionToken) - a token
-// from a month that has since rolled over is treated as dead, same as
-// Phase 1's /payout-link/validate.
+// ADMIN endpoint (mounted here too, small enough not to warrant its
+// own controller file):
+//   POST /api/brand-ambassadors/:id/payout-link/generate-edit-link
 
 const { isValidEmail } = require('../utils/email');
-const { submitPaymentDetails, getMySubmission } = require('../services/baPaymentSubmission.service');
+const { submitPaymentDetails, applyEdit, getMySubmission } = require('../services/baPaymentSubmission.service');
+const { generateEditLink } = require('../services/baPayoutSubmissionLink.service');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
 
 // ---------------------------------------------------------------------
-// PUBLIC - submit payment details for the current cycle.
+// PUBLIC - the one-time submission.
 // ---------------------------------------------------------------------
 async function submitPayoutLinkDetails(req, res) {
   try {
@@ -38,7 +40,7 @@ async function submitPayoutLinkDetails(req, res) {
       return res.status(400).json({ error: 'Please enter the name registered on this M-Pesa number.' });
     }
 
-    const { submission, cycle, ba } = await submitPaymentDetails({
+    const { submission, ba } = await submitPaymentDetails({
       token,
       email,
       mpesaNumber,
@@ -46,10 +48,9 @@ async function submitPayoutLinkDetails(req, res) {
     });
 
     return res.json({
-      message: 'Your payment details have been received. Thank you!',
+      message: 'Your payment details have been received. Thank you! This link has now been used and cannot be submitted again - if anything needs correcting later, ask RentaPay for a correction link.',
       submission: {
         id: submission.id,
-        periodKey: cycle.period_key,
         mpesaNumber: submission.mpesa_number,
         submittedName: submission.submitted_name,
         submittedEmail: submission.submitted_email,
@@ -58,6 +59,9 @@ async function submitPayoutLinkDetails(req, res) {
       },
     });
   } catch (err) {
+    if (err.duplicate) {
+      return res.status(409).json({ error: err.message, duplicateSubmission: true });
+    }
     if (err.linkInvalid) {
       return res.status(410).json({ error: err.message, linkExpired: true });
     }
@@ -80,16 +84,71 @@ async function submitPayoutLinkDetails(req, res) {
 }
 
 // ---------------------------------------------------------------------
-// PUBLIC - re-fetch the BA's own submission for the current cycle, so
-// the frontend can show/edit it again later in the same month.
+// PUBLIC - the only correction path: a valid 24h admin-issued edit
+// link. Never a second pass through submitPayoutLinkDetails.
+// ---------------------------------------------------------------------
+async function editPayoutLinkDetails(req, res) {
+  try {
+    const { editToken, mpesaNumber, name, email } = req.body || {};
+    if (!mpesaNumber || !String(mpesaNumber).trim()) {
+      return res.status(400).json({ error: 'Please enter the M-Pesa number to be paid.' });
+    }
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'Please enter the name registered on this M-Pesa number.' });
+    }
+    if (email && !isValidEmail(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+
+    const { submission, ba } = await applyEdit({
+      editToken,
+      mpesaNumber,
+      submittedName: name,
+      email,
+    });
+
+    return res.json({
+      message: 'Your payment details have been updated. Thank you!',
+      submission: {
+        id: submission.id,
+        mpesaNumber: submission.mpesa_number,
+        submittedName: submission.submitted_name,
+        submittedEmail: submission.submitted_email,
+        submittedAt: submission.submitted_at,
+        baName: ba.full_name,
+      },
+    });
+  } catch (err) {
+    if (err.linkInvalid) {
+      return res.status(410).json({ error: err.message, linkExpired: true });
+    }
+    if (err.notFound) {
+      return res.status(404).json({ error: err.message });
+    }
+    if (err.validation) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (/doesn't look like a valid/.test(err.message || '')) {
+      return res.status(400).json({ error: err.message });
+    }
+    logger.error('[baPaymentSubmission] editPayoutLinkDetails error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to update your payment details. Please try again.' });
+  }
+}
+
+// ---------------------------------------------------------------------
+// PUBLIC - re-fetch the BA's own on-file submission, by either their
+// original (now-used) submission token or a valid edit token, so the
+// frontend can show/prefill it again.
 // ---------------------------------------------------------------------
 async function getMyPayoutLinkSubmission(req, res) {
   try {
-    const { token, email } = req.query;
-    if (!email || !isValidEmail(email)) {
+    const { token, editToken, email } = req.query;
+    if (!editToken && (!email || !isValidEmail(email))) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
-    const submission = await getMySubmission({ token, email });
+    const submission = await getMySubmission({ token, editToken, email });
     if (!submission) {
       return res.json({ found: false });
     }
@@ -101,7 +160,6 @@ async function getMyPayoutLinkSubmission(req, res) {
         submittedName: submission.submitted_name,
         submittedEmail: submission.submitted_email,
         submittedAt: submission.submitted_at,
-        status: submission.status,
       },
     });
   } catch (err) {
@@ -114,7 +172,31 @@ async function getMyPayoutLinkSubmission(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// ADMIN - generate the 24h edit link for a BA who already submitted
+// once. The only route back into their details.
+// ---------------------------------------------------------------------
+async function postGenerateEditLink(req, res) {
+  try {
+    const { id } = req.params;
+    const result = await generateEditLink({ baId: id, adminId: req.user?.id || null });
+    return res.status(201).json(result);
+  } catch (err) {
+    if (err.notFound) {
+      return res.status(404).json({ error: err.message });
+    }
+    if (err.validation) {
+      return res.status(400).json({ error: err.message });
+    }
+    logger.error('[baPaymentSubmission] postGenerateEditLink error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to generate an edit link.' });
+  }
+}
+
 module.exports = {
   submitPayoutLinkDetails,
+  editPayoutLinkDetails,
   getMyPayoutLinkSubmission,
+  postGenerateEditLink,
 };

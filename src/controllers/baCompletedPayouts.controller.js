@@ -14,7 +14,7 @@
 //        - the payout PDF for that selection, reusing
 //        baPayoutQualificationReportPdf.service.js's look.
 
-const { listCompletedPeriods, listCompleted } = require('../services/baCompletedPayouts.service');
+const { listCompletedPeriods, listCompleted, listPaymentHistory } = require('../services/baCompletedPayouts.service');
 const { generateCompletedPayoutLinkPdf } = require('../services/baPayoutQualificationReportPdf.service');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
@@ -64,8 +64,20 @@ async function downloadCompletedPdf(req, res) {
   }
 }
 
+async function getPaymentHistory(req, res) {
+  try {
+    const result = await listPaymentHistory();
+    return res.json(result);
+  } catch (err) {
+    logger.error('[baCompletedPayouts] getPaymentHistory error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load payment history.' });
+  }
+}
+
 module.exports = {
   getCompletedPeriods,
   getCompleted,
   downloadCompletedPdf,
+  getPaymentHistory,
 };

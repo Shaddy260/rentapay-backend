@@ -48,12 +48,19 @@ function billingCycleFor(date) {
 async function resolveApplicableRate(baId, atDate) {
   const asOf = new Date(atDate).toISOString();
 
+  // Phase 8: a reward override is time-bound (effective_until set) -
+  // once `asOf` passes that timestamp the row must stop being picked
+  // up here, which is exactly what makes the reward "automatically
+  // revert to the universal default rate, no manual step required."
+  // Plain (non-reward) overrides never set effective_until, so this
+  // filter is a no-op for them - existing behaviour is unchanged.
   const { data: overrideRows, error: overrideErr } = await supabase
     .from('payout_rules')
-    .select('id, percentage, effective_from')
+    .select('id, percentage, effective_from, effective_until')
     .eq('scope', 'ba_override')
     .eq('ba_id', baId)
     .lte('effective_from', asOf)
+    .or(`effective_until.is.null,effective_until.gt.${asOf}`)
     .order('effective_from', { ascending: false })
     .limit(1);
   if (overrideErr) throw overrideErr;

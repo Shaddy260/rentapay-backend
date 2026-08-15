@@ -39,9 +39,9 @@ async function getAwaitingDetails(req, res) {
 
 async function postMarkPaid(req, res) {
   try {
-    const { submissionIds, submissionId } = req.body || {};
-    const ids = Array.isArray(submissionIds) ? submissionIds : submissionId ? [submissionId] : [];
-    const result = await markPaid({ submissionIds: ids, adminId: req.user?.id || null });
+    const { payoutKeys, payoutKey } = req.body || {};
+    const keys = Array.isArray(payoutKeys) ? payoutKeys : payoutKey ? [payoutKey] : [];
+    const result = await markPaid({ payoutKeys: keys, adminId: req.user?.id || null });
     return res.json(result);
   } catch (err) {
     if (err.validation) {

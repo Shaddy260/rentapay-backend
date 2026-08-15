@@ -239,7 +239,6 @@ app.use('/api/payment-plans', paymentPlanRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/tenant-onboarding', tenantOnboardingRoutes);
 app.use('/api/brand-ambassadors', brandAmbassadorRoutes);
-app.use('/api/reviews', require('./routes/platformReview.routes'));
 app.use('/api/support-chat', require('./routes/supportChat.routes'));
 
 // Public "Help & Contact Details" (read by every portal's Help modal,
