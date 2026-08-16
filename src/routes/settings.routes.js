@@ -30,7 +30,14 @@ adminRouter.delete('/help-contacts/numbers/:id', verifyToken, requireRole('admin
 // Subscription fee (base rate + period discount tiers) - affects
 // signup, adding a property, adding units, and renewals everywhere,
 // since they all read from this via utils/pricing.js.
-adminRouter.get('/subscription-pricing', verifyToken, requireRole('admin'), pricingCtrl.getSubscriptionPricing);
+// SECTION 6 (General Manager spec): "Platform unit pricing (price per
+// unit per month)" is one of the two fields explicitly locked to
+// admin-only editing - "General Managers can see these current
+// settings but have no ability to change them." The GET below opens
+// to 'general_manager' so a GM can view the live rate; the PATCH
+// stays requireRole('admin') only, genuinely non-editable for that
+// role at the API level.
+adminRouter.get('/subscription-pricing', verifyToken, requireRole('admin', 'general_manager'), pricingCtrl.getSubscriptionPricing);
 adminRouter.patch('/subscription-pricing', verifyToken, requireRole('admin'), pricingCtrl.updateSubscriptionPricing);
 
 // Loyalty discounts for landlords who've subscribed consecutively.

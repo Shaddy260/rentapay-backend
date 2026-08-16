@@ -9,6 +9,7 @@
 
 const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
+const { drawBrandedHeader, drawBrandedFooter, LOGO_PATH } = require('./pdfBranding.service');
 
 const KES = (n) => `KES ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 0 })}`;
 
@@ -27,13 +28,11 @@ function generateCollectionSummaryPdf(res, { landlordName, propertyName, generat
   const { units, payments, expenses, monthlyCollected } = stats;
 
   // --- Header ---------------------------------------------------------
-  doc.fontSize(20).fillColor('#1a1a1a').text('RentaPay', { continued: true }).fillColor('#2e7d32').text(' — Monthly Collection Summary');
-  doc.moveDown(0.2);
-  doc.fontSize(11).fillColor('#555').text(propertyName);
-  doc.fontSize(9).fillColor('#888').text(`Prepared for ${landlordName} · Generated ${generatedAt.toLocaleString('en-GB')}`);
-  doc.moveDown(1);
-  doc.strokeColor('#e0e0e0').moveTo(50, doc.y).lineTo(545, doc.y).stroke();
-  doc.moveDown(1);
+  drawBrandedHeader(doc, {
+    title: 'Monthly Collection Summary',
+    subtitle: propertyName,
+    meta: `Prepared for ${landlordName} · Generated ${generatedAt.toLocaleString('en-GB')}`,
+  });
 
   // --- Headline figures -------------------------------------------------
   doc.fontSize(13).fillColor('#1a1a1a').text('This Month');
@@ -110,8 +109,9 @@ function generateCollectionSummaryPdf(res, { landlordName, propertyName, generat
   });
 
   doc.moveDown(2);
-  doc.fontSize(8).fillColor('#aaa').text('Generated automatically by RentaPay. Figures reflect completed rent payments and logged expenses only.', 50, doc.page.height - 70, { width: 495, align: 'center' });
+  doc.fontSize(8).fillColor('#aaa').text('Generated automatically by RentaPay. Figures reflect completed rent payments and logged expenses only.', 50, doc.page.height - 95, { width: 495, align: 'center' });
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 
@@ -176,10 +176,16 @@ async function generatePaymentReceiptPdf(target, { payment, tenantName, unitName
   doc.roundedRect(left, cardTop, contentWidth, 700, 10).lineWidth(1).strokeColor('#d8d8d8').stroke();
 
   // --- Header: logo + document title -------------------------------
-  doc.fontSize(22).fillColor('#2e7d32').font('Helvetica-Bold').text('RentaPay', left + 24, cardTop + 24);
-  doc.fontSize(11).fillColor('#1a1a1a').font('Helvetica').text('Official Payment Receipt', left + 24, doc.y + 1);
-  doc.fontSize(9).fillColor('#888').text(`Receipt No. ${receiptNumber(payment.id)}`, left + 24, doc.y + 6);
-  doc.fontSize(9).fillColor('#888').text(`Generated ${generatedAt.toLocaleString('en-GB')}`);
+  try {
+    doc.roundedRect(left + 24, cardTop + 20, 40, 40, 9).fillColor('#ffffff').lineWidth(1).strokeColor('#d8d8d8').fillAndStroke('#ffffff', '#d8d8d8');
+    doc.image(LOGO_PATH, left + 28, cardTop + 24, { width: 32, height: 32 });
+  } catch {
+    // Missing logo asset should never block a receipt from generating.
+  }
+  doc.fontSize(22).fillColor('#2e7d32').font('Helvetica-Bold').text('RentaPay', left + 74, cardTop + 24);
+  doc.fontSize(11).fillColor('#1a1a1a').font('Helvetica').text('Official Payment Receipt', left + 74, doc.y + 1);
+  doc.fontSize(9).fillColor('#888').text(`Receipt No. ${receiptNumber(payment.id)}`, left + 74, doc.y + 6);
+  doc.fontSize(9).fillColor('#888').text(`Generated ${generatedAt.toLocaleString('en-GB')}`, left + 74, doc.y);
   // Text positioned with explicit x/y (the PAID pill below) resets
   // doc.y to wherever THAT text sits - capture the header block's real
   // bottom now so the divider/section below isn't drawn using the
@@ -276,6 +282,7 @@ async function generatePaymentReceiptPdf(target, { payment, tenantName, unitName
     { width: contentWidth - 48 }
   );
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 
@@ -320,13 +327,11 @@ function generatePaymentHistoryPdf(res, { tenantName, unitName, propertyName, pa
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
   doc.pipe(res);
 
-  doc.fontSize(20).fillColor('#1a1a1a').text('RentaPay', { continued: true }).fillColor('#2e7d32').text(' — Payment History');
-  doc.moveDown(0.2);
-  doc.fontSize(11).fillColor('#555').text(`${tenantName}${unitName ? ` · ${unitName}` : ''}${propertyName ? ` · ${propertyName}` : ''}`);
-  doc.fontSize(9).fillColor('#888').text(`Generated ${generatedAt.toLocaleString('en-GB')}`);
-  doc.moveDown(1);
-  doc.strokeColor('#e0e0e0').moveTo(50, doc.y).lineTo(545, doc.y).stroke();
-  doc.moveDown(1);
+  drawBrandedHeader(doc, {
+    title: 'Payment History',
+    subtitle: `${tenantName}${unitName ? ` · ${unitName}` : ''}${propertyName ? ` · ${propertyName}` : ''}`,
+    meta: `Generated ${generatedAt.toLocaleString('en-GB')}`,
+  });
 
   const colX = { date: 50, amount: 180, method: 300, status: 430 };
   const headerY = doc.y;
@@ -362,6 +367,7 @@ function generatePaymentHistoryPdf(res, { tenantName, unitName, propertyName, pa
   const total = payments.filter((p) => p.status === 'completed').reduce((sum, p) => sum + Number(p.amount), 0);
   doc.font('Helvetica-Bold').fontSize(11).fillColor('#1a1a1a').text(`Total paid (completed): ${KES(total)}`, 50);
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 
@@ -377,13 +383,11 @@ function generateEarningsStatementPdf(res, { ba, claims, totals, periodLabel, ge
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
   doc.pipe(res);
 
-  doc.fontSize(20).fillColor('#1a1a1a').text('RentaPay', { continued: true }).fillColor('#2e7d32').text(' — Brand Ambassador Earnings Statement');
-  doc.moveDown(0.2);
-  doc.fontSize(11).fillColor('#555').text(`${ba.full_name}${ba.ba_code ? ` · ${ba.ba_code}` : ''}`);
-  doc.fontSize(9).fillColor('#888').text(`Period: ${periodLabel} · Generated ${generatedAt.toLocaleString('en-GB')}`);
-  doc.moveDown(1);
-  doc.strokeColor('#e0e0e0').moveTo(50, doc.y).lineTo(545, doc.y).stroke();
-  doc.moveDown(1);
+  drawBrandedHeader(doc, {
+    title: 'Brand Ambassador Earnings Statement',
+    subtitle: `${ba.full_name}${ba.ba_code ? ` · ${ba.ba_code}` : ''}`,
+    meta: `Period: ${periodLabel} · Generated ${generatedAt.toLocaleString('en-GB')}`,
+  });
 
   const colX = { landlord: 50, date: 230, base: 310, commission: 390, status: 470 };
   const headerY = doc.y;
@@ -443,6 +447,7 @@ function generateEarningsStatementPdf(res, { ba, claims, totals, periodLabel, ge
   doc.font('Helvetica').fontSize(10).fillColor('#333').text(`Already paid: ${KES(totals.paidTotal)}`, 50);
   doc.text(`Qualified, not yet paid: ${KES(totals.qualifiedNotYetPaidTotal)}`, 50);
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 
@@ -458,17 +463,30 @@ function generateBaRewardReportPdf(res, { batch, rewards, generatedAt }) {
   doc.pipe(res);
 
   // --- Branded header band ---------------------------------------
-  doc.rect(0, 0, doc.page.width, 90).fillColor('#0F3D3E').fill();
-  doc.fontSize(22).fillColor('#FFFFFF').text('RentaPay', 50, 26, { continued: true });
-  doc.fillColor('#C9A24B').text(' — Brand Ambassador Reward Report');
-  doc.fontSize(9).fillColor('#E8CE8B').text(
+  // Same layout rhythm as pdfBranding.service.js's shared header
+  // (wordmark, then title, then meta, stacked - not run together on
+  // one line) so a long title never wraps and collides with the meta
+  // line beneath it. Kept as its own dark-teal/gold banner rather than
+  // switching to the shared green one, since this report intentionally
+  // reads as a distinct "reward" document.
+  const bandHeight = 100;
+  doc.rect(0, 0, doc.page.width, bandHeight).fillColor('#0F3D3E').fill();
+  try {
+    doc.roundedRect(50, 26, 46, 46, 10).fillColor('#ffffff').fill();
+    doc.image(LOGO_PATH, 54, 30, { width: 38, height: 38 });
+  } catch {
+    // Missing logo asset should never block the report from generating.
+  }
+  doc.font('Helvetica-Bold').fontSize(20).fillColor('#FFFFFF').text('RentaPay', 108, 30, { width: doc.page.width - 158 });
+  doc.font('Helvetica').fontSize(11).fillColor('#C9A24B').text('Brand Ambassador Reward Report', 108, doc.y + 1, { width: doc.page.width - 158 });
+  doc.font('Helvetica').fontSize(8).fillColor('#E8CE8B').text(
     `Reward period ${new Date(batch.start_at).toLocaleDateString('en-GB')} – ${new Date(batch.end_at).toLocaleDateString('en-GB')}  ·  Generated ${generatedAt.toLocaleString('en-GB')}  ·  Report ID ${batch.id.slice(0, 8).toUpperCase()}`,
-    50,
-    58,
-    { width: doc.page.width - 100 }
+    108,
+    doc.y + 3,
+    { width: doc.page.width - 158 }
   );
 
-  doc.y = 115;
+  doc.y = bandHeight + 25;
   doc.fontSize(11).fillColor('#1a1a1a').text(
     `New commission rate: ${Number(batch.new_percentage)}% (default was ${Number(batch.default_percentage_at_time)}%)  ·  ${rewards.length} Brand Ambassador${rewards.length === 1 ? '' : 's'} rewarded`,
     50
@@ -510,10 +528,11 @@ function generateBaRewardReportPdf(res, { batch, rewards, generatedAt }) {
   doc.fontSize(8).fillColor('#aaa').text(
     'RentaPay · This report lists rewarded Brand Ambassadors only. Commission rates revert automatically to the default rate at the end of the reward period.',
     50,
-    doc.page.height - 60,
-    { width: 495, align: 'center' }
+    doc.y,
+    { width: 495 }
   );
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 

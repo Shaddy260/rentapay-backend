@@ -27,6 +27,7 @@ const { sendEmail, wrapEmailHtml } = require('../services/email.service');
 const templates = require('../services/notificationTemplates');
 const { getActiveDiscountRecordForLandlord, consumeLoyaltyDiscount } = require('../services/landlordLoyalty.service');
 const { calculateSubscriptionCost } = require('../utils/pricing');
+const { createCoveragePeriod, computeRenewalStartDate } = require('../services/coveragePeriod.service');
 const { PLATFORM_PAYBILL_NUMBER, PLATFORM_PAYBILL_ACCOUNT_NUMBER } = require('../constants/platformPaybill');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
@@ -338,7 +339,6 @@ async function confirmManualSubscriptionPayment(req, res) {
       // Daraja auto-confirm path (verifies the account directly and
       // flips status to active - no OTP involved).
       await supabase.from('landlords').update({ unit_limit: record.units_count }).eq('id', landlord.id);
-      await activateLandlordAfterPayment(landlord.id, record.period_months);
 
       // FIX (direct request: "the system doesn't seem to be picking up
       // the data automatically... resolve that, to match percentage of
@@ -350,9 +350,13 @@ async function confirmManualSubscriptionPayment(req, res) {
       // path in payment.controller.js. Mirrors that path exactly now:
       // insert the subscription_payments row this manual flow never
       // created (needed since ba_commission_earnings.subscription_payment_id
-      // is a foreign key into that table), qualify the BA immediately
-      // (no unit-count requirement, no waiting on the nightly cron),
-      // then record a ONE-TIME commission against this first payment.
+      // is a foreign key into that table, and now also so Phase 13's
+      // coverage period below has a real payment to point back to),
+      // qualify the BA immediately (no unit-count requirement, no
+      // waiting on the nightly cron), then record a ONE-TIME
+      // commission against this first payment. Moved ABOVE
+      // activateLandlordAfterPayment (was below it before) so that
+      // call can pass this row's id straight through.
       const plan = record.units_count <= 10 ? 'starter' : record.units_count <= 50 ? 'standard' : 'premium';
       const paidAtIso = new Date().toISOString();
       const { data: subPaymentRow, error: subPaymentErr } = await supabase
@@ -374,6 +378,8 @@ async function confirmManualSubscriptionPayment(req, res) {
         logger.error(`[landlordManualSubscriptionPayment] Failed to record subscription_payments row for manual payment ${record.id}:`, subPaymentErr.message);
         captureException(subPaymentErr);
       }
+
+      await activateLandlordAfterPayment(landlord.id, record.period_months, record.units_count, record.amount_paid, subPaymentRow?.id);
 
       if (landlord.ba_id && landlord.ba_qualification_status === 'pending') {
         const qualifiedAt = new Date().toISOString();
@@ -409,6 +415,10 @@ async function confirmManualSubscriptionPayment(req, res) {
       let currentExpiry = landlord.subscription_expires_at ? new Date(landlord.subscription_expires_at) : new Date();
       if (currentExpiry < new Date()) currentExpiry = new Date();
       currentExpiry.setMonth(currentExpiry.getMonth() + record.period_months);
+      // Phase 13 - true MRR: mirrors the same early-vs-standard-renewal
+      // logic as the Daraja path (payment.controller.js) - captured
+      // BEFORE the update() below overwrites subscription_expires_at.
+      const coverageStart = computeRenewalStartDate(landlord.subscription_expires_at);
       await supabase
         .from('landlords')
         .update({
@@ -419,6 +429,16 @@ async function confirmManualSubscriptionPayment(req, res) {
           subscription_started_at: new Date().toISOString(),
         })
         .eq('id', landlord.id);
+      await createCoveragePeriod({
+        landlordId: landlord.id,
+        kind: 'renewal',
+        startDate: coverageStart,
+        endDate: currentExpiry,
+        unitsCovered: record.units_count,
+        amountPaid: record.amount_paid,
+        periodMonths: record.period_months,
+        manualSubscriptionPaymentId: record.id,
+      });
       await applyUnitLimitChange({ landlordId: landlord.id, newLimit: record.units_count, actorType: 'admin', actorId: req.user.id });
       if (landlord.email) {
         await sendEmail(

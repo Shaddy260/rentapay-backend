@@ -1,7 +1,7 @@
 // src/routes/baPayoutLinkCycle.routes.js
 //
 // Mounted at /api/brand-ambassadors in server.js. BUILD SPEC PHASE 10
-// - Fix: BA Payout Submission Overwrite Bug.
+// (v2) - Universal BA Payout Links + Email/OTP Gate.
 const express = require('express');
 const { verifyToken, requireRole } = require('../middleware/auth.middleware');
 const ctrl = require('../controllers/baPayoutLinkCycle.controller');
@@ -11,17 +11,21 @@ const completedCtrl = require('../controllers/baCompletedPayouts.controller');
 
 const router = express.Router();
 
-// PUBLIC - the one-time submission page validates its ?token= on
-// load. Kept for informational period bookkeeping only - see the
-// controller; BA-level submission gating now happens in
-// baPayoutSubmissionLink.service, not here.
-router.get('/payout-link/validate', ctrl.validatePayoutLinkToken);
-
-// PUBLIC - the ONE-TIME submission (no resubmission UI anywhere), the
-// "look my on-file submission back up" endpoint, and the ONLY
-// correction path (a distinct, admin-issued, 24h edit link).
+// PUBLIC - the one-time, universal, non-expiring submission link at
+// /ba-payout-submit. Gated by email + OTP, never by a token in the URL.
+router.post('/payout-link/submit/request-otp', submissionCtrl.requestSubmitOtp);
+router.post('/payout-link/submit/verify-otp', submissionCtrl.verifySubmitOtp);
 router.post('/payout-link/submit', submissionCtrl.submitPayoutLinkDetails);
-router.post('/payout-link/edit-submit', submissionCtrl.editPayoutLinkDetails);
+
+// PUBLIC - the universal, admin-issued, 24h-rotating correction link
+// at /ba-payout-edit?token=..., also gated by email + OTP.
+router.get('/payout-link/edit/validate', submissionCtrl.validateEditLink);
+router.post('/payout-link/edit/request-otp', submissionCtrl.requestEditOtp);
+router.post('/payout-link/edit/verify-otp', submissionCtrl.verifyEditOtp);
+router.post('/payout-link/edit', submissionCtrl.editPayoutLinkDetails);
+
+// PUBLIC - re-open the confirmation/prefill view, scoped to a verified
+// verificationToken (never a bare email/id lookup).
 router.get('/payout-link/my-submission', submissionCtrl.getMyPayoutLinkSubmission);
 
 // ADMIN - current period bookkeeping (informational only - earnings
@@ -41,8 +45,9 @@ router.get('/payout-link/completed', verifyToken, requireRole('admin'), complete
 // ADMIN - Payment history tab: the full, append-only, all-time log.
 router.get('/payout-link/history', verifyToken, requireRole('admin'), completedCtrl.getPaymentHistory);
 
-// ADMIN - generate a 24h edit link for a BA who has already submitted
-// once. This is the only route back into their details.
-router.post('/:id/payout-link/generate-edit-link', verifyToken, requireRole('admin'), submissionCtrl.postGenerateEditLink);
+// ADMIN - manage the universal 24h correction link. The only route
+// back into any BA's on-file details after their one-time submission.
+router.get('/payout-link/edit-link/status', verifyToken, requireRole('admin'), submissionCtrl.getEditLinkStatusHandler);
+router.post('/payout-link/edit-link/generate', verifyToken, requireRole('admin'), submissionCtrl.postGenerateEditLink);
 
 module.exports = router;

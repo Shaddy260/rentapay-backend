@@ -8,16 +8,16 @@
 //     rate is applied or implied; see the note in the controller.
 
 const PDFDocument = require('pdfkit');
+const { drawBrandedHeader, drawBrandedFooter } = require('./pdfBranding.service');
 
 const KES = (n) => `KES ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 0 })}`;
 
 function drawHeader(doc, { title, subtitle, landlordName, generatedAt }) {
-  doc.fontSize(20).fillColor('#1a1a1a').text('RentaPay', { continued: true }).fillColor('#2e7d32').text(` — ${title}`);
-  if (subtitle) {
-    doc.moveDown(0.2);
-    doc.fontSize(11).fillColor('#555').text(subtitle);
-  }
-  doc.fontSize(9).fillColor('#888').text(`Prepared for ${landlordName} · Generated ${generatedAt.toLocaleString('en-GB')}`);
+  drawBrandedHeader(doc, {
+    title,
+    subtitle,
+    meta: `Prepared for ${landlordName} · Generated ${generatedAt.toLocaleString('en-GB')}`,
+  });
   doc.moveDown(1);
   doc.strokeColor('#e0e0e0').moveTo(50, doc.y).lineTo(545, doc.y).stroke();
   doc.moveDown(1);
@@ -101,6 +101,7 @@ function generateAnnualPortfolioPdf(res, { landlordName, generatedAt, report }) 
   doc.moveDown(1);
   doc.fontSize(8).fillColor('#aaa').text('Generated automatically by RentaPay. Figures reflect completed rent payments and logged expenses only.', 50, doc.y, { width: 495 });
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 
@@ -181,6 +182,7 @@ function generateTaxSummaryPdf(res, { landlordName, kraPin, generatedAt, report 
   doc.moveDown(1);
   doc.fontSize(8).fillColor('#aaa').text('Generated automatically by RentaPay from records of completed rent payments and logged expenses. Verify against your own records before filing.', 50, doc.y, { width: 495 });
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 

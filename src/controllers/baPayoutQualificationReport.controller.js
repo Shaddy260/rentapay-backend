@@ -4,6 +4,7 @@ const {
   generateSingleBaPayoutQualificationPdf,
   generateCombinedPayoutQualificationPdf,
 } = require('../services/baPayoutQualificationReportPdf.service');
+const { brandCsv, brandedFilename } = require('../services/csvBranding.service');
 const logger = require('../utils/logger');
 const { captureException } = require('../services/sentry.service');
 
@@ -64,9 +65,13 @@ async function downloadCsv(req, res) {
     const reportId = req.params.id.replace(/\.csv$/, '');
     const report = await service.getReportById(reportId);
     if (!report) return res.status(404).json({ error: 'Report not found.' });
-    const csv = service.reportToCsv(report);
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="ba-payout-qualification-report-${report.periodKey}.csv"`);
+    const csv = brandCsv({
+      title: 'BA Payout Qualification Report',
+      meta: [`Period: ${report.periodKey}`],
+      body: service.reportToCsv(report),
+    });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${brandedFilename('ba-payout-qualification-report', report.periodKey, 'csv')}"`);
     res.send(csv);
   } catch (err) {
     logger.error('[baPayoutQualificationReport] downloadCsv failed', err);
@@ -84,7 +89,7 @@ async function downloadCombinedPdf(req, res) {
     const report = await service.getReportById(req.params.id);
     if (!report) return res.status(404).json({ error: 'Report not found.' });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="ba-payout-qualification-report-${report.periodKey}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${brandedFilename('ba-payout-qualification-report', report.periodKey, 'pdf')}"`);
     generateCombinedPayoutQualificationPdf(res, report);
   } catch (err) {
     logger.error('[baPayoutQualificationReport] downloadCombinedPdf failed', err);
@@ -101,7 +106,7 @@ async function downloadBaPdf(req, res) {
     const report = await service.getReportById(req.params.id);
     if (!report) return res.status(404).json({ error: 'Report not found.' });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="ba-payout-qualification-${req.params.baId}-${report.periodKey}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${brandedFilename('ba-payout-qualification', req.params.baId, report.periodKey, 'pdf')}"`);
     generateSingleBaPayoutQualificationPdf(res, report, req.params.baId);
   } catch (err) {
     logger.error('[baPayoutQualificationReport] downloadBaPdf failed', err);

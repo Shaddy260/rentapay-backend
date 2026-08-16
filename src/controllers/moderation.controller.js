@@ -11,6 +11,7 @@ const supabase = require('../config/supabase');
 const { notify } = require('../services/notify.service');
 const { logActivity } = require('../services/activityLog.service');
 const { captureException } = require('../services/sentry.service');
+const { isGmAction } = require('../utils/actionConfirmation');
 const logger = require('../utils/logger');
 
 const ACCOUNT_TABLES = {
@@ -123,7 +124,18 @@ async function warnAccount(req, res) {
       { category: 'account', title: 'Account warning' }
     ).catch((notifyErr) => logger.error('[moderation] warnAccount notify failed:', notifyErr.message));
 
-    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'account_warned', targetType: accountType, targetId: accountId, reason, ipAddress: req.ip });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: isGmAction(req) ? req.user.id : 'super-admin',
+      action: 'account_warned',
+      targetType: accountType,
+      targetId: accountId,
+      reason,
+      metadata: isGmAction(req)
+        ? { confirmedReason: req.pinConfirmedReason, affectedPersonLabel: accountLabel(accountType, found.account), before: { warning_count: found.account.warning_count || 0 }, after: { warning_count: newCount } }
+        : undefined,
+      ipAddress: req.ip,
+    });
 
     return res.json({ message: 'Warning sent.', warningCount: newCount });
   } catch (err) {
@@ -141,6 +153,8 @@ async function suspendAccountPermanently(req, res) {
     const found = await loadAccount(accountType, accountId);
     if (!found) return res.status(404).json({ error: 'Account not found.' });
 
+    const before = { suspended_permanently: found.account.suspended_permanently, suspended_until: found.account.suspended_until, suspension_reason: found.account.suspension_reason };
+
     const { error } = await supabase
       .from(found.table)
       .update({ suspended_permanently: true, suspended_until: null, suspension_reason: reason || null })
@@ -150,7 +164,18 @@ async function suspendAccountPermanently(req, res) {
     await logModerationAction(accountType, accountId, 'suspended_permanent', reason);
     if (reportId) await supabase.from('community_reports').update({ status: 'suspended', reviewed_at: new Date().toISOString() }).eq('id', reportId);
 
-    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'account_suspended_permanent', targetType: accountType, targetId: accountId, reason, ipAddress: req.ip });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: isGmAction(req) ? req.user.id : 'super-admin',
+      action: 'account_suspended_permanent',
+      targetType: accountType,
+      targetId: accountId,
+      reason,
+      metadata: isGmAction(req)
+        ? { confirmedReason: req.pinConfirmedReason, affectedPersonLabel: accountLabel(accountType, found.account), before, after: { suspended_permanently: true, suspended_until: null, suspension_reason: reason || null } }
+        : undefined,
+      ipAddress: req.ip,
+    });
 
     return res.json({ message: 'Account suspended indefinitely.' });
   } catch (err) {
@@ -171,6 +196,8 @@ async function suspendAccountTemporarily(req, res) {
     const found = await loadAccount(accountType, accountId);
     if (!found) return res.status(404).json({ error: 'Account not found.' });
 
+    const before = { suspended_permanently: found.account.suspended_permanently, suspended_until: found.account.suspended_until, suspension_reason: found.account.suspension_reason };
+
     const suspendedUntil = new Date();
     suspendedUntil.setDate(suspendedUntil.getDate() + numDays);
 
@@ -183,7 +210,18 @@ async function suspendAccountTemporarily(req, res) {
     await logModerationAction(accountType, accountId, 'suspended_temporary', reason, suspendedUntil.toISOString());
     if (reportId) await supabase.from('community_reports').update({ status: 'suspended', reviewed_at: new Date().toISOString() }).eq('id', reportId);
 
-    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'account_suspended_temporary', targetType: accountType, targetId: accountId, reason, metadata: { days: numDays }, ipAddress: req.ip });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: isGmAction(req) ? req.user.id : 'super-admin',
+      action: 'account_suspended_temporary',
+      targetType: accountType,
+      targetId: accountId,
+      reason,
+      metadata: isGmAction(req)
+        ? { days: numDays, confirmedReason: req.pinConfirmedReason, affectedPersonLabel: accountLabel(accountType, found.account), before, after: { suspended_permanently: false, suspended_until: suspendedUntil.toISOString(), suspension_reason: reason || null } }
+        : { days: numDays },
+      ipAddress: req.ip,
+    });
 
     return res.json({ message: `Account suspended for ${numDays} day(s), until ${suspendedUntil.toLocaleString()}.`, suspendedUntil: suspendedUntil.toISOString() });
   } catch (err) {
@@ -200,6 +238,8 @@ async function unsuspendAccount(req, res) {
     const found = await loadAccount(accountType, accountId);
     if (!found) return res.status(404).json({ error: 'Account not found.' });
 
+    const before = { suspended_permanently: found.account.suspended_permanently, suspended_until: found.account.suspended_until, suspension_reason: found.account.suspension_reason };
+
     const { error } = await supabase
       .from(found.table)
       .update({ suspended_permanently: false, suspended_until: null, suspension_reason: null })
@@ -207,7 +247,17 @@ async function unsuspendAccount(req, res) {
     if (error) throw error;
 
     await logModerationAction(accountType, accountId, 'unsuspended', null);
-    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'account_unsuspended', targetType: accountType, targetId: accountId, ipAddress: req.ip });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: isGmAction(req) ? req.user.id : 'super-admin',
+      action: 'account_unsuspended',
+      targetType: accountType,
+      targetId: accountId,
+      metadata: isGmAction(req)
+        ? { reason: req.pinConfirmedReason, affectedPersonLabel: accountLabel(accountType, found.account), before, after: { suspended_permanently: false, suspended_until: null, suspension_reason: null } }
+        : undefined,
+      ipAddress: req.ip,
+    });
 
     return res.json({ message: 'Suspension lifted.' });
   } catch (err) {

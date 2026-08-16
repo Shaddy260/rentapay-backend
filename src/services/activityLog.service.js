@@ -33,6 +33,20 @@ function safeActorId(id) {
  * @param {string} [params.ipAddress]
  * @param {object} [params.metadata]
  */
+// SECTION 7 (General Manager spec) — lazily required to avoid a
+// require() cycle (generalManagerActivityLog.service.js doesn't
+// import this file, but several controllers require both, and Node's
+// module cache makes a top-level circular require risky to reason
+// about here) - this file is the one place every GM-attributed action
+// already flows through, so it's the correct single hook point for
+// "automatic ... no manual step required" logging, rather than adding
+// a second call at every one of the ~8 existing (and any future)
+// logActivity({ actorType: 'general_manager', ... }) call sites.
+function gmActivityLogService() {
+  // eslint-disable-next-line global-require
+  return require('./generalManagerActivityLog.service');
+}
+
 async function logActivity({ actorType, actorId = null, action, targetType, targetId, reason, ipAddress, metadata = {} }) {
   // PERFORMANCE FIX (direct request: "it takes too long to load/
   // navigate in the portals"): logActivity() writes an audit row and
@@ -62,6 +76,39 @@ async function logActivity({ actorType, actorId = null, action, targetType, targ
     // Logging must never crash the main request flow - just log to console.
     logger.error('[activityLog] Failed to write activity log:', err.message);
     captureException(err);
+  }
+
+  // SECTION 7 — every PIN-confirmed General Manager action already
+  // arrives here with actorType: 'general_manager' (see
+  // actionConfirmation.js / isGmAction() call sites across the
+  // controllers). Fire the richer, GM-specific log + admin
+  // notification automatically, right alongside the generic
+  // activity_logs row above - no extra call needed at the controller.
+  // Not awaited, for the same reason the write above isn't always
+  // awaited by its callers: this must never add latency to, or be
+  // able to fail, the action that actually mattered.
+  if (actorType === 'general_manager' && actorId) {
+    const m = metadata || {};
+    gmActivityLogService()
+      .logGmActivity({
+        generalManagerId: actorId,
+        action,
+        dataType: m.dataType,
+        affectedRole: m.affectedRole || targetType,
+        affectedPersonId: targetId,
+        affectedPersonLabel: m.affectedPersonLabel,
+        initialData: m.before ?? m.initialData,
+        correctedData: m.after ?? m.correctedData,
+        reason: reason || m.reason || m.confirmedReason,
+        context: Object.fromEntries(
+          Object.entries(m).filter(([k]) => !['dataType', 'affectedRole', 'affectedPersonLabel', 'before', 'after', 'initialData', 'correctedData', 'reason', 'confirmedReason'].includes(k))
+        ),
+        ipAddress,
+      })
+      .catch((err) => {
+        logger.error('[activityLog] gmActivityLog hook failed:', err.message);
+        captureException(err);
+      });
   }
 }
 

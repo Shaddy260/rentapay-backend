@@ -7,6 +7,7 @@ const service = require('../services/baRewards.service');
 const { generateBaRewardReportPdf } = require('../services/pdfReport.service');
 const logger = require('../utils/logger');
 const { captureException } = require('../services/sentry.service');
+const { brandedFilename } = require('../services/csvBranding.service');
 
 // GET /api/brand-ambassadors/rewards/leaderboard
 async function getLeaderboard(req, res) {
@@ -80,7 +81,7 @@ async function downloadRewardPdf(req, res) {
     const result = await service.getRewardBatch(req.params.batchId);
     if (!result) return res.status(404).json({ error: 'Reward batch not found.' });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="ba-reward-report-${result.batch.id.slice(0, 8)}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${brandedFilename('ba-reward-report', result.batch.id.slice(0, 8), 'pdf')}"`);
     generateBaRewardReportPdf(res, { batch: result.batch, rewards: result.rewards, generatedAt: new Date() });
   } catch (err) {
     logger.error('[baRewards] downloadRewardPdf failed', err);

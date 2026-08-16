@@ -69,6 +69,7 @@ const { captureException } = require('../services/sentry.service');
 const { normalizePhoneOrThrow } = require('../utils/phone');
 const { generateEarningsStatementPdf } = require('../services/pdfReport.service');
 const { notify } = require('../services/notify.service');
+const { brandCsv, brandedFilename } = require('../services/csvBranding.service');
 const logger = require('../utils/logger');
 
 const ADMIN_ACTOR_ID = 'super-admin';
@@ -441,10 +442,11 @@ async function downloadBaPayoutStatement(req, res) {
     lines.push(`Commission Total,,,${commissionTotal.toFixed(2)}`);
     lines.push(`Grand Total,,,,${commissionTotal.toFixed(2)}`);
 
-    const filename = `statement-${ba.ba_code || ba.id}-${periodKey}.csv`;
-    res.setHeader('Content-Type', 'text/csv');
+    const filename = brandedFilename('statement', ba.ba_code || ba.id, periodKey, 'csv');
+    const csv = brandCsv({ title: 'BA Payout Statement', meta: [`Period: ${periodKey}`], body: lines });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    return res.send(lines.join('\n'));
+    return res.send(csv);
   } catch (err) {
     logger.error('[baAdminPayout] downloadBaPayoutStatement error:', err.message);
     captureException(err);
@@ -633,16 +635,21 @@ async function downloadBaEarningsStatement(req, res, format) {
     const statement = await fetchEarningsStatementData(baId, range);
     if (!statement) return res.status(404).json({ error: 'Brand Ambassador not found.' });
 
-    const filenameBase = `statement-${statement.ba.ba_code || statement.ba.id}-${range.label}`;
+    const filenameBase = brandedFilename('statement', statement.ba.ba_code || statement.ba.id, range.label, format);
 
     if (format === 'csv') {
-      res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}.csv"`);
-      return res.send(buildEarningsStatementCsv(statement.ba, statement.claims, statement.totals, range.label));
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}"`);
+      const csv = brandCsv({
+        title: 'BA Earnings Statement',
+        meta: [`Period: ${range.label}`],
+        body: buildEarningsStatementCsv(statement.ba, statement.claims, statement.totals, range.label),
+      });
+      return res.send(csv);
     }
 
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${filenameBase}"`);
     generateEarningsStatementPdf(res, {
       ba: statement.ba,
       claims: statement.claims,

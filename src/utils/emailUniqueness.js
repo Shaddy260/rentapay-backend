@@ -28,7 +28,7 @@ async function findEmailConflict(email, forRole) {
   const normalized = String(email || '').trim().toLowerCase();
   if (!normalized) return null;
 
-  const [{ data: landlord }, { data: activeManager }, { data: activeTenant }, { data: activeBa }] = await Promise.all([
+  const [{ data: landlord }, { data: activeManager }, { data: activeTenant }, { data: activeBa }, { data: activeGeneralManager }] = await Promise.all([
     supabase.from('landlords').select('id').ilike('email', normalized).maybeSingle(),
     // ARCHIVE FIX: same reasoning as phoneUniqueness.js - without
     // is_active here, an archived manager/caretaker's email blocked
@@ -40,6 +40,9 @@ async function findEmailConflict(email, forRole) {
     // every role, excluding 'rejected' BA rows - mirrors the partial
     // unique index on brand_ambassadors(lower(email)) WHERE status <> 'rejected'.
     supabase.from('brand_ambassadors').select('id, status').ilike('email', normalized).neq('status', 'rejected').maybeSingle(),
+    // General Manager accounts (admin-provisioned only - see
+    // 2026-08-general-manager-role.sql).
+    supabase.from('general_managers').select('id').ilike('email', normalized).maybeSingle(),
   ]);
 
   // PRIVACY FIX: see phoneUniqueness.js - when forRole is

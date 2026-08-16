@@ -1,38 +1,29 @@
 // src/controllers/baPayoutLinkCycle.controller.js
 //
-// BA Monthly Payment Details & Payout Workflow - Phase 1.
+// BA Monthly Payment Details & Payout Workflow.
 //
-// Two endpoints only in this phase:
-//   ADMIN  GET /api/brand-ambassadors/payout-link/current   - current
-//          month's cycle status + the public submission link, so the
-//          admin portal can show/copy/share it. Creates the cycle
-//          lazily on first call of a new month (see the cycle service).
-//   PUBLIC GET /api/brand-ambassadors/payout-link/validate  - the
-//          Phase 2 submission page calls this on load with ?token= to
-//          confirm the link is still good before rendering the form.
+// ADMIN GET /api/brand-ambassadors/payout-link/current - current
+// month's cycle status, used purely to group ba_commission_earnings by
+// calendar period for the Pending/Completed/History views. Creates the
+// cycle lazily on first call of a new month (see the cycle service).
 //
-// The actual submission form (Phase 2) and admin Pending/Completed
-// views (Phase 3/4) are separate, later phases - this controller only
-// covers cycle lifecycle + link validation.
+// BUILD SPEC PHASE 10 (v2): link validation for the universal
+// submission link (no token to validate - it's a static URL) and the
+// universal 24h edit link now live in baPaymentSubmission.controller.js
+// alongside the rest of that flow.
 
 const { getOrCreateCurrentCycle } = require('../services/baPayoutLinkCycle.service');
-const { validateSubmissionAttempt, validateEditLink } = require('../services/baPayoutSubmissionLink.service');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
 
 // ---------------------------------------------------------------------
-// ADMIN - current cycle status: period_key, status, and the public
-// link to share. Always returns a cycle (creates it if this is the
-// first time anyone's looked this month).
+// ADMIN - current cycle status: period_key, status. Always returns a
+// cycle (creates it if this is the first time anyone's looked this
+// month).
 // ---------------------------------------------------------------------
 async function getCurrentCycleStatus(req, res) {
   try {
     const cycle = await getOrCreateCurrentCycle(req.user?.id || null);
-    // BUILD SPEC PHASE 10: there is no shared per-cycle submission
-    // link anymore - each BA gets their own one-time submission link,
-    // issued once at approval (see approveBaApplication). This
-    // endpoint now only reports the current calendar period used to
-    // group commission earnings for the Pending/Completed views.
     return res.json({
       cycle: {
         id: cycle.id,
@@ -48,35 +39,6 @@ async function getCurrentCycleStatus(req, res) {
   }
 }
 
-// ---------------------------------------------------------------------
-// PUBLIC - validate a ?token= (one-time submission link) or ?edit=
-// (24h admin-issued correction link) before the form renders. A
-// duplicate-attempt on an already-used submission token is reported
-// clearly rather than silently rendering a form that would only fail
-// at submit time.
-// ---------------------------------------------------------------------
-async function validatePayoutLinkToken(req, res) {
-  try {
-    const { token, edit } = req.query;
-    if (edit) {
-      const result = await validateEditLink(edit);
-      if (!result.ok) return res.status(410).json({ valid: false, error: result.error });
-      return res.json({ valid: true, mode: 'edit', baName: result.ba.full_name });
-    }
-
-    const result = await validateSubmissionAttempt(token);
-    if (!result.ok) {
-      return res.status(410).json({ valid: false, error: result.error, duplicateSubmission: !!result.duplicate });
-    }
-    return res.json({ valid: true, mode: 'submit', baName: result.ba.full_name });
-  } catch (err) {
-    logger.error('[baPayoutLinkCycle] validatePayoutLinkToken error:', err.message);
-    captureException(err);
-    return res.status(500).json({ valid: false, error: 'Failed to validate the payment details link.' });
-  }
-}
-
 module.exports = {
   getCurrentCycleStatus,
-  validatePayoutLinkToken,
 };

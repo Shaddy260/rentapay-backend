@@ -1722,6 +1722,133 @@ async function updateDepositSettings(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// BULK DEPOSIT SETTINGS (direct request: "Landlord Bulk Deposit
+// Assignment" - deposits were only settable one unit at a time by
+// opening each unit individually. Same shape/reasoning as
+// bulkUpdateDueDate/bulkUpdateRent above: a scope selector lets the
+// caller apply one deposit rule to either their entire portfolio in
+// one go ("all units") or a hand-picked set of units ("selected
+// units"), instead of repeating the single-unit PATCH per unit.
+//
+// Scope is deliberately landlord-portfolio-wide for "all" (not just
+// one property) per the spec ("across the landlord's entire
+// portfolio in one go") - optionally narrowed to one property via
+// propertyId, same as bulkUpdateDueDate supports. "selected" takes
+// an explicit unitIds array (multi-select) and is NOT restricted to
+// a single property, so a landlord can pick units spanning several
+// properties in one action.
+// ---------------------------------------------------------------------
+async function bulkUpdateDepositSettings(req, res) {
+  try {
+    const { scope, propertyId, unitIds, requiresDeposit, depositAmountExpected } = req.body;
+
+    if (!['all', 'selected'].includes(scope)) {
+      return res.status(400).json({ error: "scope must be 'all' or 'selected'." });
+    }
+    if (typeof requiresDeposit !== 'boolean') {
+      return res.status(400).json({ error: 'requiresDeposit must be true or false.' });
+    }
+    if (depositAmountExpected !== undefined && depositAmountExpected !== null) {
+      const amt = Number(depositAmountExpected);
+      if (!Number.isFinite(amt) || amt < 0) return res.status(400).json({ error: 'depositAmountExpected must be a positive number.' });
+    }
+    if (scope === 'selected' && (!Array.isArray(unitIds) || unitIds.length === 0)) {
+      return res.status(400).json({ error: 'unitIds is required when scope is "selected".' });
+    }
+
+    const landlordId = effectiveLandlordId(req);
+    const isManager = req.user.role === 'manager';
+    const assignedPropertyIds = isManager ? await getManagerAssignedPropertyIds(req.user.id) : [];
+    if (propertyId && isManager && !assignedPropertyIds.includes(propertyId)) {
+      return res.status(403).json({ error: 'You do not manage this property.' });
+    }
+
+    let unitsQuery = supabase.from('units').select('id, unit_name, property_id, requires_deposit, deposit_amount_expected').eq('landlord_id', landlordId);
+    if (scope === 'selected') {
+      unitsQuery = unitsQuery.in('id', unitIds);
+    } else if (propertyId) {
+      unitsQuery = unitsQuery.eq('property_id', propertyId);
+    } else if (isManager) {
+      if (assignedPropertyIds.length === 0) return res.json({ message: 'No units to update.', updated: 0, skipped: 0 });
+      unitsQuery = unitsQuery.in('property_id', assignedPropertyIds);
+    }
+    const { data: units, error: unitsErr } = await unitsQuery;
+    if (unitsErr) throw unitsErr;
+    if (!units || units.length === 0) {
+      return res.json({ message: 'No units to update.', updated: 0, skipped: 0 });
+    }
+    if (scope === 'selected') {
+      // Every requested id must actually belong to this landlord (and,
+      // for a manager, to a property they're assigned to) - otherwise a
+      // caller could smuggle in a unit that isn't theirs by id.
+      const foundIds = new Set(units.map((u) => u.id));
+      const missing = unitIds.filter((id) => !foundIds.has(id));
+      if (missing.length > 0) {
+        return res.status(400).json({ error: 'One or more selected units were not found in your portfolio.' });
+      }
+      if (isManager) {
+        const disallowed = units.some((u) => !assignedPropertyIds.includes(u.property_id));
+        if (disallowed) return res.status(403).json({ error: 'You do not manage one or more of the selected units.' });
+      }
+    }
+
+    const resolvedAmount = requiresDeposit ? (depositAmountExpected ?? null) : null;
+    let updated = 0;
+    let skipped = 0;
+    // Units already matching the target setting are skipped rather
+    // than re-written, same "no-op units don't count as updated"
+    // behavior as bulkUpdateDueDate.
+    const unitsToUpdate = units.filter((u) => {
+      const alreadySet = !!u.requires_deposit === !!requiresDeposit
+        && (!requiresDeposit || Number(u.deposit_amount_expected ?? null) === Number(resolvedAmount ?? null) || (u.deposit_amount_expected == null && resolvedAmount == null));
+      if (alreadySet) { skipped += 1; return false; }
+      return true;
+    });
+
+    await runInBatches(
+      unitsToUpdate,
+      async (unit) => {
+        const { error: updateError } = await supabase
+          .from('units')
+          .update({ requires_deposit: requiresDeposit, deposit_amount_expected: resolvedAmount })
+          .eq('id', unit.id);
+        if (updateError) throw updateError;
+        updated += 1;
+      },
+      {
+        concurrency: 15,
+        onError: (err, unit) => {
+          logger.error(`[unit] bulkUpdateDepositSettings: failed for unit ${unit.id}:`, err.message);
+          captureException(err);
+          skipped += 1;
+        },
+      }
+    );
+
+    logActivity({
+      actorType: req.user.role,
+      actorId: req.user.id,
+      action: 'bulk_deposit_setting_changed',
+      targetType: scope === 'selected' ? 'unit' : 'property',
+      targetId: scope === 'selected' ? null : (propertyId || null),
+      metadata: { scope, updated, skipped, requiresDeposit, depositAmountExpected: resolvedAmount, unitIds: scope === 'selected' ? unitIds : undefined },
+    });
+
+    return res.json({
+      message: requiresDeposit
+        ? `Deposit requirement set for ${updated} unit${updated === 1 ? '' : 's'}${skipped ? ` (${skipped} already matched or skipped)` : ''}.`
+        : `Deposit requirement cleared for ${updated} unit${updated === 1 ? '' : 's'}${skipped ? ` (${skipped} already matched or skipped)` : ''}.`,
+      updated,
+      skipped,
+    });
+  } catch (err) {
+    logger.error('[unit] bulkUpdateDepositSettings error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to bulk update deposit settings.' });
+  }
+}
+
 module.exports = {
   createUnit,
   bulkCreateUnits,
@@ -1742,4 +1869,5 @@ module.exports = {
   updateListingStatus,
   updateListingDescription,
   updateDepositSettings,
+  bulkUpdateDepositSettings,
 };

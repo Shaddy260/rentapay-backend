@@ -152,6 +152,29 @@ const templates = {
   managerRemoved: (managerName) =>
     `Hi ${managerName}, your property manager access on RentaPay has been removed.`,
 
+  // --- General Manager onboarding (Section 2 of the General Manager
+  // Accounts spec) --- No login link included yet: the dedicated
+  // rentapay.co.ke/manager-account entry point is built in Section 3
+  // of the same spec. Admin shares that URL separately once it
+  // exists; this email only ever needs to carry the temp password.
+  generalManagerLoginCredentials: (managerName, tempPassword) =>
+    `Welcome ${managerName}! An admin has created a General Manager account for you on RentaPay. ` +
+    `Temp password: ${tempPassword}. ` +
+    `You'll be asked to set a permanent password and an Operations PIN the first time you log in. ` +
+    `Your admin will share your login link with you separately.`,
+
+  // --- Section 4: Operations PIN forgot/reset ---
+  // Deliberately worded to never say "password" - this resets the
+  // Operations PIN specifically, a distinct credential from the login
+  // password (Section 3), and confusing the two in an email a General
+  // Manager might skim is exactly the kind of thing that causes a
+  // support ticket.
+  operationsPinResetOtpMessage: (otpCode) =>
+    `Your RentaPay Operations PIN reset code is ${otpCode}. It expires in 5 minutes. This does not change your login password. Do not share this code.`,
+
+  operationsPinChanged: (managerName) =>
+    `Hi ${managerName}, your RentaPay Operations PIN was just changed. If this wasn't you, contact RentaPay support immediately.`,
+
   // --- Portfolio health digest (direct request #5) ---
   // Returns { subject, body } - body is plain text/newlines. Used to
   // be wrapped into HTML by wrapEmailHtml() for an email; per

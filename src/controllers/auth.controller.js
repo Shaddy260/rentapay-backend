@@ -24,6 +24,7 @@ const { postSystemAnnouncement, getActorDisplay } = require('./announcement.cont
 const { convertMatchingLeadForPhone } = require('./landlordLead.controller');
 const { KENYA_COUNTIES } = require('../constants/kenyaCounties');
 const { KENYA_CONSTITUENCIES } = require('../constants/kenyaConstituencies');
+const { createCoveragePeriod } = require('../services/coveragePeriod.service');
 const { OAuth2Client } = require('google-auth-library');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
@@ -56,6 +57,14 @@ function accountTable(accountType) {
   // ambassador') routes call accountTable(req.user.role) directly with
   // an already-authenticated role, so it still needs a mapping here.
   if (accountType === 'brand_ambassador') return { table: 'brand_ambassadors', phoneField: 'phone' };
+  // SECTION 3 (General Manager dedicated login): general_managers has
+  // the same password_hash/must_change_password/is_active shape as
+  // property_managers, so it slots straight into the generic
+  // accountTable()-driven helpers (changePassword, forgot-password)
+  // even though its actual LOGIN entry point is deliberately separate
+  // (see generalManagerLogin below, not login()) - only the *table
+  // lookup* is shared, never the login route/screen itself.
+  if (accountType === 'general_manager') return { table: 'general_managers', phoneField: 'phone' };
   return { table: 'tenants', phoneField: 'primary_phone' };
 }
 
@@ -684,7 +693,7 @@ async function registerLandlord(req, res) {
  * this falls back to the landlord's own subscription_period_months
  * (already set at signup) rather than leaving the expiry unset.
  */
-async function activateLandlordAfterPayment(landlordId, periodMonths) {
+async function activateLandlordAfterPayment(landlordId, periodMonths, unitsCount, amountPaid, subscriptionPaymentId) {
   let months = Number(periodMonths);
   if (!months || months < 1) {
     const { data: existing } = await supabase.from('landlords').select('subscription_period_months').eq('id', landlordId).maybeSingle();
@@ -711,6 +720,26 @@ async function activateLandlordAfterPayment(landlordId, periodMonths) {
     .single();
 
   if (error) throw error;
+
+  // Phase 13 - true MRR: this landlord's very first coverage period,
+  // starting today. unitsCount/amountPaid are optional (older/other
+  // call sites that haven't been updated to pass them through yet)
+  // so this never throws and blocks account activation itself over a
+  // missing analytics input - it just skips the coverage-period
+  // record in that case, same as any other coveragePeriod.service.js
+  // failure (see that file's own try/catch).
+  if (unitsCount && amountPaid != null) {
+    await createCoveragePeriod({
+      landlordId,
+      kind: 'first',
+      startDate: startedAt,
+      endDate: expiresAt,
+      unitsCovered: unitsCount,
+      amountPaid,
+      periodMonths: months,
+      subscriptionPaymentId,
+    });
+  }
 
   return landlord;
 }
@@ -1134,6 +1163,91 @@ async function handleBrandAmbassadorLogin({ email, password, invalidCredsMsg }) 
       referralCode: ba.referral_code,
     },
   };
+}
+
+// ---------------------------------------------------------------------
+// SECTION 3 — General Manager: Dedicated Login Entry Point
+//
+// Deliberately its OWN endpoint, not folded into the unified login()
+// below - the spec calls for a login screen General Managers reach
+// only via their own dedicated URL (rentapay.co.ke/manager-account,
+// see App.jsx), separate from the landlord/manager/tenant screen at
+// /login and from the hidden admin screen. Modeled closely on
+// handleBrandAmbassadorLogin (self-contained, own table, own status
+// rules) rather than on accountTable()'s generic multi-role lookups,
+// since - like brand_ambassadors - general_managers is never part of
+// ALL_ACCOUNT_TYPES/login()'s auto-detect matching; it only ever gets
+// reached through this one dedicated route.
+// ---------------------------------------------------------------------
+async function generalManagerLogin(req, res) {
+  try {
+    let { email, password } = req.body;
+    if (typeof email === 'string') email = email.trim();
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email and password are required.' });
+    }
+
+    // Same lockdown gate every non-admin login path respects.
+    const { data: settings } = await supabase
+      .from('platform_settings')
+      .select('is_locked_down, lockdown_reason')
+      .eq('id', 1)
+      .maybeSingle();
+    if (settings?.is_locked_down) {
+      return res.status(503).json({ error: settings.lockdown_reason || 'The platform is temporarily paused for technical maintenance.', lockedDown: true });
+    }
+
+    const invalidCredsMsg = 'Invalid email or password.';
+
+    const { data: manager, error } = await supabase
+      .from('general_managers')
+      .select('*')
+      .ilike('email', email)
+      .maybeSingle();
+
+    // Never reveal whether the email is registered - identical
+    // response to a wrong password on a real account.
+    if (error || !manager) {
+      return res.status(401).json({ error: invalidCredsMsg });
+    }
+
+    const passwordMatches = await comparePassword(password, manager.password_hash);
+    if (!passwordMatches) {
+      return res.status(401).json({ error: invalidCredsMsg });
+    }
+
+    if (!manager.is_active) {
+      return res.status(403).json({ error: 'Your access has been removed. Contact RentaPay support for more information.', accountSuspended: true });
+    }
+
+    const token = signToken({ id: manager.id, role: 'general_manager' });
+
+    logActivity({
+      actorType: 'general_manager',
+      actorId: manager.id,
+      action: 'general_manager_login',
+      targetType: 'general_manager',
+      targetId: manager.id,
+      ipAddress: req.ip,
+    });
+
+    return res.json({
+      token,
+      role: 'general_manager',
+      fullName: manager.full_name,
+      email: manager.email,
+      // Frontend routes to the forced password-change screen first
+      // (same field name/flow as every other role), then - once
+      // that's done - to Operations PIN setup, per Section 4.
+      mustChangePassword: manager.must_change_password || false,
+      operationsPinSet: !!manager.operations_pin_hash,
+    });
+  } catch (err) {
+    logger.error('[auth] generalManagerLogin error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to log in.' });
+  }
 }
 
 async function login(req, res) {
@@ -2907,6 +3021,7 @@ module.exports = {
   resendOTP,
   login,
   loginWithGoogle,
+  generalManagerLogin,
   adminLogin,
   adminVerifyOTP,
   adminForgotPassword,

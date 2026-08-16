@@ -62,6 +62,7 @@ const { captureException } = require('../services/sentry.service');
 const tenantRatingReminderService = require('../services/tenantRatingReminder.service');
 const { recordCommissionForPayment } = require('../services/baCommission.service');
 const { consumeLoyaltyDiscount } = require('../services/landlordLoyalty.service');
+const { createCoveragePeriod, computeRenewalStartDate } = require('../services/coveragePeriod.service');
 const logger = require('../utils/logger');
 
 // ---------------------------------------------------------------------
@@ -541,7 +542,7 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
 
   if (isFirstPayment) {
     // First-ever payment completes registration (blueprint 3.1)
-    await activateLandlordAfterPayment(landlord.id, subPayment.period_months);
+    await activateLandlordAfterPayment(landlord.id, subPayment.period_months, subPayment.units_count, subPayment.amount, subPayment.id);
   } else {
     // Renewal (blueprint 9.4 / 11.2): extend expiry by the period paid for
     let currentExpiry = landlord.subscription_expires_at ? new Date(landlord.subscription_expires_at) : new Date();
@@ -567,6 +568,28 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
         subscription_started_at: new Date().toISOString(),
       })
       .eq('id', landlord.id);
+
+    // Phase 13 - true MRR: this renewal's own coverage period.
+    // computeRenewalStartDate looks at the landlord's PRE-update
+    // expiry (still held in `landlord.subscription_expires_at` above -
+    // the update() call just now doesn't mutate this local object) to
+    // tell an early renewal (still-future expiry - new period starts
+    // the day after the old one ends) apart from a standard one
+    // (already-lapsed or first time - starts today). The period's end
+    // date deliberately mirrors the currentExpiry just written to the
+    // landlord row above, so this ledger always agrees with what the
+    // landlord's actual access is set to.
+    const coverageStart = computeRenewalStartDate(landlord.subscription_expires_at);
+    await createCoveragePeriod({
+      landlordId: landlord.id,
+      kind: 'renewal',
+      startDate: coverageStart,
+      endDate: currentExpiry,
+      unitsCovered: subPayment.units_count,
+      amountPaid: subPayment.amount,
+      periodMonths: subPayment.period_months,
+      subscriptionPaymentId: subPayment.id,
+    });
 
     // Same freeze/unfreeze + tenant-archive-safety rules as the admin
     // path (see unitLimitEnforcement.js) - a landlord renewing with

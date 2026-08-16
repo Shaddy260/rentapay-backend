@@ -42,6 +42,7 @@ const { captureException } = require('../services/sentry.service');
 const { notify } = require('../services/notify.service');
 const { queueBatchedNotification } = require('../services/notificationBatch.service');
 const { sendPushToRecipient } = require('../services/webpush.service');
+const { confirmAdminOrGmAction, isGmAction } = require('../utils/actionConfirmation');
 const logger = require('../utils/logger');
 
 // Bumped only if the Terms of Engagement copy materially changes -
@@ -554,10 +555,12 @@ async function verifyAdminPassword(password) {
 async function suspendBrandAmbassador(req, res) {
   try {
     const { id } = req.params;
-    const { password } = req.body;
-    const passwordOk = await verifyAdminPassword(password);
-    if (!passwordOk) {
-      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT suspended.' });
+    // SECTION 6 (General Manager spec): a General Manager confirms
+    // with Operations PIN + reason (already checked at the router
+    // level), not the admin password.
+    const confirmed = await confirmAdminOrGmAction(req);
+    if (!confirmed.ok) {
+      return res.status(401).json({ error: `${confirmed.error} Brand Ambassador was NOT suspended.` });
     }
 
     const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
@@ -575,7 +578,16 @@ async function suspendBrandAmbassador(req, res) {
       .single();
     if (updateErr) throw updateErr;
 
-    logActivity({ actorType: 'admin', actorId: req.user.id, action: 'ba_suspended', targetType: 'brand_ambassador', targetId: id });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: req.user.id,
+      action: 'ba_suspended',
+      targetType: 'brand_ambassador',
+      targetId: id,
+      metadata: isGmAction(req)
+        ? { reason: req.pinConfirmedReason, affectedPersonLabel: updated.full_name, before: { status: ba.status }, after: { status: updated.status } }
+        : undefined,
+    });
 
     return res.json({ message: 'Brand Ambassador suspended.', brandAmbassador: updated });
   } catch (err) {
@@ -593,10 +605,9 @@ async function suspendBrandAmbassador(req, res) {
 async function reactivateBrandAmbassador(req, res) {
   try {
     const { id } = req.params;
-    const { password } = req.body;
-    const passwordOk = await verifyAdminPassword(password);
-    if (!passwordOk) {
-      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT reactivated.' });
+    const confirmed = await confirmAdminOrGmAction(req);
+    if (!confirmed.ok) {
+      return res.status(401).json({ error: `${confirmed.error} Brand Ambassador was NOT reactivated.` });
     }
 
     const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
@@ -614,7 +625,16 @@ async function reactivateBrandAmbassador(req, res) {
       .single();
     if (updateErr) throw updateErr;
 
-    logActivity({ actorType: 'admin', actorId: req.user.id, action: 'ba_reactivated', targetType: 'brand_ambassador', targetId: id });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: req.user.id,
+      action: 'ba_reactivated',
+      targetType: 'brand_ambassador',
+      targetId: id,
+      metadata: isGmAction(req)
+        ? { reason: req.pinConfirmedReason, affectedPersonLabel: updated.full_name, before: { status: ba.status }, after: { status: updated.status } }
+        : undefined,
+    });
 
     return res.json({ message: 'Brand Ambassador reactivated.', brandAmbassador: updated });
   } catch (err) {
@@ -645,10 +665,9 @@ async function reactivateBrandAmbassador(req, res) {
 async function offboardBrandAmbassador(req, res) {
   try {
     const { id } = req.params;
-    const { password } = req.body;
-    const passwordOk = await verifyAdminPassword(password);
-    if (!passwordOk) {
-      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT offboarded.' });
+    const confirmed = await confirmAdminOrGmAction(req);
+    if (!confirmed.ok) {
+      return res.status(401).json({ error: `${confirmed.error} Brand Ambassador was NOT offboarded.` });
     }
 
     const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
@@ -660,13 +679,31 @@ async function offboardBrandAmbassador(req, res) {
 
     const { data: updated, error: updateErr } = await supabase
       .from('brand_ambassadors')
+      // offboarded_by_admin_id keeps its existing name/shape (schema
+      // change out of scope here) - for a GM caller this now records
+      // the GM's own id, which is still the correct "who did this"
+      // value even though the column name predates this role.
       .update({ status: 'inactive', offboarded_at: new Date().toISOString(), offboarded_by_admin_id: req.user.id })
       .eq('id', id)
       .select('id, full_name, status, offboarded_at')
       .single();
     if (updateErr) throw updateErr;
 
-    logActivity({ actorType: 'admin', actorId: req.user.id, action: 'ba_offboarded', targetType: 'brand_ambassador', targetId: id });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: req.user.id,
+      action: 'ba_offboarded',
+      targetType: 'brand_ambassador',
+      targetId: id,
+      metadata: isGmAction(req)
+        ? {
+            reason: req.pinConfirmedReason,
+            affectedPersonLabel: updated.full_name,
+            before: { status: ba.status, offboarded_at: null, offboarded_by_admin_id: null },
+            after: { status: updated.status, offboarded_at: updated.offboarded_at, offboarded_by_admin_id: req.user.id },
+          }
+        : undefined,
+    });
 
     return res.json({ message: 'Brand Ambassador offboarded. Their referral link keeps working.', brandAmbassador: updated });
   } catch (err) {
@@ -690,10 +727,9 @@ async function offboardBrandAmbassador(req, res) {
 async function restoreBrandAmbassador(req, res) {
   try {
     const { id } = req.params;
-    const { password } = req.body;
-    const passwordOk = await verifyAdminPassword(password);
-    if (!passwordOk) {
-      return res.status(401).json({ error: 'Incorrect admin password. Brand Ambassador was NOT restored.' });
+    const confirmed = await confirmAdminOrGmAction(req);
+    if (!confirmed.ok) {
+      return res.status(401).json({ error: `${confirmed.error} Brand Ambassador was NOT restored.` });
     }
 
     const { data: ba, error: findErr } = await supabase.from('brand_ambassadors').select('id, status').eq('id', id).maybeSingle();
@@ -711,7 +747,21 @@ async function restoreBrandAmbassador(req, res) {
       .single();
     if (updateErr) throw updateErr;
 
-    logActivity({ actorType: 'admin', actorId: req.user.id, action: 'ba_restored', targetType: 'brand_ambassador', targetId: id });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: req.user.id,
+      action: 'ba_restored',
+      targetType: 'brand_ambassador',
+      targetId: id,
+      metadata: isGmAction(req)
+        ? {
+            reason: req.pinConfirmedReason,
+            affectedPersonLabel: updated.full_name,
+            before: { status: ba.status },
+            after: { status: updated.status, offboarded_at: null, offboarded_by_admin_id: null },
+          }
+        : undefined,
+    });
 
     return res.json({ message: 'Brand Ambassador restored to active.', brandAmbassador: updated });
   } catch (err) {
@@ -786,11 +836,12 @@ async function approveBaApplication(req, res) {
     const tempPassword = generateTempPassword();
     const passwordHash = await hashPassword(tempPassword);
 
-    // BUILD SPEC PHASE 10: the one-time, non-expiring payout
-    // submission token is established right here, at the point the BA
-    // account becomes active - not a recurring per-cycle link. This is
-    // the only time this token is ever generated for this BA.
-    const payoutSubmissionToken = require('crypto').randomBytes(20).toString('hex');
+    // BUILD SPEC PHASE 10 (v2): the payout submission link is now a
+    // single universal URL shared by every BA (see
+    // baPayoutSubmissionLink.service.js) - there is no per-BA token to
+    // establish at approval time anymore. payout_submission_used_at
+    // stays null (the channel is "open") until this BA's one-time
+    // submission succeeds.
 
     const { data: approved, error: updateErr } = await supabase
       .from('brand_ambassadors')
@@ -803,8 +854,6 @@ async function approveBaApplication(req, res) {
         onboarded_at: new Date().toISOString(),
         reviewed_by_admin_id: 'super-admin',
         reviewed_at: new Date().toISOString(),
-        payout_submission_token: payoutSubmissionToken,
-        payout_submission_token_generated_at: new Date().toISOString(),
       })
       .eq('id', id)
       .select()

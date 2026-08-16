@@ -14,6 +14,7 @@
 // report carries real KES amounts (Section F) rather than a bare
 // qualifies/doesn't-qualify count.
 const PDFDocument = require('pdfkit');
+const { drawBrandedHeader, drawBrandedFooter } = require('./pdfBranding.service');
 
 const GREEN = '#2e7d32';
 const ORANGE = '#e65100';
@@ -34,13 +35,11 @@ function periodLabelOf(report) {
 }
 
 function drawHeader(doc, { subtitle, periodLabel, generatedAt }) {
-  doc.fontSize(20).fillColor(INK).text('RentaPay', { continued: true }).fillColor(GREEN).text(' — BA Payout Run');
-  doc.moveDown(0.2);
-  doc.fontSize(11).fillColor('#555').text(subtitle);
-  doc.fontSize(9).fillColor(MUTED).text(`Period: ${periodLabel} · Generated ${generatedAt.toLocaleString('en-GB')}`);
-  doc.moveDown(0.8);
-  doc.strokeColor(RULE).moveTo(PAGE_LEFT, doc.y).lineTo(PAGE_RIGHT, doc.y).stroke();
-  doc.moveDown(0.7);
+  drawBrandedHeader(doc, {
+    title: 'BA Payout Run',
+    subtitle,
+    meta: `Period: ${periodLabel} · Generated ${generatedAt.toLocaleString('en-GB')}`,
+  });
 }
 
 function drawLegend(doc) {
@@ -157,6 +156,7 @@ function generateSingleBaPayoutQualificationPdf(res, report, baId) {
       .text(`Total owed this cycle: ${fmtKes(ba.totalOwed)}`, PAGE_LEFT);
   }
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 
@@ -204,6 +204,7 @@ function generateCombinedPayoutQualificationPdf(res, report) {
     PAGE_LEFT
   );
 
+  drawBrandedFooter(doc);
   doc.end();
 }
 
@@ -230,13 +231,11 @@ function generateCompletedPayoutLinkPdf(res, { periodKey, generatedAt, cards, to
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
   doc.pipe(res);
 
-  doc.fontSize(20).fillColor(INK).text('RentaPay', { continued: true }).fillColor(GREEN).text(' — BA Payout (Completed)');
-  doc.moveDown(0.2);
-  doc.fontSize(11).fillColor('#555').text(periodKey ? `Cycle ${periodKey}` : 'All completed cycles');
-  doc.fontSize(9).fillColor(MUTED).text(`Generated ${new Date(generatedAt).toLocaleString('en-GB')}`);
-  doc.moveDown(0.8);
-  doc.strokeColor(RULE).moveTo(PAGE_LEFT, doc.y).lineTo(PAGE_RIGHT, doc.y).stroke();
-  doc.moveDown(0.7);
+  drawBrandedHeader(doc, {
+    title: 'BA Payout (Completed)',
+    subtitle: periodKey ? `Cycle ${periodKey}` : 'All completed cycles',
+    meta: `Generated ${new Date(generatedAt).toLocaleString('en-GB')}`,
+  });
 
   doc.font('Helvetica').fontSize(9).fillColor('#333').text(
     `${totals.count} paid  ·  ${fmtKes(totals.totalAmount)} disbursed`,
@@ -246,6 +245,7 @@ function generateCompletedPayoutLinkPdf(res, { periodKey, generatedAt, cards, to
 
   if (!cards || cards.length === 0) {
     doc.font('Helvetica').fontSize(10).fillColor('#666').text('No completed payments for this selection.', PAGE_LEFT);
+    drawBrandedFooter(doc);
     doc.end();
     return;
   }
@@ -296,5 +296,6 @@ function generateCompletedPayoutLinkPdf(res, { periodKey, generatedAt, cards, to
   );
   doc.font('Helvetica').fontSize(9).fillColor(MUTED).text(`(${totals.count} payment${totals.count === 1 ? '' : 's'})`, PAGE_LEFT);
 
+  drawBrandedFooter(doc);
   doc.end();
 }

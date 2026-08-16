@@ -12,6 +12,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { effectiveLandlordId } = require('../middleware/auth.middleware');
 const { captureException } = require('../services/sentry.service');
 const loyaltyService = require('../services/landlordLoyalty.service');
+const { createCoveragePeriod } = require('../services/coveragePeriod.service');
 const logger = require('../utils/logger');
 
 // ---------------------------------------------------------------------
@@ -137,13 +138,40 @@ async function addUnitsMidPeriod(req, res) {
  * (similar pattern to processSubscriptionPaymentCallback) rather than
  * called directly - left here as the function the callback should
  * invoke once that account_reference pattern is added.
+ *
+ * Phase 13 note: `amountPaid` is optional and only used to create the
+ * mid-cycle-addition coverage period (spec: "a separate, shorter
+ * coverage period just for the new units, running from the addition
+ * date to the end of the current term"). Omit it and this still does
+ * exactly what it always did (unit_limit bump) - nothing here is
+ * gated on it.
  */
-async function confirmAddUnits(landlordId, additionalUnits) {
-  const { data: landlord, error } = await supabase.from('landlords').select('unit_limit').eq('id', landlordId).single();
+async function confirmAddUnits(landlordId, additionalUnits, amountPaid) {
+  const { data: landlord, error } = await supabase.from('landlords').select('unit_limit, subscription_expires_at').eq('id', landlordId).single();
   if (error || !landlord) throw new Error('Landlord not found');
 
   await supabase.from('landlords').update({ unit_limit: landlord.unit_limit + additionalUnits }).eq('id', landlordId);
   logActivity({ actorType: 'system', action: 'units_added_to_subscription', targetType: 'landlord', targetId: landlordId, metadata: { additionalUnits } });
+
+  if (amountPaid != null && landlord.subscription_expires_at) {
+    const now = new Date();
+    const end = new Date(landlord.subscription_expires_at);
+    if (end > now) {
+      await createCoveragePeriod({
+        landlordId,
+        kind: 'addon',
+        startDate: now,
+        endDate: end,
+        unitsCovered: additionalUnits,
+        amountPaid,
+        // No periodMonths here on purpose - a mid-cycle addition's
+        // length is whatever's left of the CURRENT term, not a round
+        // number of months, so this normalizes from the actual
+        // start/end range instead (see monthsBetween() in
+        // coveragePeriod.service.js).
+      });
+    }
+  }
 }
 
 // ---------------------------------------------------------------------

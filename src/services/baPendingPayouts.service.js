@@ -160,7 +160,7 @@ async function listPendingPayments() {
 // ---------------------------------------------------------------------
 async function listAwaitingDetails() {
   const { currentPeriodKey } = require('./baPayoutLinkCycle.service');
-  const { submissionLinkForToken } = require('./baPayoutSubmissionLink.service');
+  const { submissionLink } = require('./baPayoutSubmissionLink.service');
   const currentPeriod = currentPeriodKey();
 
   const { data: earnings, error: earningsErr } = await supabase
@@ -174,7 +174,7 @@ async function listAwaitingDetails() {
 
   const { data: bas, error: baErr } = await supabase
     .from('brand_ambassadors')
-    .select('id, full_name, ba_code, email, phone, payout_submission_used_at, payout_submission_token')
+    .select('id, full_name, ba_code, email, phone, payout_submission_used_at')
     .in('id', earningBaIds);
   if (baErr) throw baErr;
 
@@ -194,13 +194,11 @@ async function listAwaitingDetails() {
     phone: b.phone,
     periodKey: currentPeriod,
     estimatedAmountOwed: truncateKes(owedByBa.get(b.id) || 0),
-    hasSubmissionLink: !!b.payout_submission_token,
-    // FIX (missing UI to send a BA their one-time submission link):
-    // the token has existed since approval (see approveBaApplication /
-    // issueSubmissionToken), but nothing ever surfaced the built URL to
-    // the admin - only the fact that a token existed. Build it here so
-    // the Payouts screen can offer a Copy/Share action per BA.
-    submissionLink: b.payout_submission_token ? submissionLinkForToken(b.payout_submission_token) : null,
+    // BUILD SPEC PHASE 10 (v2): the submission link is now one static,
+    // universal URL, the same for every BA - always available to
+    // share, never per-person.
+    hasSubmissionLink: true,
+    submissionLink: submissionLink(),
   }));
 }
 

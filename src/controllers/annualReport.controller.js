@@ -19,6 +19,7 @@
 const supabase = require('../config/supabase');
 const { effectiveLandlordId, getManagerAssignedPropertyIds } = require('../middleware/auth.middleware');
 const { captureException } = require('../services/sentry.service');
+const { brandCsv, brandedFilename } = require('../services/csvBranding.service');
 const logger = require('../utils/logger');
 
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -269,9 +270,13 @@ async function getFinancialReportCsv(req, res) {
     const result = await computeAnnualPortfolioStatistics(req);
     if (result.error) return res.status(result.error.statusCode || 500).json(result.error);
 
-    const csv = buildFinancialReportCsv(result.data);
+    const csv = brandCsv({
+      title: 'Annual Financial Report',
+      meta: [`Tax year: ${result.data.year}`],
+      body: buildFinancialReportCsv(result.data),
+    });
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="rentapay-financial-report-${result.data.year}.csv"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${brandedFilename('financial-report', result.data.year, 'csv')}"`);
     res.send(csv);
   } catch (err) {
     logger.error('[annualReport] getFinancialReportCsv error:', err.message);

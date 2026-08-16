@@ -22,6 +22,11 @@ router.post('/login', authController.login);
 router.post('/google', authController.loginWithGoogle);
 router.post('/forgot-password/request', authController.requestPasswordReset);
 router.post('/forgot-password/reset', authController.resetPassword);
+// SECTION 3 (General Manager dedicated login) - deliberately its own
+// endpoint, mirroring the dedicated frontend route at /manager-account
+// (see App.jsx), not the shared /login used by landlords/managers/
+// tenants and not the hidden /admin/login screen either.
+router.post('/manager-account/login', authController.generalManagerLogin);
 router.post('/admin/login', authController.adminLogin);
 router.post('/admin/verify-otp', authController.adminVerifyOTP);
 router.post('/admin/forgot-password', authController.adminForgotPassword);
@@ -55,7 +60,7 @@ router.patch('/landlord/payment-method', verifyToken, requireRole('landlord', 'm
 
 // Protected: either role - used both for the forced first-login
 // change and for a voluntary change later from the account menu.
-router.post('/change-password', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador'), authController.changePassword);
+router.post('/change-password', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador', 'general_manager'), authController.changePassword);
 router.post('/dismiss-onboarding', verifyToken, requireRole('landlord', 'tenant', 'manager'), authController.dismissOnboarding);
 
 module.exports = router;

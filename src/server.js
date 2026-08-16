@@ -39,6 +39,10 @@ const paymentPlanRoutes = require('./routes/paymentPlan.routes');
 const publicRoutes = require('./routes/public.routes');
 const tenantOnboardingRoutes = require('./routes/tenantOnboarding.routes');
 const brandAmbassadorRoutes = require('./routes/brandAmbassador.routes');
+// SECTION 4 (Operations PIN) - General Manager's own self-service
+// routes, mounted separately from admin.routes.js's /general-managers
+// (admin managing GM accounts, Section 2).
+const generalManagerRoutes = require('./routes/generalManager.routes');
 const assistantRoutes = require('./routes/assistant.routes');
 const settingsRoutes = require('./routes/settings.routes');
 const baPayoutQualificationReportRoutes = require('./routes/baPayoutQualificationReport.routes');
@@ -239,6 +243,7 @@ app.use('/api/payment-plans', paymentPlanRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/tenant-onboarding', tenantOnboardingRoutes);
 app.use('/api/brand-ambassadors', brandAmbassadorRoutes);
+app.use('/api/manager-account', generalManagerRoutes);
 app.use('/api/support-chat', require('./routes/supportChat.routes'));
 
 // Public "Help & Contact Details" (read by every portal's Help modal,

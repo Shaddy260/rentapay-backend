@@ -8,10 +8,12 @@ const supabase = require('../config/supabase');
 const { notify } = require('../services/notify.service');
 const { logActivity } = require('../services/activityLog.service');
 const { comparePassword } = require('../utils/password');
+const { confirmAdminOrGmAction, isGmAction } = require('../utils/actionConfirmation');
 const { applyUnitLimitChange } = require('../utils/unitLimitEnforcement');
-const { calculateSubscriptionCost } = require('../utils/pricing');
 const { KENYA_COUNTIES } = require('../constants/kenyaCounties');
 const { captureException } = require('../services/sentry.service');
+const { getMRRForMonth, getActiveLandlordsWithGrace } = require('../services/coveragePeriod.service');
+const { getPricingProposal } = require('../services/pricingProposal.service');
 const logger = require('../utils/logger');
 
 // FIX ("deleting a landlord, or locking down the platform, should
@@ -79,7 +81,7 @@ async function getDashboardMetrics(req, res) {
       (yearPayments || []).reduce((sum, p) => sum + Number(p.amount), 0) +
       (yearManualPayments || []).reduce((sum, p) => sum + Number(p.amount_paid || 0), 0);
 
-    return res.json({
+    const payload = {
       totalLandlords,
       activeLandlords,
       suspendedLandlords,
@@ -88,7 +90,20 @@ async function getDashboardMetrics(req, res) {
       revenueThisMonth,
       revenueThisYear,
       expiringSoon,
-    });
+    };
+
+    // SECTION 5 (General Manager spec): this single endpoint mixes
+    // operational counts with the platform's financial/profit figures
+    // (revenueThisMonth/revenueThisYear). A General Manager gets
+    // everything else on this dashboard, but those two fields are
+    // stripped out here rather than just hidden in the frontend, so
+    // the numbers never leave the server for that role.
+    if (req.user && req.user.role === 'general_manager') {
+      delete payload.revenueThisMonth;
+      delete payload.revenueThisYear;
+    }
+
+    return res.json(payload);
   } catch (err) {
     logger.error('[admin] getDashboardMetrics error:', err.message);
     captureException(err);
@@ -210,7 +225,7 @@ async function getIncompleteSignups(req, res) {
 async function setLandlordStatus(req, res) {
   try {
     const { landlordId } = req.params;
-    const { status, password } = req.body; // 'active' | 'suspended'
+    const { status } = req.body; // 'active' | 'suspended'
 
     if (!['active', 'suspended'].includes(status)) {
       return res.status(400).json({ error: "status must be 'active' or 'suspended'." });
@@ -221,15 +236,36 @@ async function setLandlordStatus(req, res) {
     // same weight as deleting one, which already required the admin
     // password. Neither direction is treated as the "safe" one that
     // gets a pass.
-    const passwordOk = await verifyAdminPassword(password);
-    if (!passwordOk) {
-      return res.status(401).json({ error: `Incorrect admin password. Landlord was NOT ${status === 'suspended' ? 'suspended' : 'activated'}.` });
+    // SECTION 6 (General Manager spec): a General Manager confirms
+    // with their Operations PIN + reason instead of the admin
+    // password - already checked at the router level for that role;
+    // confirmAdminOrGmAction() does the right check either way.
+    const { data: before } = await supabase.from('landlords').select('full_name, subscription_status').eq('id', landlordId).maybeSingle();
+
+    const confirmed = await confirmAdminOrGmAction(req);
+    if (!confirmed.ok) {
+      return res.status(401).json({ error: `${confirmed.error} Landlord was NOT ${status === 'suspended' ? 'suspended' : 'activated'}.` });
     }
 
     const { error } = await supabase.from('landlords').update({ subscription_status: status }).eq('id', landlordId);
     if (error) throw error;
 
-    logActivity({ actorType: 'admin', actorId: 'super-admin', action: `landlord_${status}`, targetType: 'landlord', targetId: landlordId, ipAddress: req.ip });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: isGmAction(req) ? req.user.id : 'super-admin',
+      action: `landlord_${status}`,
+      targetType: 'landlord',
+      targetId: landlordId,
+      metadata: isGmAction(req)
+        ? {
+            reason: req.pinConfirmedReason,
+            affectedPersonLabel: before?.full_name,
+            before: { subscription_status: before?.subscription_status },
+            after: { subscription_status: status },
+          }
+        : undefined,
+      ipAddress: req.ip,
+    });
 
     return res.json({ message: `Landlord account ${status}.` });
   } catch (err) {
@@ -245,17 +281,32 @@ async function setLandlordStatus(req, res) {
 async function deleteLandlordAccount(req, res) {
   try {
     const { landlordId } = req.params;
-    const { password } = req.body;
 
-    const passwordOk = await verifyAdminPassword(password);
-    if (!passwordOk) {
-      return res.status(401).json({ error: 'Incorrect admin password. Account was NOT deleted.' });
+    // Snapshotted BEFORE confirmAdminOrGmAction/delete so a General
+    // Manager's Section 10 revert has a full row to re-insert - "a
+    // true, precise undo, not an approximation" - not just the fact
+    // that a landlord with this id once existed.
+    const { data: fullRowBeforeDelete } = await supabase.from('landlords').select('*').eq('id', landlordId).maybeSingle();
+
+    const confirmed = await confirmAdminOrGmAction(req);
+    if (!confirmed.ok) {
+      return res.status(401).json({ error: `${confirmed.error} Account was NOT deleted.` });
     }
 
     const { error } = await supabase.from('landlords').delete().eq('id', landlordId);
     if (error) throw error;
 
-    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'landlord_deleted', targetType: 'landlord', targetId: landlordId, ipAddress: req.ip });
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: isGmAction(req) ? req.user.id : 'super-admin',
+      action: 'landlord_deleted',
+      targetType: 'landlord',
+      targetId: landlordId,
+      metadata: isGmAction(req)
+        ? { reason: req.pinConfirmedReason, affectedPersonLabel: fullRowBeforeDelete?.full_name, before: fullRowBeforeDelete }
+        : undefined,
+      ipAddress: req.ip,
+    });
 
     return res.json({ message: 'Landlord account permanently deleted.' });
   } catch (err) {
@@ -881,20 +932,11 @@ async function getRevenueDashboard(req, res) {
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
     const [
-      { data: activeLandlords, error: activeErr },
       { data: renewalsDue, error: renewalsErr },
       { data: recentlyLapsed, error: lapsedErr },
       { count: activeBaselineCount, error: pastActiveErr },
       { data: recentPayments, error: paymentsErr },
     ] = await Promise.all([
-      // MRR inputs: every currently-active landlord's paid unit count
-      // and billing period (period determines their discount tier -
-      // see calculateSubscriptionCost/pricing.js).
-      supabase
-        .from('landlords')
-        .select('id, full_name, unit_limit, subscription_period_months')
-        .eq('subscription_status', 'active'),
-
       // Renewals due this week - same underlying query as
       // getExpiringLandlords(days=7), duplicated here (rather than
       // calling that handler internally) so this single dashboard
@@ -940,26 +982,32 @@ async function getRevenueDashboard(req, res) {
         .gte('paid_at', thirtyDaysAgo.toISOString()),
     ]);
 
-    if (activeErr) throw activeErr;
     if (renewalsErr) throw renewalsErr;
     if (lapsedErr) throw lapsedErr;
     if (pastActiveErr) throw pastActiveErr;
     if (paymentsErr) throw paymentsErr;
 
-    // --- MRR: sum each active landlord's monthly-normalized rate ----
-    let mrr = 0;
-    for (const l of activeLandlords || []) {
-      const unitsCount = l.unit_limit || 0;
-      if (unitsCount < 1) continue;
-      try {
-        const { ratePerUnitPerMonth } = await calculateSubscriptionCost(unitsCount, l.subscription_period_months || 1, l.id);
-        mrr += ratePerUnitPerMonth * unitsCount;
-      } catch {
-        // A malformed subscription_period_months on some old record
-        // shouldn't blow up the whole dashboard - skip just that one.
-      }
-    }
-    mrr = Math.round(mrr * 100) / 100;
+    // FIX (Phase 13 - "Phase 12's MRR input now comes from this
+    // coverage-period model instead of raw monthly cash collected...
+    // keeping active landlords, MRR, and the Phase 12 proposals all
+    // consistent with one shared data model rather than drifting
+    // apart"): this used to estimate MRR as "every currently-active
+    // landlord's CURRENT rate x their unit count" - which is today's
+    // price applied to today's landlords, not actual recognized
+    // revenue for the month (a landlord who prepaid 6 months at last
+    // quarter's price, or added units mid-term, was invisible to this
+    // calculation). Now sourced from subscription_coverage_periods,
+    // the same true-MRR figure Phase 12's pricing proposal uses -
+    // this dashboard and that proposal can never drift apart into two
+    // different "MRR" numbers again. Active landlord count/list is
+    // now the same coverage-period-plus-grace-window definition too
+    // (see getActiveLandlordsWithGrace's own scope note - this never
+    // touches the landlord's actual subscription_status/paywall,
+    // purely a read-model for these analytics).
+    const [mrr, activeLandlordsWithGrace] = await Promise.all([
+      getMRRForMonth(new Date()),
+      getActiveLandlordsWithGrace(),
+    ]);
 
     // --- Churn rate: lapsed-in-last-30-days / active-30-days-ago ----
     const churnedCount = (recentlyLapsed || []).length;
@@ -980,7 +1028,7 @@ async function getRevenueDashboard(req, res) {
 
     return res.json({
       mrr,
-      activeLandlordCount: (activeLandlords || []).length,
+      activeLandlordCount: activeLandlordsWithGrace.length,
       renewalsDueThisWeek: renewalsDue || [],
       churn: {
         lapsedLast30Days: churnedCount,
@@ -994,6 +1042,31 @@ async function getRevenueDashboard(req, res) {
     logger.error('[admin] getRevenueDashboard error:', err.message);
     captureException(err);
     return res.status(500).json({ error: 'Failed to fetch revenue dashboard.' });
+  }
+}
+
+// ---------------------------------------------------------------------
+// PHASE 12 - Admin Revenue Statistics & Pricing Proposal.
+//
+// Looks at real MRR (Phase 13's coverage-period model), real BA
+// commission payouts, and real operating expenses, and proposes a
+// price-per-unit and BA commission % that would hit an admin-chosen
+// target profit margin - side by side with whatever's currently live.
+// This endpoint is read-only: it never writes to
+// subscription_pricing_settings or payout_rules - applying a proposal
+// is a separate, deliberate step using the existing pricing/payout-
+// rules admin screens.
+// ---------------------------------------------------------------------
+async function getPricingProposalHandler(req, res) {
+  try {
+    const targetMarginPct = req.query.targetMarginPct != null ? Number(req.query.targetMarginPct) : undefined;
+    const monthKeyStr = req.query.monthKey || undefined;
+    const proposal = await getPricingProposal({ targetMarginPct, monthKeyStr });
+    return res.json(proposal);
+  } catch (err) {
+    logger.error('[admin] getPricingProposal error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to calculate pricing proposal.' });
   }
 }
 
@@ -1150,6 +1223,7 @@ module.exports = {
   getRevenueBreakdown,
   getRevenueTrend,
   getRevenueDashboard,
+  getPricingProposal: getPricingProposalHandler,
   getGrowthStatistics,
   getExpiringLandlords,
   sendRenewalReminders,

@@ -28,6 +28,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { captureException } = require('../services/sentry.service');
 const { runBaQualificationCheck } = require('../jobs/baQualification.job');
 const { notifyRateChange } = require('../services/baCommission.service');
+const { brandCsv, brandedFilename } = require('../services/csvBranding.service');
 const logger = require('../utils/logger');
 
 const ADMIN_ACTOR_ID = 'super-admin';
@@ -322,10 +323,14 @@ async function downloadQualificationDryRunCsv(req, res) {
     lines.push(`Landlords checked,${result.checked}`);
     lines.push(`Would qualify,${result.qualified}`);
 
-    const filename = `ba-qualification-dry-run-${new Date().toISOString().slice(0, 10)}.csv`;
-    res.setHeader('Content-Type', 'text/csv');
+    const filename = brandedFilename('ba-qualification-dry-run', new Date().toISOString().slice(0, 10), 'csv');
+    const csv = brandCsv({
+      title: 'BA Qualification Dry Run',
+      body: lines,
+    });
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    return res.send(lines.join('\n'));
+    return res.send(csv);
   } catch (err) {
     logger.error('[payoutRules] downloadQualificationDryRunCsv error:', err.message);
     captureException(err);

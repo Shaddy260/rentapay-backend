@@ -5,6 +5,7 @@
 
 const jwt = require('jsonwebtoken');
 const supabase = require('../config/supabase');
+const { comparePassword } = require('../utils/password');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
 
@@ -13,10 +14,13 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
 function signToken(payload) {
   // payload should be { id, role } where role is
-  // 'admin' | 'landlord' | 'tenant' | 'manager' | 'brand_ambassador'
+  // 'admin' | 'landlord' | 'tenant' | 'manager' | 'brand_ambassador' | 'general_manager'
   // 'manager' tokens additionally carry { landlordId } - the id of the
   // landlord who added them - since a manager's own id is NOT a
   // landlords.id and must never be substituted for one.
+  // 'general_manager' tokens carry no landlordId - a General Manager
+  // is scoped platform-wide (see Section 5 of the sectioned spec), not
+  // to any single landlord's data.
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
@@ -89,6 +93,18 @@ async function isAccountStillValid(user) {
       if (error) return { valid: true };
       if (!data || data.status !== 'active') {
         return { valid: false, message: 'Your Brand Ambassador access is no longer active. You have been logged out.' };
+      }
+      return { valid: true };
+    }
+
+    // SECTION 3: same revoked-mid-session protection every other role
+    // already gets - admin deactivating a General Manager takes effect
+    // within ACCOUNT_CACHE_TTL_MS, not just on their next fresh login.
+    if (user.role === 'general_manager') {
+      const { data, error } = await supabase.from('general_managers').select('id, is_active').eq('id', user.id).maybeSingle();
+      if (error) return { valid: true };
+      if (!data || data.is_active === false) {
+        return { valid: false, message: 'Your access to this account has been removed. You have been logged out.' };
       }
       return { valid: true };
     }
@@ -254,6 +270,97 @@ function requireRole(...allowedRoles) {
     }
     next();
   };
+}
+
+/**
+ * SECTION 5 (General Manager spec) - "everything admin can see across
+ * the platform ... with one specific exception": the financial
+ * breakdown / profit section (total earned, commissions paid out,
+ * operating expenses, net profit) stays admin-only, in full, at the
+ * route level - not just hidden in the frontend. Mount this on any
+ * route that returns those figures, alongside requireRole('admin',
+ * 'general_manager'), so a General Manager gets a clean 403 and the
+ * data never leaves the server for that role. Admin passes through
+ * untouched.
+ */
+function blockGeneralManagerFinancial(req, res, next) {
+  if (req.user && req.user.role === 'general_manager') {
+    return res.status(403).json({ error: 'General Managers do not have access to platform financial or profit data.' });
+  }
+  next();
+}
+
+/**
+ * SECTION 6 (General Manager spec) — Edit Scope, PIN Confirmation &
+ * Mandatory Reason.
+ *
+ * Supersedes the old generalManagerReadOnly gate now that editing is
+ * actually built. Mount this (in place of that old gate) on any
+ * router opened up to 'general_manager' that now allows writes.
+ * Admin passes straight through untouched - none of this applies
+ * unless req.user.role is 'general_manager'.
+ *
+ * For a General Manager:
+ *   - GET/HEAD requests always pass straight through - Section 5's
+ *     visibility doesn't need confirming, only changes do.
+ *   - Every other request must carry { operationsPin, reason } in the
+ *     body. Per the spec: "The login password plays no role here -
+ *     it's used only to log in (Section 3). Every edit action
+ *     requires the Operations PIN (Section 4) to confirm it. Every
+ *     PIN-confirmed action also requires the General Manager to type
+ *     a mandatory reason ... the action cannot succeed without one."
+ *   - The PIN is compared against this GM's own operations_pin_hash
+ *     only (req.user.id) - a General Manager can only ever confirm
+ *     actions with their OWN PIN, never anyone else's.
+ *   - A GM who has somehow reached a protected route without ever
+ *     completing Section 4's onboarding (operations_pin_hash still
+ *     null) is blocked with a clear message rather than crashing on a
+ *     null hash - this should be unreachable in practice since the
+ *     frontend forces PIN setup before the dashboard loads, but it's
+ *     checked defensively here too since this is a security gate.
+ *
+ * On success, the verified reason is stashed on req.pinConfirmedReason
+ * so the controller (and, later, Section 7's automatic logging) can
+ * record it without re-parsing the body or trusting an unverified
+ * value.
+ */
+async function requireOperationsPinConfirmation(req, res, next) {
+  if (!req.user || req.user.role !== 'general_manager') return next();
+  if (req.method === 'GET' || req.method === 'HEAD') return next();
+
+  try {
+    const { operationsPin, reason } = req.body || {};
+    const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+    if (!trimmedReason) {
+      return res.status(400).json({ error: 'A reason is required to confirm this action.' });
+    }
+    if (!operationsPin) {
+      return res.status(400).json({ error: 'Your Operations PIN is required to confirm this action.' });
+    }
+
+    const { data: manager, error } = await supabase
+      .from('general_managers')
+      .select('id, operations_pin_hash, is_active')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (error || !manager) return res.status(404).json({ error: 'Account not found.' });
+    if (!manager.is_active) return res.status(403).json({ error: 'This account has been deactivated.' });
+    if (!manager.operations_pin_hash) {
+      return res.status(409).json({ error: 'Set your Operations PIN in Settings before making changes.' });
+    }
+
+    const matches = await comparePassword(String(operationsPin), manager.operations_pin_hash);
+    if (!matches) {
+      return res.status(401).json({ error: 'Incorrect Operations PIN. Action was NOT performed.' });
+    }
+
+    req.pinConfirmedReason = trimmedReason;
+    next();
+  } catch (err) {
+    logger.error('[auth] requireOperationsPinConfirmation error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to verify Operations PIN.' });
+  }
 }
 
 /**
@@ -485,6 +592,8 @@ module.exports = {
   requirePropertyAccess,
   requireNotCaretaker,
   requireBrandAmbassador,
+  blockGeneralManagerFinancial,
+  requireOperationsPinConfirmation,
   effectiveLandlordId,
   effectiveBaId,
   getManagerAssignedPropertyIds,

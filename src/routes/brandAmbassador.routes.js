@@ -4,7 +4,7 @@ const ctrl = require('../controllers/brandAmbassador.controller');
 const payoutRulesCtrl = require('../controllers/payoutRules.controller');
 const baAdminPayoutCtrl = require('../controllers/baAdminPayout.controller');
 const baRewardsCtrl = require('../controllers/baRewards.controller');
-const { verifyToken, requireRole } = require('../middleware/auth.middleware');
+const { verifyToken, requireRole, requireOperationsPinConfirmation } = require('../middleware/auth.middleware');
 
 // PUBLIC - the one generic "Become a Brand Ambassador" link
 // (frontend: /become-a-ba). No token in the URL, no login.
@@ -63,18 +63,33 @@ router.get('/me/earnings-statement.csv', verifyToken, requireRole('brand_ambassa
 // generation on its own either way.
 router.get('/onboarding-link', verifyToken, requireRole('admin'), ctrl.getBaOnboardingLinkStatus);
 router.post('/onboarding-link/generate', verifyToken, requireRole('admin'), ctrl.generateBaOnboardingLink);
-router.get('/applications', verifyToken, requireRole('admin'), ctrl.listPendingBaApplications);
-router.post('/applications/:id/approve', verifyToken, requireRole('admin'), ctrl.approveBaApplication);
-router.post('/applications/:id/reject', verifyToken, requireRole('admin'), ctrl.rejectBaApplication);
-router.get('/', verifyToken, requireRole('admin'), ctrl.listBrandAmbassadors);
+// SECTION 5 (General Manager spec): "Brand Ambassador data" is
+// explicitly one of the things a General Manager can see. These two
+// GETs are roster/application data, not payout or commission
+// figures, so they're opened up read-only to 'general_manager' here.
+// SECTION 6: approve/reject/suspend/reactivate/offboard/restore are
+// now open to 'general_manager' too - "Brand Ambassador account
+// management" and "onboarding actions" are explicitly in scope -
+// gated behind requireOperationsPinConfirmation (PIN + mandatory
+// reason for that role; admin is unaffected and passes straight
+// through). Payout rules, rewards, and everything payout/commission-
+// related below stay admin-only - either the commission figures
+// Section 5 excludes outright, or (payout-rules GET) opened
+// read-only-only further below since "Platform Brand Ambassador
+// commission rate" is one of Section 6's two explicitly locked
+// fields - viewable, never editable, for a General Manager.
+router.get('/applications', verifyToken, requireRole('admin', 'general_manager'), ctrl.listPendingBaApplications);
+router.post('/applications/:id/approve', verifyToken, requireRole('admin', 'general_manager'), requireOperationsPinConfirmation, ctrl.approveBaApplication);
+router.post('/applications/:id/reject', verifyToken, requireRole('admin', 'general_manager'), requireOperationsPinConfirmation, ctrl.rejectBaApplication);
+router.get('/', verifyToken, requireRole('admin', 'general_manager'), ctrl.listBrandAmbassadors);
 // PHASE 16 - suspend (reversible, for-cause) vs offboard (permanent,
 // referral link keeps working) are deliberately separate actions -
 // see brandAmbassador.controller.js for what each one does and does
 // not touch.
-router.post('/:id/suspend', verifyToken, requireRole('admin'), ctrl.suspendBrandAmbassador);
-router.post('/:id/reactivate', verifyToken, requireRole('admin'), ctrl.reactivateBrandAmbassador);
-router.post('/:id/offboard', verifyToken, requireRole('admin'), ctrl.offboardBrandAmbassador);
-router.post('/:id/restore', verifyToken, requireRole('admin'), ctrl.restoreBrandAmbassador);
+router.post('/:id/suspend', verifyToken, requireRole('admin', 'general_manager'), requireOperationsPinConfirmation, ctrl.suspendBrandAmbassador);
+router.post('/:id/reactivate', verifyToken, requireRole('admin', 'general_manager'), requireOperationsPinConfirmation, ctrl.reactivateBrandAmbassador);
+router.post('/:id/offboard', verifyToken, requireRole('admin', 'general_manager'), requireOperationsPinConfirmation, ctrl.offboardBrandAmbassador);
+router.post('/:id/restore', verifyToken, requireRole('admin', 'general_manager'), requireOperationsPinConfirmation, ctrl.restoreBrandAmbassador);
 
 // SECTION E - percentage commission rate (global + per-BA override),
 // each an append-only history (setting a new rate inserts a new row
@@ -84,7 +99,13 @@ router.post('/:id/restore', verifyToken, requireRole('admin'), ctrl.restoreBrand
 // living at the API root. The old commission-tiers / unit-pricing-tiers
 // endpoints that used to live here are gone - hard cutover, those
 // tables no longer exist.
-router.get('/payout-rules', verifyToken, requireRole('admin'), payoutRulesCtrl.getPayoutRules);
+// SECTION 6: GM can now SEE the current global/per-BA commission
+// rate - "General Managers can see these current settings but have
+// no ability to change them" - so this GET opens to 'general_manager'
+// while both PATCH routes below stay requireRole('admin') only,
+// genuinely non-editable for that role at the API level, not just
+// hidden in the UI.
+router.get('/payout-rules', verifyToken, requireRole('admin', 'general_manager'), payoutRulesCtrl.getPayoutRules);
 router.patch('/payout-rules/global', verifyToken, requireRole('admin'), payoutRulesCtrl.updateGlobalPayoutRule);
 router.patch('/:baId/payout-rule-override', verifyToken, requireRole('admin'), payoutRulesCtrl.setBaPayoutOverride);
 router.get('/payout-rules/history', verifyToken, requireRole('admin'), payoutRulesCtrl.getPayoutRuleHistory);

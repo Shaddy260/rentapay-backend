@@ -43,6 +43,12 @@ router.patch('/:unitId/listing-status', requireRole('landlord', 'manager', 'admi
 // updateListingDescription (unit.controller.js) is kept for now as
 // dead code / in case old data needs inspecting, but no longer routed.
 router.patch('/:unitId/deposit-settings', requireRole('landlord', 'manager', 'admin'), unitController.updateDepositSettings);
+// Bulk deposit-settings endpoint (direct request: "Landlord Bulk
+// Deposit Assignment" - scope selector on the deposit-setting UI lets
+// a landlord apply one deposit rule to their whole portfolio ("all")
+// or a hand-picked group of units ("selected") in a single request,
+// instead of opening and editing each unit individually.
+router.post('/bulk-deposit-settings', requireRole('landlord', 'manager', 'admin'), unitController.bulkUpdateDepositSettings);
 router.delete('/:unitId', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot remove units. Contact the landlord or property manager.'), unitController.removeUnit);
 router.post('/:unitId/extra-charges', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot add extra charges. Contact the landlord or property manager.'), unitController.addExtraCharge);
 

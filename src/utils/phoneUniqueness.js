@@ -27,7 +27,7 @@ const supabase = require('../config/supabase');
  *   phone can't be used, or null if it's free to use.
  */
 async function findPhoneConflict(phone, forRole) {
-  const [{ data: landlord }, { data: activeManager }, { data: activeTenant }, { data: activeBa }] = await Promise.all([
+  const [{ data: landlord }, { data: activeManager }, { data: activeTenant }, { data: activeBa }, { data: activeGeneralManager }] = await Promise.all([
     supabase.from('landlords').select('id').eq('phone', phone).maybeSingle(),
     // ARCHIVE FIX: this used to have no is_active filter at all, so a
     // manager/caretaker archived (removed) by one landlord permanently
@@ -44,6 +44,11 @@ async function findPhoneConflict(phone, forRole) {
     // can cleanly re-apply later - mirrors the partial unique index
     // on brand_ambassadors.phone (WHERE status <> 'rejected').
     supabase.from('brand_ambassadors').select('id, status').eq('phone', phone).neq('status', 'rejected').maybeSingle(),
+    // General Manager accounts (admin-provisioned only - see
+    // 2026-08-general-manager-role.sql). No archive/soft-delete
+    // concept exists for this role yet (Section 2 only), so any row
+    // here counts as active.
+    supabase.from('general_managers').select('id').eq('phone', phone).maybeSingle(),
   ]);
 
   // PRIVACY FIX: when the account being registered is a Brand
@@ -86,6 +91,13 @@ async function findPhoneConflict(phone, forRole) {
     return forRole === 'brand_ambassador'
       ? GENERIC_BA_CONFLICT
       : 'This phone number is already registered to a Brand Ambassador account. Please use a different number.';
+  }
+
+  if (activeGeneralManager) {
+    if (forRole === 'brand_ambassador') return GENERIC_BA_CONFLICT;
+    return forRole === 'general_manager'
+      ? 'A General Manager with this phone number already exists.'
+      : 'This phone number is already registered to a General Manager account. Please use a different number.';
   }
 
   return null;
