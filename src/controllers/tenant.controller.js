@@ -376,7 +376,7 @@ async function getBalance(req, res) {
 
     const { data: tenant, error } = await supabase
       .from('tenants')
-      .select('*, units(*, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number)), landlords(payment_method, paybill_number, paybill_account_number, till_number)')
+      .select('*, units(*, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_description)), landlords(payment_method, paybill_number, paybill_account_number, till_number, payment_description)')
       .eq('id', tenantId)
       .maybeSingle();
 
@@ -767,7 +767,7 @@ async function remindTenant(req, res) {
     const { data: tenant, error } = await supabase
       .from('tenants')
       .select(
-        '*, units(property_id, rent_amount, due_day_of_month, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number)), landlords(payment_method, paybill_number, paybill_account_number, till_number)'
+        '*, units(property_id, rent_amount, due_day_of_month, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_description)), landlords(payment_method, paybill_number, paybill_account_number, till_number, payment_description)'
       )
       .eq('id', tenantId)
       .single();
@@ -834,7 +834,7 @@ async function getWhatsAppReminderInfo(req, res) {
     const { data: tenant, error } = await supabase
       .from('tenants')
       .select(
-        '*, units(property_id, rent_amount, due_day_of_month, unit_name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number)), landlords(payment_method, paybill_number, paybill_account_number, till_number)'
+        '*, units(property_id, rent_amount, due_day_of_month, unit_name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_description)), landlords(payment_method, paybill_number, paybill_account_number, till_number, payment_description)'
       )
       .eq('id', tenantId)
       .single();
@@ -896,14 +896,14 @@ async function getWhatsAppBulkReminderQueue(req, res) {
 
     const { data: landlord } = await supabase
       .from('landlords')
-      .select('payment_method, paybill_number, paybill_account_number, till_number')
+      .select('payment_method, paybill_number, paybill_account_number, till_number, payment_description')
       .eq('id', landlordId)
       .single();
 
     const { data: tenants, error } = await supabase
       .from('tenants')
       .select(
-        '*, units(rent_amount, due_day_of_month, unit_name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number))'
+        '*, units(rent_amount, due_day_of_month, unit_name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_description))'
       )
       .eq('landlord_id', landlordId)
       .eq('is_active', true);
@@ -947,14 +947,14 @@ async function sendBulkReminders(req, res) {
 
     const { data: landlord } = await supabase
       .from('landlords')
-      .select('payment_method, paybill_number, paybill_account_number, till_number')
+      .select('payment_method, paybill_number, paybill_account_number, till_number, payment_description')
       .eq('id', landlordId)
       .single();
 
     const { data: tenants, error } = await supabase
       .from('tenants')
       .select(
-        '*, units(rent_amount, due_day_of_month, unit_name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number))'
+        '*, units(rent_amount, due_day_of_month, unit_name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_description))'
       )
       .eq('landlord_id', landlordId)
       .eq('is_active', true);
@@ -1185,7 +1185,7 @@ async function getProfile(req, res) {
 
     const { data: tenant, error } = await supabase
       .from('tenants')
-      .select('*, units(*, properties(name, rules_text, caretaker_name, caretaker_phone, primary_contact_manager_id, contact_manager:primary_contact_manager_id(full_name, phone), payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number)), landlords(full_name, phone, email, payment_method, paybill_number, paybill_account_number, till_number)')
+      .select('*, units(*, properties(name, rules_text, caretaker_name, caretaker_phone, primary_contact_manager_id, contact_manager:primary_contact_manager_id(full_name, phone), payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_description)), landlords(full_name, phone, email, payment_method, paybill_number, paybill_account_number, till_number, payment_description)')
       .eq('id', tenantId)
       .maybeSingle();
     if (error) {
@@ -2168,6 +2168,81 @@ async function getMyLandlordReputation(req, res) {
   }
 }
 
+// Phase 1 of the utility-billing rework: real invoices a tenant can
+// see and pay separately from rent (see utilitySubmetering.controller
+// finalizeRun, which is the only writer of utility_invoices rows).
+// Landlord/manager can pass ?tenantId= to view another tenant's bills;
+// a tenant can only ever see their own.
+async function getUtilityInvoices(req, res) {
+  try {
+    const tenantId = req.user.role === 'tenant' ? req.user.id : req.query.tenantId;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required.' });
+
+    if (req.user.role !== 'tenant') {
+      const { data: tenant } = await supabase.from('tenants').select('id, landlord_id').eq('id', tenantId).maybeSingle();
+      if (!tenant) return res.status(404).json({ error: 'Tenant not found.' });
+      if (effectiveLandlordId(req) !== tenant.landlord_id) return res.status(403).json({ error: 'Not authorized for this tenant.' });
+    }
+
+    const { data: invoices, error } = await supabase
+      .from('utility_invoices')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const byType = {};
+    for (const inv of invoices || []) {
+      if (!byType[inv.utility_type]) byType[inv.utility_type] = { utilityType: inv.utility_type, totalOwed: 0, invoices: [] };
+      byType[inv.utility_type].invoices.push(inv);
+      if (inv.status !== 'paid') byType[inv.utility_type].totalOwed += Number(inv.amount) - Number(inv.amount_paid || 0);
+    }
+    for (const key of Object.keys(byType)) byType[key].totalOwed = Math.round(byType[key].totalOwed * 100) / 100;
+
+    return res.json({ invoices, byType: Object.values(byType) });
+  } catch (err) {
+    logger.error('[tenant] getUtilityInvoices error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load utility invoices.' });
+  }
+}
+
+// Combined rent + utility totals for the tenant portal's "you owe
+// rent + water + electricity = X" bottom line. Rent and each utility
+// type stay fully independent numbers - this just adds them up for
+// display, it never merges the underlying balances.
+async function getAccountSummary(req, res) {
+  try {
+    const tenantId = req.user.id;
+    const { data: tenant, error } = await supabase.from('tenants').select('balance_due').eq('id', tenantId).maybeSingle();
+    if (error) throw error;
+    if (!tenant) return res.status(404).json({ error: 'Tenant not found.' });
+
+    const { data: invoices, error: invErr } = await supabase
+      .from('utility_invoices')
+      .select('utility_type, amount, amount_paid, status')
+      .eq('tenant_id', tenantId)
+      .neq('status', 'paid');
+    if (invErr) throw invErr;
+
+    const byType = {};
+    for (const inv of invoices || []) {
+      const owed = Math.round((Number(inv.amount) - Number(inv.amount_paid || 0)) * 100) / 100;
+      byType[inv.utility_type] = Math.round(((byType[inv.utility_type] || 0) + owed) * 100) / 100;
+    }
+
+    const rentOwed = Math.max(0, Number(tenant.balance_due) || 0);
+    const utilitiesTotal = Object.values(byType).reduce((a, b) => a + b, 0);
+    const totalOwed = Math.round((rentOwed + utilitiesTotal) * 100) / 100;
+
+    return res.json({ rentOwed, utilities: byType, totalOwed });
+  } catch (err) {
+    logger.error('[tenant] getAccountSummary error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load account summary.' });
+  }
+}
+
 module.exports = {
   addTenant,
   deleteTenant,
@@ -2199,6 +2274,8 @@ module.exports = {
   flagTenantRating,
   listTenantReputations,
   rateLandlord,
+  getUtilityInvoices,
+  getAccountSummary,
   getMyLandlordReputation,
   getMyReputationAsLandlord,
   listRateableStaff,

@@ -23,6 +23,7 @@
 
 const supabase = require('../config/supabase');
 const logger = require('../utils/logger');
+const { captureException } = require('./sentry.service');
 const { normalizePhoneOrThrow } = require('../utils/phone');
 const {
   resolveVerificationToken,
@@ -82,11 +83,22 @@ async function submitPaymentDetails({ verificationToken, mpesaNumber, submittedN
   }
 
   // Close the submission channel permanently - automatic, no admin step.
-  await supabase
+  // This MUST succeed, or the BA silently becomes ineligible for the
+  // edit/correction flow forever (findEligibleBa('edit') requires this
+  // to be set) even though their submission is genuinely on file - so
+  // any failure here is logged loudly and reported, never swallowed.
+  const { error: stampErr } = await supabase
     .from('brand_ambassadors')
     .update({ payout_submission_used_at: new Date().toISOString() })
     .eq('id', ba.id)
     .is('payout_submission_used_at', null);
+  if (stampErr) {
+    logger.error(
+      `[baPaymentSubmission] CRITICAL: failed to stamp payout_submission_used_at for ba ${ba.id} after successful submission - they will be unable to use the correction link until this is fixed manually:`,
+      stampErr.message
+    );
+    captureException(stampErr);
+  }
 
   await markVerificationConsumed(otpRecordId);
 

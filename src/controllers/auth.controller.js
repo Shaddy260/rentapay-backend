@@ -2342,7 +2342,7 @@ async function getPaymentMethodForViewer(req, res) {
     const { propertyId } = req.query;
     const { data: landlord, error } = await supabase
       .from('landlords')
-      .select('payment_method, paybill_number, paybill_account_number, till_number, stk_phone_number')
+      .select('payment_method, paybill_number, paybill_account_number, till_number, stk_phone_number, payment_description')
       .eq('id', landlordId)
       .single();
     if (error || !landlord) return res.status(404).json({ error: 'Account not found.' });
@@ -2351,7 +2351,7 @@ async function getPaymentMethodForViewer(req, res) {
     if (propertyId) {
       const { data } = await supabase
         .from('properties')
-        .select('payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number')
+        .select('payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description')
         .eq('id', propertyId)
         .eq('landlord_id', landlordId)
         .maybeSingle();
@@ -2365,6 +2365,7 @@ async function getPaymentMethodForViewer(req, res) {
       paybill_account_number: property.payment_override_paybill_account_number,
       till_number: property.payment_override_till_number,
       stk_phone_number: property.payment_override_stk_phone_number,
+      description: property.payment_override_description,
     } : landlord;
 
     return res.json({
@@ -2374,6 +2375,10 @@ async function getPaymentMethodForViewer(req, res) {
         accountNumber: (overridden ? source.paybill_account_number : landlord.paybill_account_number) || '',
         tillNumber: (overridden ? source.till_number : landlord.till_number) || '',
         stkPhoneNumber: (overridden ? source.stk_phone_number : landlord.stk_phone_number) || '',
+        // Free-text note shown to the tenant when they tap Pay Rent /
+        // Pay <utility>, e.g. "Rent due by the 5th; water billed
+        // separately." Same override precedence as everything else.
+        description: (overridden ? source.description : landlord.payment_description) || '',
         isApartmentSpecific: overridden,
       },
     });
@@ -2513,7 +2518,7 @@ async function updateMyContact(req, res) {
 async function updatePaymentMethod(req, res) {
   try {
     const landlordId = effectiveLandlordId(req);
-    const { method, paybillNumber, accountNumber, tillNumber, stkPhoneNumber, propertyId, useDefault } = req.body;
+    const { method, paybillNumber, accountNumber, tillNumber, stkPhoneNumber, description, propertyId, useDefault } = req.body;
 
     if (!useDefault && !['stk', 'paybill', 'till'].includes(method)) {
       return res.status(400).json({ error: "method must be 'stk', 'paybill', or 'till'." });
@@ -2543,7 +2548,7 @@ async function updatePaymentMethod(req, res) {
       if (!property) return res.status(404).json({ error: 'Apartment not found on your account.' });
       propertyName = property.name;
 
-      const { data: landlordRow } = await supabase.from('landlords').select('payment_method, paybill_number, paybill_account_number, till_number').eq('id', landlordId).single();
+      const { data: landlordRow } = await supabase.from('landlords').select('payment_method, paybill_number, paybill_account_number, till_number, payment_description').eq('id', landlordId).single();
       previousLabel = property.payment_override_enabled
         ? methodLabel(property.payment_override_method, property.payment_override_paybill_number, property.payment_override_paybill_account_number, property.payment_override_till_number)
         : `${methodLabel(landlordRow.payment_method, landlordRow.paybill_number, landlordRow.paybill_account_number, landlordRow.till_number)} (account default)`;
@@ -2562,6 +2567,7 @@ async function updatePaymentMethod(req, res) {
             payment_override_paybill_account_number: accountNumber || null,
             payment_override_till_number: tillNumber || null,
             payment_override_stk_phone_number: stkPhoneNumber || null,
+            payment_override_description: description !== undefined ? (description || null) : undefined,
           })
           .eq('id', propertyId);
         if (error) throw error;
@@ -2584,6 +2590,7 @@ async function updatePaymentMethod(req, res) {
           paybill_account_number: accountNumber || null,
           till_number: tillNumber || null,
           stk_phone_number: stkPhoneNumber || null,
+          payment_description: description !== undefined ? (description || null) : undefined,
         })
         .eq('id', landlordId);
       if (error) throw error;

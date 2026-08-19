@@ -24,7 +24,7 @@ const logger = require('../utils/logger');
 const { captureException } = require('../services/sentry.service');
 const { logActivity } = require('../services/activityLog.service');
 const { notify } = require('../services/notify.service');
-const { checkLandlordOwnership, checkManagerPropertyAccess, effectiveLandlordId } = require('../middleware/auth.middleware');
+const { checkLandlordOwnership, checkManagerPropertyAccess, effectiveLandlordId, getManagerAssignedPropertyIds } = require('../middleware/auth.middleware');
 const svc = require('../services/utilitySubmetering.service');
 
 const MONTH_KEY_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -66,6 +66,22 @@ async function createMeter(req, res) {
     const foreignUnit = (units || []).find((u) => u.landlord_id !== landlordId);
     if (foreignUnit) return res.status(403).json({ error: 'One or more units do not belong to your account.' });
 
+    // Property-scoping guard: a meter must cover units from exactly
+    // one property. Without this, a manager/landlord with multiple
+    // properties could accidentally mix units from two different
+    // properties into one meter via a stale/incorrect unitIds list.
+    const distinctProperties = [...new Set((units || []).map((u) => u.property_id))];
+    if (distinctProperties.length > 1) {
+      return res.status(400).json({ error: 'All units on a meter must belong to the same property.' });
+    }
+    if (propertyId && distinctProperties[0] && propertyId !== distinctProperties[0]) {
+      return res.status(400).json({ error: 'unitIds do not belong to the given propertyId.' });
+    }
+    if (req.user.role === 'manager') {
+      const propertyAccessError = await checkManagerPropertyAccess(req, propertyId || distinctProperties[0]);
+      if (propertyAccessError) return res.status(propertyAccessError.statusCode).json(propertyAccessError);
+    }
+
     const { role, id } = currentActor(req);
     const { data: meter, error } = await supabase
       .from('utility_meters')
@@ -98,14 +114,245 @@ async function createMeter(req, res) {
   }
 }
 
+// Bulk-create individual (non-shared) meters, one per unit, in a
+// single call - for the common case where a landlord has individual
+// water/electricity meters for every unit in a property and doesn't
+// want to repeat the "Add a meter" form once per unit.
+//
+// Every meter created this way shares the same utilityType and
+// ratePerUnit (the landlord can edit any one of them individually
+// afterwards via updateMeter if a specific unit's rate/label needs to
+// differ). Labels are auto-generated from each unit's name unless a
+// per-unit label override is supplied.
+async function bulkCreateMeters(req, res) {
+  try {
+    const { propertyId, utilityType, ratePerUnit, units } = req.body;
+    if (!utilityType || !['water', 'electricity'].includes(utilityType)) {
+      return res.status(400).json({ error: "A valid utilityType ('water' or 'electricity') is required." });
+    }
+    if (ratePerUnit == null || Number(ratePerUnit) <= 0) {
+      return res.status(400).json({ error: 'ratePerUnit must be a positive number.' });
+    }
+    // units: [{ unitId, label? }] - label optional, falls back to
+    // "<unit name> - <utility type>".
+    if (!Array.isArray(units) || units.length === 0) {
+      return res.status(400).json({ error: 'units is required - at least one { unitId } entry.' });
+    }
+
+    const landlordId = await effectiveLandlordId(req);
+    const unitIds = units.map((u) => u.unitId).filter(Boolean);
+    if (unitIds.length !== units.length) {
+      return res.status(400).json({ error: 'Every entry in units must include a unitId.' });
+    }
+
+    const { data: unitRows, error: unitsErr } = await supabase
+      .from('units')
+      .select('id, landlord_id, property_id, unit_name')
+      .in('id', unitIds);
+    if (unitsErr) throw unitsErr;
+    const missing = unitIds.filter((id) => !(unitRows || []).some((u) => u.id === id));
+    if (missing.length > 0) return res.status(404).json({ error: 'One or more units were not found.' });
+    const foreignUnit = (unitRows || []).find((u) => u.landlord_id !== landlordId);
+    if (foreignUnit) return res.status(403).json({ error: 'One or more units do not belong to your account.' });
+
+    // Skip units that already have an individual meter of this exact
+    // utility type - never silently create a duplicate meter for a
+    // unit that's already covered.
+    const { data: existingLinks, error: existingErr } = await supabase
+      .from('utility_meter_units')
+      .select('unit_id, utility_meters!inner(utility_type, is_shared, landlord_id)')
+      .in('unit_id', unitIds)
+      .eq('utility_meters.utility_type', utilityType)
+      .eq('utility_meters.is_shared', false)
+      .eq('utility_meters.landlord_id', landlordId);
+    if (existingErr) throw existingErr;
+    const alreadyCoveredUnitIds = new Set((existingLinks || []).map((l) => l.unit_id));
+
+    const { role, id } = currentActor(req);
+    const toCreate = units.filter((u) => !alreadyCoveredUnitIds.has(u.unitId));
+    const skipped = units
+      .filter((u) => alreadyCoveredUnitIds.has(u.unitId))
+      .map((u) => (unitRows.find((row) => row.id === u.unitId) || {}).unit_name || u.unitId);
+
+    const created = [];
+    for (const u of toCreate) {
+      const unitRow = unitRows.find((row) => row.id === u.unitId);
+      const label = (u.label && u.label.trim()) || `${unitRow?.unit_name || 'Unit'} - ${utilityType}`;
+
+      const { data: meter, error } = await supabase
+        .from('utility_meters')
+        .insert({
+          landlord_id: landlordId,
+          property_id: propertyId || unitRow?.property_id || null,
+          label,
+          utility_type: utilityType,
+          is_shared: false,
+          rate_per_unit: Number(ratePerUnit),
+          created_by_role: role,
+          created_by_id: id,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+
+      const { error: linkErr } = await supabase.from('utility_meter_units').insert({ meter_id: meter.id, unit_id: u.unitId });
+      if (linkErr) throw linkErr;
+
+      created.push(meter);
+    }
+
+    if (created.length > 0) {
+      logActivity({
+        actorType: role,
+        actorId: id,
+        action: 'utility_meters_bulk_created',
+        targetType: 'utility_meter',
+        metadata: { utilityType, count: created.length, skippedCount: skipped.length },
+      });
+    }
+
+    return res.status(201).json({
+      meters: created,
+      createdCount: created.length,
+      skipped, // unit names that already had a meter of this type - not touched
+    });
+  } catch (err) {
+    logger.error('[utilitySubmetering] bulkCreateMeters error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to create meters.' });
+  }
+}
+
+// Edit an existing meter's label, rate, utility type, shared flag, or
+// which unit(s) it covers. Every field is optional - only what's
+// passed gets changed. Switching is_shared true<->false requires
+// unitIds to be supplied too (single-unit lists forced back to
+// exactly one unit when un-sharing).
+async function updateMeter(req, res) {
+  try {
+    const { meterId } = req.params;
+    const { label, ratePerUnit, utilityType, isShared, unitIds } = req.body;
+
+    const meter = await getMeterOr404(meterId);
+    const accessError = await assertMeterAccess(req, meter);
+    if (accessError) return res.status(accessError.statusCode).json(accessError);
+
+    if (utilityType != null && !['water', 'electricity'].includes(utilityType)) {
+      return res.status(400).json({ error: "utilityType must be 'water' or 'electricity'." });
+    }
+    if (ratePerUnit != null && Number(ratePerUnit) <= 0) {
+      return res.status(400).json({ error: 'ratePerUnit must be a positive number.' });
+    }
+
+    const nextIsShared = isShared != null ? !!isShared : meter.is_shared;
+    if (unitIds != null) {
+      if (!Array.isArray(unitIds) || unitIds.length === 0) {
+        return res.status(400).json({ error: 'unitIds must be a non-empty array.' });
+      }
+      if (!nextIsShared && unitIds.length !== 1) {
+        return res.status(400).json({ error: 'An individual (non-shared) meter must cover exactly one unit.' });
+      }
+      const landlordId = await effectiveLandlordId(req);
+      const { data: units, error: unitsErr } = await supabase.from('units').select('id, landlord_id').in('id', unitIds);
+      if (unitsErr) throw unitsErr;
+      const missing = unitIds.filter((uid) => !(units || []).some((u) => u.id === uid));
+      if (missing.length > 0) return res.status(404).json({ error: 'One or more units were not found.' });
+      const foreignUnit = (units || []).find((u) => u.landlord_id !== landlordId);
+      if (foreignUnit) return res.status(403).json({ error: 'One or more units do not belong to your account.' });
+    }
+
+    const patch = {};
+    if (label != null) patch.label = label;
+    if (ratePerUnit != null) patch.rate_per_unit = Number(ratePerUnit);
+    if (utilityType != null) patch.utility_type = utilityType;
+    if (isShared != null) patch.is_shared = !!isShared;
+
+    if (Object.keys(patch).length > 0) {
+      const { error } = await supabase.from('utility_meters').update(patch).eq('id', meterId);
+      if (error) throw error;
+    }
+
+    if (unitIds != null) {
+      const { error: delErr } = await supabase.from('utility_meter_units').delete().eq('meter_id', meterId);
+      if (delErr) throw delErr;
+      const { error: insErr } = await supabase.from('utility_meter_units').insert(unitIds.map((unitId) => ({ meter_id: meterId, unit_id: unitId })));
+      if (insErr) throw insErr;
+    }
+
+    const { data: updated, error: fetchErr } = await supabase
+      .from('utility_meters')
+      .select('*, utility_meter_units(unit_id, units(unit_name))')
+      .eq('id', meterId)
+      .single();
+    if (fetchErr) throw fetchErr;
+
+    const { role, id } = currentActor(req);
+    logActivity({ actorType: role, actorId: id, action: 'utility_meter_updated', targetType: 'utility_meter', targetId: meterId, metadata: patch });
+
+    return res.json({ meter: updated });
+  } catch (err) {
+    logger.error('[utilitySubmetering] updateMeter error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to update meter.' });
+  }
+}
+
+// Permanently remove a meter that has never had any readings
+// submitted against it - e.g. cleaning up a duplicate created by
+// mistake. Meters with reading history can't be deleted (their
+// numbers may already be reflected in past invoices); edit them
+// instead.
+async function deleteMeter(req, res) {
+  try {
+    const { meterId } = req.params;
+    const meter = await getMeterOr404(meterId);
+    const accessError = await assertMeterAccess(req, meter);
+    if (accessError) return res.status(accessError.statusCode).json(accessError);
+
+    const { data: anyReading } = await supabase.from('utility_readings').select('id').eq('meter_id', meterId).limit(1).maybeSingle();
+    if (anyReading) {
+      return res.status(409).json({ error: 'This meter already has readings on file and cannot be deleted. Edit it instead if something needs to change.' });
+    }
+
+    const { error: linkErr } = await supabase.from('utility_meter_units').delete().eq('meter_id', meterId);
+    if (linkErr) throw linkErr;
+    const { error } = await supabase.from('utility_meters').delete().eq('id', meterId);
+    if (error) throw error;
+
+    const { role, id } = currentActor(req);
+    logActivity({ actorType: role, actorId: id, action: 'utility_meter_deleted', targetType: 'utility_meter', targetId: meterId });
+
+    return res.json({ deleted: true });
+  } catch (err) {
+    logger.error('[utilitySubmetering] deleteMeter error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to delete meter.' });
+  }
+}
+
 async function listMeters(req, res) {
   try {
     const landlordId = await effectiveLandlordId(req);
-    const { data, error } = await supabase
+    // Managers are scoped to whichever property they're assigned to -
+    // never show them a cross-property picker or another property's
+    // meters. A landlord with multiple properties must pass
+    // ?propertyId= explicitly (each property's dashboard supplies its
+    // own id); with none given, a landlord sees everything they own,
+    // same as before this change.
+    let propertyId = req.query.propertyId || null;
+    if (req.user.role === 'manager' && !propertyId) {
+      const assignedIds = await getManagerAssignedPropertyIds(req.user.id);
+      if (assignedIds && assignedIds.length === 1) propertyId = assignedIds[0];
+    }
+
+    let query = supabase
       .from('utility_meters')
       .select('*, utility_meter_units(unit_id, units(unit_name))')
       .eq('landlord_id', landlordId)
       .order('created_at', { ascending: false });
+    if (propertyId) query = query.eq('property_id', propertyId);
+
+    const { data, error } = await query;
     if (error) throw error;
     return res.json({ meters: data || [] });
   } catch (err) {
@@ -136,114 +383,146 @@ async function assertMeterAccess(req, meter) {
 // SECTION 1 + 2 - submit a reading (or the first-ever baseline).
 // ---------------------------------------------------------------------
 
-async function submitReading(req, res) {
-  try {
-    const { meterId } = req.params;
-    const { monthKey, readingValue, photoUrl, isBaseline } = req.body;
+// Core of Section 1+2+3, factored out so both the single-meter HTTP
+// handler (submitReading) and the bulk handler (bulkSubmitReadings)
+// share one code path - no duplicated business logic to drift apart.
+// Throws { statusCode, error } for anything that should map to a
+// non-500 HTTP response; anything else propagates as a real error.
+async function submitReadingCore(req, { meterId, monthKey, readingValue, photoUrl, isBaseline, previousReadingValue }) {
+  if (!monthKey || !MONTH_KEY_RE.test(monthKey)) {
+    throw { statusCode: 400, error: 'monthKey is required in YYYY-MM format.' };
+  }
+  if (readingValue == null || Number.isNaN(Number(readingValue))) {
+    throw { statusCode: 400, error: 'readingValue is required and must be a number.' };
+  }
 
-    if (!monthKey || !MONTH_KEY_RE.test(monthKey)) {
-      return res.status(400).json({ error: 'monthKey is required in YYYY-MM format.' });
-    }
-    if (readingValue == null || Number.isNaN(Number(readingValue))) {
-      return res.status(400).json({ error: 'readingValue is required and must be a number.' });
-    }
-    // DIRECT REQUEST: photo proof is optional, not mandatory, for any
-    // reading (baseline or otherwise). photo_url is simply null if
-    // omitted - not blocking here anymore.
+  const meter = await getMeterOr404(meterId);
+  const accessError = await assertMeterAccess(req, meter);
+  if (accessError) throw { statusCode: accessError.statusCode, error: accessError.error };
 
-    const meter = await getMeterOr404(meterId);
-    const accessError = await assertMeterAccess(req, meter);
-    if (accessError) return res.status(accessError.statusCode).json(accessError);
+  const { data: existing } = await supabase
+    .from('utility_readings')
+    .select('id')
+    .eq('meter_id', meterId)
+    .eq('month_key', monthKey)
+    .maybeSingle();
+  if (existing) {
+    throw { statusCode: 409, error: `A reading has already been submitted for this meter for ${monthKey}. Use the correction flow if it needs to change.` };
+  }
 
-    // SECTION 1 - duplicate protection: one reading per meter+month, full stop.
-    const { data: existing } = await supabase
-      .from('utility_readings')
-      .select('id')
-      .eq('meter_id', meterId)
-      .eq('month_key', monthKey)
-      .maybeSingle();
-    if (existing) {
-      return res.status(409).json({ error: `A reading has already been submitted for this meter for ${monthKey}. Use the correction flow if it needs to change.` });
-    }
+  const { role, id } = currentActor(req);
 
-    const { role, id } = currentActor(req);
+  const { data: anyPrior } = await supabase.from('utility_readings').select('id').eq('meter_id', meterId).limit(1).maybeSingle();
+  const isFirstEverReading = !anyPrior;
 
-    // SECTION 2 - if this meter has no history at all, the very first
-    // submission is treated as the baseline: no usage/amount computed,
-    // it just becomes the reference point for next month.
-    const { data: anyPrior } = await supabase.from('utility_readings').select('id').eq('meter_id', meterId).limit(1).maybeSingle();
-    const treatAsBaseline = !!isBaseline || !anyPrior;
+  // First reading ever taken on this meter, and the caller hasn't
+  // told us what the meter read before now: don't silently record it
+  // as a zero-usage baseline. Ask for the previous reading instead so
+  // we can bill usage from day one. The frontend shows this as an
+  // inline "what did the meter read before this?" prompt.
+  if (isFirstEverReading && !isBaseline && (previousReadingValue == null || previousReadingValue === '')) {
+    return {
+      statusCode: 200,
+      body: {
+        needsPreviousReading: true,
+        message: 'This meter has no reading on file yet. Enter the previous reading before this one so usage can be billed straight away.',
+      },
+    };
+  }
 
-    if (treatAsBaseline) {
-      const { data: reading, error } = await supabase
-        .from('utility_readings')
-        .insert({
-          meter_id: meterId,
-          month_key: monthKey,
-          reading_value: Number(readingValue),
-          photo_url: photoUrl || null,
-          is_baseline: true,
-          submitted_by_role: role,
-          submitted_by_id: id,
-          status: 'submitted',
-        })
-        .select()
-        .single();
-      if (error) throw error;
-      logActivity({ actorType: role, actorId: id, action: 'utility_baseline_set', targetType: 'utility_meter', targetId: meterId, metadata: { monthKey, readingValue } });
-      return res.status(201).json({ reading, isBaseline: true, message: 'Baseline reading recorded. Usage will be calculated from next month\'s reading.' });
-    }
-
-    // SECTION 3 - a real month-over-month reading: needs a previous
-    // reading to calculate against (guaranteed to exist here, since
-    // treatAsBaseline above already handled the no-history case).
-    const previous = await svc.getPreviousReading(meterId, monthKey);
-    if (!previous) {
-      return res.status(400).json({ error: 'No baseline/previous reading exists for this meter yet. Submit a baseline reading first.' });
-    }
-
-    let usage = null;
-    let anomalyFlag = false;
-    let anomalyReason = null;
-
-    if (!meter.is_shared) {
-      const calc = svc.calculateIndividualUsage(readingValue, previous.reading_value, meter.rate_per_unit);
-      usage = calc.usage;
-      const anomaly = await svc.detectAnomaly(meterId, usage);
-      anomalyFlag = anomaly.anomaly;
-      anomalyReason = anomaly.reason;
-    } else {
-      // SECTION 5 - shared meters: total usage is still new-minus-
-      // previous at the meter level; the per-unit split happens later
-      // on the review screen (Section 6), not at submission time.
-      usage = Number(readingValue) - Number(previous.reading_value);
-      const anomaly = await svc.detectAnomaly(meterId, usage);
-      anomalyFlag = anomaly.anomaly;
-      anomalyReason = anomaly.reason;
-    }
-
+  // Explicit baseline entry (no prior reading to bill against at all,
+  // e.g. a brand-new installation) - record it and wait for next month.
+  if (isBaseline) {
     const { data: reading, error } = await supabase
       .from('utility_readings')
       .insert({
         meter_id: meterId,
         month_key: monthKey,
         reading_value: Number(readingValue),
-        photo_url: photoUrl,
-        is_baseline: false,
+        photo_url: photoUrl || null,
+        is_baseline: true,
         submitted_by_role: role,
         submitted_by_id: id,
-        usage_amount: usage,
-        anomaly_flag: anomalyFlag,
-        anomaly_reason: anomalyReason,
         status: 'submitted',
       })
       .select()
       .single();
     if (error) throw error;
+    await supabase.from('utility_meters').update({ awaiting_previous_reading: false }).eq('id', meterId);
+    logActivity({ actorType: role, actorId: id, action: 'utility_baseline_set', targetType: 'utility_meter', targetId: meterId, metadata: { monthKey, readingValue } });
+    return { statusCode: 201, body: { reading, isBaseline: true, message: 'Baseline reading recorded. Usage will be calculated from next month\'s reading.' } };
+  }
 
-    logActivity({ actorType: role, actorId: id, action: 'utility_reading_submitted', targetType: 'utility_meter', targetId: meterId, metadata: { monthKey, readingValue, usage, anomalyFlag } });
+  // First-ever reading WITH a previous reading supplied: file the
+  // previous reading as a baseline dated one month earlier, so the
+  // usual getPreviousReading() lookup finds it and this month bills
+  // normally - no special-cased usage math needed below.
+  if (isFirstEverReading && previousReadingValue != null && previousReadingValue !== '') {
+    if (Number.isNaN(Number(previousReadingValue))) {
+      throw { statusCode: 400, error: 'previousReadingValue must be a number.' };
+    }
+    const priorMonthKey = svc.decrementMonthKey(monthKey);
+    const { error: priorErr } = await supabase
+      .from('utility_readings')
+      .insert({
+        meter_id: meterId,
+        month_key: priorMonthKey,
+        reading_value: Number(previousReadingValue),
+        is_baseline: true,
+        submitted_by_role: role,
+        submitted_by_id: id,
+        status: 'submitted',
+      });
+    if (priorErr) throw priorErr;
+    await supabase.from('utility_meters').update({ awaiting_previous_reading: false }).eq('id', meterId);
+  }
 
-    return res.status(201).json({
+  const previous = await svc.getPreviousReading(meterId, monthKey);
+  if (!previous) {
+    throw { statusCode: 400, error: 'No baseline/previous reading exists for this meter yet. Submit a baseline reading first.' };
+  }
+
+  let usage = null;
+  let anomalyFlag = false;
+  let anomalyReason = null;
+
+  if (!meter.is_shared) {
+    const calc = svc.calculateIndividualUsage(readingValue, previous.reading_value, meter.rate_per_unit);
+    usage = calc.usage;
+    const anomaly = await svc.detectAnomaly(meterId, usage);
+    anomalyFlag = anomaly.anomaly;
+    anomalyReason = anomaly.reason;
+  } else {
+    usage = Number(readingValue) - Number(previous.reading_value);
+    const anomaly = await svc.detectAnomaly(meterId, usage);
+    anomalyFlag = anomaly.anomaly;
+    anomalyReason = anomaly.reason;
+  }
+
+  const { data: reading, error } = await supabase
+    .from('utility_readings')
+    .insert({
+      meter_id: meterId,
+      month_key: monthKey,
+      reading_value: Number(readingValue),
+      photo_url: photoUrl,
+      is_baseline: false,
+      submitted_by_role: role,
+      submitted_by_id: id,
+      usage_amount: usage,
+      anomaly_flag: anomalyFlag,
+      anomaly_reason: anomalyReason,
+      status: 'submitted',
+    })
+    .select()
+    .single();
+  if (error) throw error;
+
+  logActivity({ actorType: role, actorId: id, action: 'utility_reading_submitted', targetType: 'utility_meter', targetId: meterId, metadata: { monthKey, readingValue, usage, anomalyFlag } });
+
+  return {
+    statusCode: 201,
+    body: {
       reading,
       isBaseline: false,
       usage,
@@ -251,11 +530,72 @@ async function submitReading(req, res) {
       message: anomalyFlag
         ? 'Reading submitted, but this looks unusual - please double check it on the review screen.'
         : 'Reading submitted. Continue to the review screen to finalize billing.',
-    });
+    },
+  };
+}
+
+async function submitReading(req, res) {
+  try {
+    const { meterId } = req.params;
+    const { monthKey, readingValue, photoUrl, isBaseline, previousReadingValue } = req.body;
+    const result = await submitReadingCore(req, { meterId, monthKey, readingValue, photoUrl, isBaseline, previousReadingValue });
+    return res.status(result.statusCode).json(result.body);
   } catch (err) {
+    if (err && err.statusCode) return res.status(err.statusCode).json({ error: err.error });
     logger.error('[utilitySubmetering] submitReading error:', err.message);
     captureException(err);
     return res.status(500).json({ error: 'Failed to submit reading.' });
+  }
+}
+
+// Submit readings for several meters at once (e.g. a caretaker
+// walking the whole property and entering every unit's reading in one
+// screen). Each entry is processed independently through the exact
+// same core logic as the single-meter endpoint, so per-meter baseline
+// detection, duplicate protection, and anomaly detection all behave
+// identically - a failure on one meter (e.g. a duplicate for that
+// month) never blocks or rolls back the others.
+async function bulkSubmitReadings(req, res) {
+  try {
+    const { monthKey, readings } = req.body;
+    if (!monthKey || !MONTH_KEY_RE.test(monthKey)) {
+      return res.status(400).json({ error: 'monthKey is required in YYYY-MM format.' });
+    }
+    if (!Array.isArray(readings) || readings.length === 0) {
+      return res.status(400).json({ error: 'readings is required - at least one { meterId, readingValue } entry.' });
+    }
+
+    const results = [];
+    for (const entry of readings) {
+      const { meterId, readingValue, photoUrl, isBaseline, previousReadingValue } = entry;
+      if (!meterId) {
+        results.push({ meterId: null, ok: false, error: 'Missing meterId.' });
+        continue;
+      }
+      try {
+        const result = await submitReadingCore(req, { meterId, monthKey, readingValue, photoUrl, isBaseline, previousReadingValue });
+        results.push({ meterId, ok: true, ...result.body });
+      } catch (err) {
+        if (err && err.statusCode) {
+          results.push({ meterId, ok: false, error: err.error });
+        } else {
+          logger.error(`[utilitySubmetering] bulkSubmitReadings meter ${meterId} error:`, err.message);
+          captureException(err);
+          results.push({ meterId, ok: false, error: 'Failed to submit this reading.' });
+        }
+      }
+    }
+
+    const succeeded = results.filter((r) => r.ok).length;
+    return res.status(207).json({
+      results,
+      succeeded,
+      failed: results.length - succeeded,
+    });
+  } catch (err) {
+    logger.error('[utilitySubmetering] bulkSubmitReadings error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to submit readings.' });
   }
 }
 
@@ -559,12 +899,31 @@ async function finalizeRun(req, res) {
         .maybeSingle();
       if (!tenant) continue; // shouldn't happen (occupied units only reach here), but never fail the whole run over one missing record
 
-      const newBalance = Math.round((Number(tenant.balance_due || 0) + Number(row.final_amount)) * 100) / 100;
-      const { error: balErr } = await supabase.from('tenants').update({ balance_due: newBalance }).eq('id', tenant.id);
-      if (balErr) throw balErr;
+      // Phase 2: utility charges are billed as their own invoice only
+      // - they no longer touch tenants.balance_due, which is rent-only
+      // from this point forward. This is the change that makes "pay
+      // water" and "pay rent" independent in the tenant portal.
+      // Real, queryable invoice - not just an SMS - so the tenant
+      // portal can render it under the payment banner and let the
+      // tenant pay it as its own line item (separate from rent).
+      const { error: invoiceErr } = await supabase.from('utility_invoices').insert({
+        tenant_id: tenant.id,
+        unit_id: row.unit_id,
+        landlord_id: meter.landlord_id,
+        meter_id: meter.id,
+        run_id: run.id,
+        run_unit_id: row.id,
+        utility_type: meter.utility_type,
+        month_key: run.month_key,
+        usage_amount: meter.is_shared ? null : run.total_usage,
+        rate_per_unit: meter.rate_per_unit,
+        amount: row.final_amount,
+        status: 'unpaid',
+      });
+      if (invoiceErr) throw invoiceErr;
 
       try {
-        await notify('tenant', tenant.id, tenant.primary_phone || tenant.phone, `A ${meter.utility_type} utility charge of KES ${Number(row.final_amount).toLocaleString()} has been added to your upcoming RentaPay invoice.`);
+        await notify('tenant', tenant.id, tenant.primary_phone || tenant.phone, `Your ${meter.utility_type} bill for ${run.month_key} is KES ${Number(row.final_amount).toLocaleString()}. It's been added to your RentaPay account as a separate invoice from rent - open the app to view and pay it.`);
       } catch (notifyErr) {
         logger.error('[utilitySubmetering] finalizeRun: notify failed for tenant', tenant.id, notifyErr.message);
       }
@@ -589,8 +948,12 @@ async function finalizeRun(req, res) {
 
 module.exports = {
   createMeter,
+  bulkCreateMeters,
+  updateMeter,
+  deleteMeter,
   listMeters,
   submitReading,
+  bulkSubmitReadings,
   listReadings,
   correctReading,
   getReadingCorrections,

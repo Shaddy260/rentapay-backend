@@ -161,6 +161,7 @@ async function deleteExpense(id) {
 
 module.exports = {
   monthKey,
+  expensesForMonth,
   getMonthlyOverview,
   addExpense,
   stopExpense,

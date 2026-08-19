@@ -117,6 +117,63 @@ async function initiateRentSTKPush(req, res) {
 }
 
 // ---------------------------------------------------------------------
+// INITIATE STK PUSH FOR A UTILITY BILL - same mechanism as rent, but
+// against a specific utility_invoices row instead of the tenant's
+// rent balance. handleSTKCallback below routes the resulting
+// payments.target_type='utility' row to the right invoice.
+// ---------------------------------------------------------------------
+async function initiateUtilityStkPush(req, res) {
+  try {
+    const tenantId = req.user.id;
+    const { invoiceId } = req.body;
+    if (!invoiceId) return res.status(400).json({ error: 'invoiceId is required.' });
+
+    const { data: invoice, error: invErr } = await supabase.from('utility_invoices').select('*').eq('id', invoiceId).maybeSingle();
+    if (invErr) throw invErr;
+    if (!invoice || invoice.tenant_id !== tenantId) return res.status(404).json({ error: 'Utility invoice not found.' });
+    if (invoice.status === 'paid') return res.status(409).json({ error: 'This bill has already been paid.' });
+
+    const owed = Math.round((Number(invoice.amount) - Number(invoice.amount_paid || 0)) * 100) / 100;
+    const { data: tenant, error } = await supabase.from('tenants').select('*, units(unit_payment_code)').eq('id', tenantId).single();
+    if (error || !tenant) return res.status(404).json({ error: 'Tenant not found.' });
+
+    const stkResponse = await initiateSTKPush({
+      phoneNumber: tenant.primary_phone,
+      amount: owed,
+      accountReference: tenant.units.unit_payment_code,
+      transactionDesc: `${invoice.utility_type} bill`,
+    });
+
+    const { data: payment, error: insertError } = await supabase
+      .from('payments')
+      .insert({
+        tenant_id: tenantId,
+        unit_id: tenant.unit_id,
+        landlord_id: tenant.landlord_id,
+        amount: owed,
+        payment_method: 'stk_push',
+        mpesa_checkout_request_id: stkResponse.CheckoutRequestID,
+        status: 'pending',
+        target_type: 'utility',
+        target_invoice_id: invoice.id,
+      })
+      .select()
+      .single();
+    if (insertError) throw insertError;
+
+    return res.json({
+      message: 'STK push sent. Enter your M-Pesa PIN to complete payment.',
+      checkoutRequestId: stkResponse.CheckoutRequestID,
+      paymentId: payment.id,
+    });
+  } catch (err) {
+    logger.error('[payment] initiateUtilityStkPush error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to initiate payment.' });
+  }
+}
+
+// ---------------------------------------------------------------------
 // SELF-HEALING PAYMENT STATUS CHECK - THE FIX for "signed up, paid,
 // but never got the verification OTP" (and the tenant-side equivalent
 // for rent payments).
@@ -372,6 +429,24 @@ async function processRentPaymentCallback(payment, resultCode, callbackMetadata)
   if (!updatedPaymentRows || updatedPaymentRows.length === 0) {
     // Already processed by another path (webhook vs. self-heal poll,
     // or Safaricom retrying the same callback) - don't double-apply.
+    return;
+  }
+
+  // Utility bill STK push (Phase 2): credits the specific invoice
+  // only, never tenants.balance_due, so rent and utility payments
+  // stay on completely independent ledgers even over M-Pesa.
+  if (payment.target_type === 'utility' && payment.target_invoice_id) {
+    const { data: invoice } = await supabase.from('utility_invoices').select('*').eq('id', payment.target_invoice_id).maybeSingle();
+    if (invoice) {
+      const newAmountPaid = Math.round((Number(invoice.amount_paid || 0) + Number(amountPaid)) * 100) / 100;
+      const newStatus = newAmountPaid >= Number(invoice.amount) ? 'paid' : 'partially_paid';
+      await supabase.from('utility_invoices').update({ amount_paid: newAmountPaid, status: newStatus, updated_at: new Date().toISOString() }).eq('id', invoice.id);
+      try {
+        await notify('tenant', payment.tenant_id, payment.tenants?.primary_phone, `Your M-Pesa payment of KES ${Number(amountPaid).toLocaleString()} for your ${invoice.utility_type} bill was received.`, { category: 'account', title: 'Bill Payment Received' });
+      } catch (notifyErr) {
+        logger.error('[payment] processRentPaymentCallback (utility): notify failed:', notifyErr.message);
+      }
+    }
     return;
   }
 
@@ -637,7 +712,7 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
 async function submitPaybillTransaction(req, res) {
   try {
     const tenantId = req.user.id;
-    const { transactionCode, amountPaid, mpesaPayerName, mpesaPayerPhone, mpesaSmsTimestamp } = req.body;
+    const { transactionCode, amountPaid, mpesaPayerName, mpesaPayerPhone, mpesaSmsTimestamp, targetInvoiceId } = req.body;
 
     if (!transactionCode || amountPaid == null || !mpesaPayerName || !mpesaPayerPhone || !mpesaSmsTimestamp) {
       return res.status(400).json({ error: 'transactionCode, amountPaid, mpesaPayerName, mpesaPayerPhone, and mpesaSmsTimestamp are required.' });
@@ -657,6 +732,26 @@ async function submitPaybillTransaction(req, res) {
       .eq('id', tenantId)
       .single();
     if (tenantErr || !tenant) return res.status(404).json({ error: 'Tenant not found.' });
+
+    // If this proof is for a specific utility bill (water/electricity)
+    // rather than rent, confirm the invoice is really this tenant's
+    // and still owed before anything is created against it.
+    let targetType = 'rent';
+    if (targetInvoiceId) {
+      const { data: invoice, error: invErr } = await supabase
+        .from('utility_invoices')
+        .select('id, tenant_id, status')
+        .eq('id', targetInvoiceId)
+        .maybeSingle();
+      if (invErr) throw invErr;
+      if (!invoice || invoice.tenant_id !== tenantId) {
+        return res.status(404).json({ error: 'Utility invoice not found for this tenant.' });
+      }
+      if (invoice.status === 'paid') {
+        return res.status(409).json({ error: 'This bill has already been marked paid.' });
+      }
+      targetType = 'utility';
+    }
 
     // Normalize the same way the landlord will see it, so a duplicate
     // typed with different spacing/casing still matches.
@@ -705,6 +800,8 @@ async function submitPaybillTransaction(req, res) {
         status: 'pending',
         duplicate_of: existingConfirmed ? existingConfirmed.id : null,
         resubmission_of: isResubmission ? mostRecent.id : null,
+        target_type: targetType,
+        target_invoice_id: targetType === 'utility' ? targetInvoiceId : null,
       })
       .select()
       .single();
@@ -898,6 +995,157 @@ async function recordManualPayment(req, res) {
     logger.error('[payment] recordManualPayment error:', err.message);
     captureException(err);
     return res.status(500).json({ error: 'Failed to record manual payment.' });
+  }
+}
+
+// ---------------------------------------------------------------------
+// LANDLORD/MANAGER MANUAL UTILITY PAYMENT ENTRY (Phase 2, item 6):
+// water/electricity bills are frequently paid separately from rent -
+// in person, over the counter, via a different paybill - so a
+// landlord/manager needs to be able to record that directly without
+// the tenant submitting proof first. Scope is either a single
+// utility_invoices row (invoiceId) or every currently-unpaid invoice
+// of one utility type across the property (propertyId + utilityType),
+// for the "one payment covered everyone's water this month" case.
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// List every currently-open (not yet fully paid) invoice of one
+// utility type across a property, so a landlord/manager can pick
+// exactly which unit's bill they're recording a payment for in
+// RecordUtilityPaymentModal.jsx. Read-only counterpart to the bulk
+// path in recordManualUtilityPayment below.
+// ---------------------------------------------------------------------
+async function listOpenUtilityInvoicesForProperty(req, res) {
+  try {
+    const landlordId = effectiveLandlordId(req);
+    const { propertyId, utilityType } = req.query;
+    if (!propertyId || !utilityType) {
+      return res.status(400).json({ error: 'propertyId and utilityType are required.' });
+    }
+
+    const { data: property, error: propErr } = await supabase
+      .from('properties')
+      .select('id')
+      .eq('id', propertyId)
+      .eq('landlord_id', landlordId)
+      .maybeSingle();
+    if (propErr) throw propErr;
+    if (!property) return res.status(404).json({ error: 'Apartment not found on your account.' });
+
+    const { data: units, error: unitsErr } = await supabase.from('units').select('id, unit_name').eq('property_id', propertyId);
+    if (unitsErr) throw unitsErr;
+    const unitIds = (units || []).map((u) => u.id);
+    const unitNameById = Object.fromEntries((units || []).map((u) => [u.id, u.unit_name]));
+
+    const { data: invoices, error } = await supabase
+      .from('utility_invoices')
+      .select('*')
+      .eq('landlord_id', landlordId)
+      .eq('utility_type', utilityType)
+      .in('unit_id', unitIds.length ? unitIds : ['00000000-0000-0000-0000-000000000000'])
+      .neq('status', 'paid')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const withUnitName = (invoices || []).map((inv) => ({ ...inv, unit_name: unitNameById[inv.unit_id] || null }));
+    return res.json({ invoices: withUnitName });
+  } catch (err) {
+    logger.error('[payment] listOpenUtilityInvoicesForProperty error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load open bills for this apartment.' });
+  }
+}
+
+async function recordManualUtilityPayment(req, res) {
+  try {
+    const landlordId = effectiveLandlordId(req);
+    const { invoiceId, propertyId, utilityType, amount, paymentDate, mpesaReference, note } = req.body;
+
+    if (!invoiceId && !(propertyId && utilityType)) {
+      return res.status(400).json({ error: 'Provide either invoiceId (one bill) or propertyId + utilityType (every unpaid bill of that type on the property).' });
+    }
+    if (!paymentDate) return res.status(400).json({ error: 'paymentDate is required.' });
+
+    let invoices = [];
+    if (invoiceId) {
+      const { data: invoice, error } = await supabase.from('utility_invoices').select('*').eq('id', invoiceId).maybeSingle();
+      if (error) throw error;
+      if (!invoice) return res.status(404).json({ error: 'Utility invoice not found.' });
+      if (invoice.landlord_id !== landlordId) return res.status(403).json({ error: 'You do not manage this invoice.' });
+      if (invoice.status === 'paid') return res.status(409).json({ error: 'This bill is already marked paid.' });
+      invoices = [invoice];
+    } else {
+      const { data: units } = await supabase.from('units').select('id').eq('property_id', propertyId);
+      const unitIds = (units || []).map((u) => u.id);
+      const { data: openInvoices, error } = await supabase
+        .from('utility_invoices')
+        .select('*')
+        .eq('landlord_id', landlordId)
+        .eq('utility_type', utilityType)
+        .in('unit_id', unitIds)
+        .neq('status', 'paid');
+      if (error) throw error;
+      invoices = openInvoices || [];
+      if (invoices.length === 0) return res.status(404).json({ error: `No unpaid ${utilityType} bills found for this property.` });
+    }
+
+    const perInvoiceAmount = amount != null ? validatePositiveAmount(amount) : null;
+    const results = [];
+    for (const invoice of invoices) {
+      const payAmount = perInvoiceAmount != null ? Math.min(perInvoiceAmount, Number(invoice.amount) - Number(invoice.amount_paid || 0)) : Number(invoice.amount) - Number(invoice.amount_paid || 0);
+      if (payAmount <= 0) continue;
+
+      const newAmountPaid = Math.round((Number(invoice.amount_paid || 0) + payAmount) * 100) / 100;
+      const newStatus = newAmountPaid >= Number(invoice.amount) ? 'paid' : 'partially_paid';
+      await supabase.from('utility_invoices').update({ amount_paid: newAmountPaid, status: newStatus, updated_at: new Date().toISOString() }).eq('id', invoice.id);
+
+      const { data: payment } = await supabase
+        .from('payments')
+        .insert({
+          tenant_id: invoice.tenant_id,
+          unit_id: invoice.unit_id,
+          landlord_id: landlordId,
+          amount: payAmount,
+          payment_method: 'manual',
+          mpesa_transaction_id: mpesaReference || null,
+          status: 'completed',
+          recorded_by_landlord: true,
+          recorded_note: note || null,
+          paid_by: 'self',
+          paid_at: paymentDate,
+          target_type: 'utility',
+          target_invoice_id: invoice.id,
+        })
+        .select()
+        .single();
+
+      results.push({ invoiceId: invoice.id, status: newStatus, payment });
+
+      try {
+        const { data: tenant } = await supabase.from('tenants').select('primary_phone').eq('id', invoice.tenant_id).maybeSingle();
+        if (tenant) {
+          await notify('tenant', invoice.tenant_id, tenant.primary_phone, `Your ${invoice.utility_type} bill of KES ${payAmount.toLocaleString()} has been recorded as paid.`, { category: 'account', title: 'Bill Payment Recorded' });
+        }
+      } catch (notifyErr) {
+        logger.error('[payment] recordManualUtilityPayment: notify failed (non-blocking):', notifyErr.message);
+      }
+    }
+
+    logActivity({
+      actorType: req.user.role,
+      actorId: req.user.id,
+      action: 'manual_utility_payment_recorded',
+      targetType: invoiceId ? 'utility_invoice' : 'property',
+      targetId: invoiceId || propertyId,
+      reason: note,
+      metadata: { utilityType, amount, mpesaReference, invoicesAffected: results.length },
+    });
+
+    return res.status(201).json({ message: `Recorded payment on ${results.length} bill${results.length === 1 ? '' : 's'}.`, results });
+  } catch (err) {
+    logger.error('[payment] recordManualUtilityPayment error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to record utility payment.' });
   }
 }
 
@@ -1103,12 +1351,15 @@ async function downloadReceiptPdf(req, res) {
 
 module.exports = {
   initiateRentSTKPush,
+  initiateUtilityStkPush,
   checkRentPaymentStatus,
   checkSubscriptionPaymentStatus,
   handleSTKCallback,
   submitPaybillTransaction,
   getMyLatestPaybillConfirmation,
   recordManualPayment,
+  recordManualUtilityPayment,
+  listOpenUtilityInvoicesForProperty,
   getLandlordPaymentHistory,
   deletePayment,
   downloadReceiptPdf,

@@ -18,6 +18,8 @@ router.use(verifyToken);
 router.post('/', requireRole('landlord', 'manager'), tenantController.addTenant);
 router.get('/balance', requireRole('tenant'), tenantController.getBalance);
 router.get('/payment-history', requireRole('tenant'), tenantController.getPaymentHistory);
+router.get('/utility-invoices', requireRole('tenant'), tenantController.getUtilityInvoices);
+router.get('/account-summary', requireRole('tenant'), tenantController.getAccountSummary);
 router.get('/payment-history/pdf', requireRole('tenant'), tenantController.exportPaymentHistoryPdf);
 router.get('/profile', requireRole('tenant'), tenantController.getProfile);
 router.patch('/profile', requireRole('tenant'), tenantController.editOwnProfile);
@@ -66,6 +68,7 @@ router.get('/:tenantId', requireRole('landlord', 'manager', 'admin'), tenantCont
 router.delete('/:tenantId', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot remove tenants. Contact the landlord or property manager.'), tenantController.deleteTenant);
 router.patch('/:tenantId', requireRole('landlord', 'manager', 'admin'), tenantController.editTenantDetails);
 router.get('/:tenantId/balance', requireRole('landlord', 'manager', 'admin'), tenantController.getBalance);
+router.get('/utility-invoices/list', requireRole('landlord', 'manager', 'admin'), tenantController.getUtilityInvoices);
 router.patch('/:tenantId/balance', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot edit a tenant\'s balance. Contact the landlord or property manager.'), tenantController.editBalance);
 router.patch('/:tenantId/deposit', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot settle a tenant\'s deposit. Contact the landlord or property manager.'), tenantController.settleDeposit);
 router.post('/:tenantId/remind', requireRole('landlord', 'manager', 'admin'), tenantController.remindTenant);

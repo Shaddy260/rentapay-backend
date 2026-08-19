@@ -45,6 +45,7 @@ router.get('/history', requireRole('landlord', 'manager'), requireNotCaretaker('
 router.delete('/history/:paymentId', requireRole('landlord', 'manager'), requireNotCaretaker('Caretakers cannot delete payment records. Contact the landlord or property manager.'), paymentController.deletePayment);
 router.get('/history/:landlordId', requireRole('admin'), paymentController.getLandlordPaymentHistory);
 router.post('/stk-push', requireRole('tenant'), paymentController.initiateRentSTKPush);
+router.post('/utility-stk-push', requireRole('tenant'), paymentController.initiateUtilityStkPush);
 router.get('/rent-status/:checkoutRequestId', requireRole('tenant'), paymentController.checkRentPaymentStatus);
 router.post('/paybill-submit', requireRole('tenant'), paybillSubmitLimiter, paymentController.submitPaybillTransaction);
 router.get('/my-latest-confirmation', requireRole('tenant'), paymentController.getMyLatestPaybillConfirmation);
@@ -59,6 +60,17 @@ router.post(
   requireRole('landlord', 'manager'),
   requireNotCaretaker('Caretakers cannot record payments. Contact the landlord or property manager.'),
   paymentController.recordManualPayment
+);
+router.post(
+  '/utility-manual',
+  requireRole('landlord', 'manager'),
+  requireNotCaretaker('Caretakers cannot record payments. Contact the landlord or property manager.'),
+  paymentController.recordManualUtilityPayment
+);
+router.get(
+  '/utility-manual/open-invoices',
+  requireRole('landlord', 'manager'),
+  paymentController.listOpenUtilityInvoicesForProperty
 );
 
 // Manual Paybill payment confirmation flow (landlord/manager side) -

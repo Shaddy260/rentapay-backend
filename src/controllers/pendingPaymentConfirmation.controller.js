@@ -26,8 +26,15 @@ const logger = require('../utils/logger');
 
 const TENANT_JOIN_SELECT =
   '*, tenants(full_name, photo_url, primary_phone, email), ' +
-  'units(unit_name, unit_payment_code, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, ' +
-  'properties(name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number)), ' +
+  'units(unit_name, unit_payment_code, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description, ' +
+  'properties(name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description)), ' +
+  // Direct request: the landlord/manager confirmations list needs to
+  // show whether a submission is for rent or a specific utility bill
+  // (and which one) - target_type alone only says 'rent'/'utility',
+  // this join brings in the utility_type ('water'/'electricity') and
+  // month_key so the card can say "Water bill - Jul 2026" instead of
+  // a generic "utility".
+  'target_invoice:target_invoice_id(utility_type, month_key), ' +
   'confirmed_by_landlord:confirmed_or_rejected_by_landlord(full_name), confirmed_by_manager:confirmed_or_rejected_by_manager(full_name)';
 
 // FIX (direct request): "when a landlord or caretaker or manager
@@ -96,7 +103,7 @@ async function getPendingConfirmations(req, res) {
     // instead of falling back to the unit code.
     const { data: landlord } = await supabase
       .from('landlords')
-      .select('full_name, payment_method, paybill_number, paybill_account_number, till_number, stk_phone_number')
+      .select('full_name, payment_method, paybill_number, paybill_account_number, till_number, stk_phone_number, payment_description')
       .eq('id', landlordId)
       .maybeSingle();
 
@@ -195,7 +202,9 @@ async function confirmPendingPayment(req, res) {
     // Reuse the same balance-update logic every other payment path
     // uses (see payment.controller.js recordManualPayment /
     // processRentPaymentCallback) so this can never drift into
-    // different math.
+    // different math. Rent and utility bills are credited completely
+    // independently (Phase 2) - a rent confirmation never touches a
+    // utility invoice and vice versa.
     const { data: tenant, error: tenantErr } = await supabase
       .from('tenants')
       .select('*, units(rent_amount, due_day_of_month)')
@@ -203,16 +212,37 @@ async function confirmPendingPayment(req, res) {
       .single();
     if (tenantErr || !tenant) throw tenantErr || new Error('Tenant not found for confirmed payment.');
 
-    const currentlyOwed = Number(tenant.balance_due) || 0;
     const amountPaid = Number(record.amount_paid);
-    const rentAmount = Number(tenant.rent_override || tenant.units?.rent_amount || 0);
-    const newBalance = applyPaymentToBalance(currentlyOwed, amountPaid);
-    const dueDay = tenant.due_day_of_month || tenant.units?.due_day_of_month;
-    const today = new Date();
-    const nextCycleDueDate = new Date(today.getFullYear(), today.getMonth() + 1, dueDay);
-    const prepaymentInfo = buildPrepaymentSummary(newBalance, rentAmount, nextCycleDueDate);
+    let currentlyOwed = 0;
+    let newBalance = 0;
+    let prepaymentInfo = null;
+    let billLabel = 'Paybill payment';
 
-    await supabase.from('tenants').update({ balance_due: newBalance }).eq('id', record.tenant_id);
+    if (record.target_type === 'utility' && record.target_invoice_id) {
+      const { data: invoice, error: invoiceErr } = await supabase
+        .from('utility_invoices')
+        .select('*')
+        .eq('id', record.target_invoice_id)
+        .single();
+      if (invoiceErr || !invoice) throw invoiceErr || new Error('Utility invoice not found for confirmed payment.');
+
+      currentlyOwed = Math.round((Number(invoice.amount) - Number(invoice.amount_paid || 0)) * 100) / 100;
+      const newAmountPaid = Math.round((Number(invoice.amount_paid || 0) + amountPaid) * 100) / 100;
+      const newStatus = newAmountPaid >= Number(invoice.amount) ? 'paid' : 'partially_paid';
+      newBalance = Math.max(0, Math.round((Number(invoice.amount) - newAmountPaid) * 100) / 100);
+
+      await supabase.from('utility_invoices').update({ amount_paid: newAmountPaid, status: newStatus, updated_at: nowIso }).eq('id', invoice.id);
+      billLabel = `${invoice.utility_type} bill`;
+    } else {
+      currentlyOwed = Number(tenant.balance_due) || 0;
+      const rentAmount = Number(tenant.rent_override || tenant.units?.rent_amount || 0);
+      newBalance = applyPaymentToBalance(currentlyOwed, amountPaid);
+      const dueDay = tenant.due_day_of_month || tenant.units?.due_day_of_month;
+      const today = new Date();
+      const nextCycleDueDate = new Date(today.getFullYear(), today.getMonth() + 1, dueDay);
+      prepaymentInfo = buildPrepaymentSummary(newBalance, rentAmount, nextCycleDueDate);
+      await supabase.from('tenants').update({ balance_due: newBalance }).eq('id', record.tenant_id);
+    }
 
     // Insert into the same `payments` table getPaymentHistory /
     // getPaymentHistoryFull already read from, so it shows up
@@ -231,6 +261,8 @@ async function confirmPendingPayment(req, res) {
         paid_by: 'self',
         paid_at: nowIso,
         recorded_note: `Confirmed by ${actingUser.name}`,
+        target_type: record.target_type || 'rent',
+        target_invoice_id: record.target_invoice_id || null,
       })
       .select()
       .single();
@@ -242,7 +274,7 @@ async function confirmPendingPayment(req, res) {
         'tenant',
         record.tenant_id,
         tenant.primary_phone,
-        `Your Paybill payment of KES ${amountPaid.toLocaleString()} (ref ${record.transaction_code}) has been confirmed by ${actingUser.name}.`,
+        `Your Paybill payment of KES ${amountPaid.toLocaleString()} (ref ${record.transaction_code}) for your ${billLabel} has been confirmed by ${actingUser.name}.`,
         { category: 'account', title: 'Payment Confirmed' }
       );
     } catch (notifyErr) {

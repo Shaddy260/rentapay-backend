@@ -19,6 +19,17 @@
 // landlord with multiple apartments editing "the" payment method was
 // really editing a single value shared by every apartment they own.
 //
+// Substitutes the {unit} token in an account-number TEMPLATE with
+// this tenant's own unit label, so one saved value like "RENT-{unit}"
+// works for every unit without the landlord touching it per-unit.
+// A value with no {unit} token (a plain fixed account number) passes
+// through untouched, so this is fully backward compatible.
+function applyUnitTemplate(value, unit) {
+  if (!value || typeof value !== 'string' || value.indexOf('{unit}') === -1) return value;
+  const unitLabel = (unit && (unit.unit_name || unit.unit_number)) || '';
+  return value.split('{unit}').join(unitLabel);
+}
+
 // Precedence, most specific wins: unit override > property override >
 // landlord's own general/default payment method.
 function buildPaymentInstructions(landlord, unit, property) {
@@ -35,9 +46,12 @@ function buildPaymentInstructions(landlord, unit, property) {
   const paybillNumber = unitOverridden ? unit.payment_override_paybill_number
     : propertyOverridden ? resolvedProperty.payment_override_paybill_number
     : landlord.paybill_number;
-  const paybillAccountNumber = unitOverridden ? unit.payment_override_paybill_account_number
-    : propertyOverridden ? resolvedProperty.payment_override_paybill_account_number
-    : landlord.paybill_account_number;
+  const paybillAccountNumber = applyUnitTemplate(
+    unitOverridden ? unit.payment_override_paybill_account_number
+      : propertyOverridden ? resolvedProperty.payment_override_paybill_account_number
+      : landlord.paybill_account_number,
+    unit
+  );
   const tillNumber = unitOverridden ? unit.payment_override_till_number
     : propertyOverridden ? resolvedProperty.payment_override_till_number
     : landlord.till_number;
@@ -48,6 +62,13 @@ function buildPaymentInstructions(landlord, unit, property) {
   const stkPhoneNumber = unitOverridden ? unit.payment_override_stk_phone_number
     : propertyOverridden ? resolvedProperty.payment_override_stk_phone_number
     : landlord.stk_phone_number;
+  // Direct request: a free-text note the landlord/manager writes once
+  // at setup ("Rent is due by the 5th; water is billed separately"),
+  // shown to the tenant right where they tap Pay Rent / Pay <utility>.
+  // Same override precedence as everything else above.
+  const description = unitOverridden ? unit.payment_override_description
+    : propertyOverridden ? resolvedProperty.payment_override_description
+    : landlord.payment_description;
 
   if (method === 'paybill' && paybillNumber) {
     return {
@@ -55,6 +76,7 @@ function buildPaymentInstructions(landlord, unit, property) {
       paybillNumber,
       accountNumber: paybillAccountNumber || landlord.full_name || 'N/A',
       text: `Pay via M-Pesa Paybill ${paybillNumber}, Account Number: ${paybillAccountNumber || landlord.full_name}`,
+      description: description || null,
       isOverride: overridden,
     };
   }
@@ -64,6 +86,7 @@ function buildPaymentInstructions(landlord, unit, property) {
       method: 'till',
       tillNumber,
       text: `Pay via M-Pesa Buy Goods (Till Number) ${tillNumber}`,
+      description: description || null,
       isOverride: overridden,
     };
   }
@@ -79,6 +102,7 @@ function buildPaymentInstructions(landlord, unit, property) {
     method: 'stk',
     stkPhoneNumber: stkPhoneNumber || null,
     text: stkPhoneNumber ? `Send payment via M-Pesa to ${stkPhoneNumber}.` : 'Contact your landlord for payment details.',
+    description: description || null,
     isOverride: overridden,
   };
 }

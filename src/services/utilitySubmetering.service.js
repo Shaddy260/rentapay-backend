@@ -69,6 +69,17 @@ function daysInMonth(monthKey) {
   return new Date(year, month, 0).getDate();
 }
 
+// One calendar month before the given YYYY-MM key. Used to give a
+// first-ever "previous reading" a month_key that sorts before the
+// tenant's actual first billed month, so getPreviousReading() picks
+// it up via its existing "< monthKey" lookup with no special-casing.
+function decrementMonthKey(monthKey) {
+  const [year, month] = monthKey.split('-').map(Number);
+  const prevMonth = month === 1 ? 12 : month - 1;
+  const prevYear = month === 1 ? year - 1 : year;
+  return `${prevYear}-${String(prevMonth).padStart(2, '0')}`;
+}
+
 function occupiedDaysForTenancy(monthKey, moveInDate, moveOutDate) {
   const [year, month] = monthKey.split('-').map(Number);
   const monthStart = new Date(Date.UTC(year, month - 1, 1));
@@ -159,6 +170,7 @@ module.exports = {
   detectAnomaly,
   getPreviousReading,
   daysInMonth,
+  decrementMonthKey,
   occupiedDaysForTenancy,
   getOccupiedUnitsForMonth,
   splitSharedUsage,

@@ -14,9 +14,13 @@ const ctrl = require('../controllers/utilitySubmetering.controller');
 router.use(verifyToken, requireRole('landlord', 'manager'));
 
 router.post('/meters', ctrl.createMeter);
+router.post('/meters/bulk', ctrl.bulkCreateMeters);
 router.get('/meters', ctrl.listMeters);
+router.patch('/meters/:meterId', ctrl.updateMeter);
+router.delete('/meters/:meterId', ctrl.deleteMeter);
 
 router.post('/meters/:meterId/readings', ctrl.submitReading);
+router.post('/readings/bulk', ctrl.bulkSubmitReadings);
 router.get('/meters/:meterId/readings', ctrl.listReadings);
 router.patch('/readings/:readingId', ctrl.correctReading);
 router.get('/readings/:readingId/corrections', ctrl.getReadingCorrections);

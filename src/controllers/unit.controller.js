@@ -1437,7 +1437,7 @@ async function getUnit(req, res) {
 async function updatePaymentOverride(req, res) {
   try {
     const { unitId } = req.params;
-    const { enabled, method, paybillNumber, accountNumber, tillNumber } = req.body;
+    const { enabled, method, paybillNumber, accountNumber, tillNumber, description } = req.body;
     const landlordId = effectiveLandlordId(req);
 
     const { data: unit, error: fetchError } = await supabase.from('units').select('landlord_id, unit_name, property_id, is_frozen').eq('id', unitId).single();
@@ -1461,6 +1461,11 @@ async function updatePaymentOverride(req, res) {
       updateFields.payment_override_paybill_number = method === 'paybill' ? paybillNumber || null : null;
       updateFields.payment_override_paybill_account_number = method === 'paybill' ? accountNumber || null : null;
       updateFields.payment_override_till_number = method === 'till' ? tillNumber || null : null;
+      // Direct request: same "set once, show to tenant when they tap
+      // Pay Rent" description field as the account/apartment levels,
+      // available per-unit too since a unit override already means
+      // "this one unit is different from the rest."
+      if (description !== undefined) updateFields.payment_override_description = description || null;
     }
     // When switching the override off, the saved override values are
     // deliberately left in place (not wiped) - flipping it back on
