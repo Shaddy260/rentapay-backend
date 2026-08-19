@@ -16,6 +16,15 @@ const generalManagerController = require('../controllers/generalManager.controll
 const generalManagerLogController = require('../controllers/generalManagerLog.controller');
 const { verifyToken, requireRole } = require('../middleware/auth.middleware');
 
+// PUBLIC — self-service onboarding (Prompt 7). No token in the URL
+// path, no login - the invitee reaches this via the ?token= link
+// admin generated and sent them privately. Mirrors brandAmbassador
+// .routes.js's public onboarding block exactly.
+router.post('/onboarding/email/send-otp', generalManagerController.requestGmEmailVerification);
+router.post('/onboarding/email/verify-otp', generalManagerController.confirmGmEmailVerification);
+router.post('/onboarding/apply', generalManagerController.submitGmOnboarding);
+router.get('/onboarding/link/validate', generalManagerController.validateGmOnboardingLinkToken);
+
 router.use(verifyToken, requireRole('general_manager'));
 
 // SECTION 4 — Operations PIN Setup (Onboarding + Settings)

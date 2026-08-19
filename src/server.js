@@ -12,6 +12,7 @@ const rateLimit = require('express-rate-limit');
 
 const authRoutes = require('./routes/auth.routes');
 const unitRoutes = require('./routes/unit.routes');
+const utilitySubmeteringRoutes = require('./routes/utilitySubmetering.routes');
 const propertyRoutes = require('./routes/property.routes');
 const tenantRoutes = require('./routes/tenant.routes');
 const paymentRoutes = require('./routes/payment.routes');
@@ -215,6 +216,7 @@ app.get('/health', async (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/units', unitRoutes);
+app.use('/api/utility-submetering', utilitySubmeteringRoutes);
 app.use('/api/properties', propertyRoutes);
 app.use('/api/tenants', tenantRoutes);
 app.use('/api/first-time-credentials', credentialsRoutes);

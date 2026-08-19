@@ -15,9 +15,9 @@ function currentUser(req) {
 
 // ---------------------------------------------------------------------
 // POST /api/support-chat/message
-// The full fallback chain for a single incoming message: 7.1/7.2/7.3
-// checks -> rule-based matcher -> Gemini -> Groq -> Cerebras ->
-// OpenRouter -> category menu.
+// The full fallback chain for a single incoming message: Tier 0 casual
+// handling -> 7.1/7.2/7.3 checks -> rule-based matcher -> Gemini ->
+// Groq -> Cerebras -> OpenRouter -> category menu.
 // ---------------------------------------------------------------------
 async function sendMessage(req, res) {
   try {
@@ -27,6 +27,16 @@ async function sendMessage(req, res) {
 
     const session = await svc.getOrCreateSession(userType, userId, roleLevel);
     const history = await svc.getTodayHistory(session.id);
+
+    // Tier 0 - casual/conversational input (greetings, emojis, single
+    // short words) handled locally, before anything else, so it never
+    // depends on a rule-based DB lookup or any AI provider being up.
+    if (svc.detectCasualMessage(message)) {
+      await svc.appendMessage(session.id, 'user', message, null, null);
+      const reply = svc.casualReply();
+      await svc.appendMessage(session.id, 'assistant', reply, 'casual', null);
+      return res.json({ reply, tier: 'casual', escalate: false });
+    }
 
     // Section 7.1/7.2 - checked on EVERY incoming message, before the
     // rule-based matcher or any AI tier is attempted.

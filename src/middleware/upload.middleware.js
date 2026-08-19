@@ -171,10 +171,37 @@ function handleCommunityPhotosUpload(req, res, next) {
   });
 }
 
+// ---------------------------------------------------------------------
+// Utility sub-metering: photo of the physical meter attached as proof
+// to a reading (Section 1). Single image, same size/type limits as a
+// profile photo. Optional at the middleware level - submitReading
+// itself enforces "required unless this is a baseline" (see
+// utilitySubmetering.controller.js), since a baseline reading is
+// allowed to skip the photo.
+// ---------------------------------------------------------------------
+const uploadMeterReadingPhotoMiddleware = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_SIZE },
+  fileFilter,
+}).single('photo'); // frontend sends the file under field name "photo"
+
+function handleMeterReadingPhotoUpload(req, res, next) {
+  uploadMeterReadingPhotoMiddleware(req, res, (err) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'Photo must be smaller than 5MB.' });
+      return res.status(400).json({ error: err.message });
+    }
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.file) return res.status(400).json({ error: 'No photo was uploaded. Attach a file under the field name "photo".' });
+    next();
+  });
+}
+
 module.exports = {
   handleProfilePhotoUpload,
   handleExpenseReceiptUpload,
   handleDocumentUpload,
   handleUnitPhotosUpload,
   handleCommunityPhotosUpload,
+  handleMeterReadingPhotoUpload,
 };

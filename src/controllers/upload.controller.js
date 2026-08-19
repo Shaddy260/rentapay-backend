@@ -351,4 +351,65 @@ async function applyUnitPhotosToOthers(req, res) {
   }
 }
 
-module.exports = { uploadProfilePhoto, removeProfilePhoto, uploadUnitPhotos, removeUnitPhoto, applyUnitPhotosToOthers };
+// ---------------------------------------------------------------------
+// Utility sub-metering: physical meter photo attached as proof to a
+// reading (Section 1 - "the photo exists purely as evidence"). Not
+// tied to any existing table row the way profile/unit photos are -
+// this just uploads the file and hands back a public URL, which the
+// caller then includes as photoUrl in the actual
+// POST /api/utility-submetering/meters/:meterId/readings call. Same
+// resize approach as unit photos (landscape, since it's a photo of a
+// meter dial, not an avatar).
+//
+// ONE-TIME SETUP REQUIRED: create a public Storage bucket named
+// "meter-reading-photos" in the Supabase dashboard, same as the
+// other buckets above.
+// ---------------------------------------------------------------------
+const METER_READING_PHOTOS_BUCKET = 'meter-reading-photos';
+
+async function processMeterReadingPhoto(buffer) {
+  return sharp(buffer)
+    .rotate()
+    .resize(1024, 768, { fit: 'cover' })
+    .webp({ quality: 82 })
+    .toBuffer();
+}
+
+async function uploadMeterReadingPhoto(req, res) {
+  try {
+    const { id, role } = req.user;
+    const file = req.file;
+
+    let processedBuffer;
+    try {
+      processedBuffer = await processMeterReadingPhoto(file.buffer);
+    } catch (sharpErr) {
+      logger.error('[upload] meter reading photo processing failed:', sharpErr.message);
+      captureException(sharpErr);
+      return res.status(400).json({ error: 'That file doesn\'t look like a valid image. Please try a different photo.' });
+    }
+
+    const path = `${role}/${id}/${Date.now()}.webp`;
+    const { error: uploadError } = await supabase.storage
+      .from(METER_READING_PHOTOS_BUCKET)
+      .upload(path, processedBuffer, { contentType: 'image/webp', upsert: false });
+
+    if (uploadError) {
+      if (/bucket not found/i.test(uploadError.message)) {
+        return res.status(500).json({
+          error: 'Photo storage isn\'t set up yet. In Supabase: Storage -> New bucket -> name it "meter-reading-photos" -> make it public.',
+        });
+      }
+      throw uploadError;
+    }
+
+    const { data: publicUrlData } = supabase.storage.from(METER_READING_PHOTOS_BUCKET).getPublicUrl(path);
+    return res.json({ photoUrl: publicUrlData.publicUrl });
+  } catch (err) {
+    logger.error('[upload] uploadMeterReadingPhoto error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to upload photo.' });
+  }
+}
+
+module.exports = { uploadProfilePhoto, removeProfilePhoto, uploadUnitPhotos, removeUnitPhoto, applyUnitPhotosToOthers, uploadMeterReadingPhoto };

@@ -142,6 +142,12 @@ router.post('/landlord-leads/:id/mark-contacted', landlordLeadController.markLea
 // get to browse the GM roster either.
 router.get('/general-managers', requireRole('admin'), generalManagerController.listGeneralManagers);
 router.post('/general-managers', requireRole('admin'), generalManagerController.createGeneralManager);
+// Self-service onboarding link (Prompt 7) - same shape as the BA
+// onboarding-link routes: admin views/generates the current live
+// link here; the invitee's own submission happens on public routes
+// registered separately (see generalManager.routes.js).
+router.get('/general-managers/onboarding-link', requireRole('admin'), generalManagerController.getGmOnboardingLinkStatus);
+router.post('/general-managers/onboarding-link/generate', requireRole('admin'), generalManagerController.generateGmOnboardingLink);
 // Suspend / reactivate a General Manager's own account - admin-only,
 // same reasoning as the roster/creation routes above (a General
 // Manager can never manage another General Manager's account).

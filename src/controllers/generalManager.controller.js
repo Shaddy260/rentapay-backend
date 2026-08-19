@@ -494,6 +494,304 @@ async function setGeneralManagerStatus(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// SECTION 2 UPDATE — self-service onboarding link, matching the BA
+// onboarding pattern (brandAmbassador.controller.js): admin generates
+// one live link and sends it privately to the specific person they
+// want to invite; that person fills in their own details and verifies
+// their own email, rather than admin typing everything in. Unlike BA,
+// there's no pending-approval queue here — admin already chose this
+// exact person by generating and sending them the link directly, so
+// submission activates the account immediately (same trust model as
+// the old admin-typed-it-in flow it replaces).
+// ---------------------------------------------------------------------
+
+const { generateOTP: generateGmOTP, getEmailVerificationOTPExpiry, isOTPExpired: isGmOTPExpired } = require('../utils/otp');
+const { sendEmail: sendGmEmail, wrapEmailHtml: wrapGmEmailHtml } = require('../services/email.service');
+
+const GM_ONBOARDING_LINK_TTL_HOURS = 24;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://rentapay.co.ke';
+
+function generateGmOnboardingLinkToken() {
+  return crypto.randomBytes(20).toString('hex');
+}
+
+async function getCurrentGmOnboardingLink() {
+  const { data, error } = await supabase
+    .from('gm_onboarding_links')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+function isGmLinkExpired(link) {
+  return !link || new Date(link.expires_at) <= new Date();
+}
+
+async function checkGmOnboardingLinkToken(token) {
+  if (!token) {
+    return { ok: false, error: 'This onboarding link is invalid. Please request a new one from RentaPay.' };
+  }
+  const current = await getCurrentGmOnboardingLink();
+  if (isGmLinkExpired(current) || current.token !== String(token)) {
+    return { ok: false, error: 'This onboarding link has expired. Please request a new one from RentaPay.' };
+  }
+  return { ok: true };
+}
+
+// ADMIN — current link status, so the "Onboard a new General Manager"
+// card can show the live link without regenerating it just to look.
+async function getGmOnboardingLinkStatus(req, res) {
+  try {
+    const current = await getCurrentGmOnboardingLink();
+    const expired = isGmLinkExpired(current);
+    return res.json({
+      link: current && !expired ? `${FRONTEND_URL}/onboard-general-manager?token=${current.token}` : null,
+      expiresAt: current?.expires_at || null,
+      expired,
+    });
+  } catch (err) {
+    logger.error('[generalManager] getGmOnboardingLinkStatus error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load the onboarding link.' });
+  }
+}
+
+// ADMIN — generate/regenerate. Fresh row + fresh token every time, so
+// regenerating early immediately invalidates whatever link was live.
+async function generateGmOnboardingLink(req, res) {
+  try {
+    const token = generateGmOnboardingLinkToken();
+    const expiresAt = new Date(Date.now() + GM_ONBOARDING_LINK_TTL_HOURS * 60 * 60 * 1000);
+
+    const { data, error } = await supabase
+      .from('gm_onboarding_links')
+      .insert({ token, generated_by: req.user?.id || 'super-admin', expires_at: expiresAt.toISOString() })
+      .select()
+      .single();
+    if (error) throw error;
+
+    logActivity({ actorType: 'admin', actorId: req.user?.id || 'super-admin', action: 'gm_onboarding_link_generated', targetType: 'gm_onboarding_link', targetId: data.id });
+
+    return res.status(201).json({
+      link: `${FRONTEND_URL}/onboard-general-manager?token=${token}`,
+      expiresAt: data.expires_at,
+    });
+  } catch (err) {
+    logger.error('[generalManager] generateGmOnboardingLink error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to generate a new onboarding link.' });
+  }
+}
+
+// PUBLIC — lets the onboarding page check its ?token= on load.
+async function validateGmOnboardingLinkToken(req, res) {
+  try {
+    const { token } = req.query;
+    const result = await checkGmOnboardingLinkToken(token);
+    if (!result.ok) return res.status(410).json({ valid: false, error: result.error });
+    return res.json({ valid: true });
+  } catch (err) {
+    logger.error('[generalManager] validateGmOnboardingLinkToken error:', err.message);
+    captureException(err);
+    return res.status(500).json({ valid: false, error: 'Failed to validate link.' });
+  }
+}
+
+// PUBLIC — step 1: send a code to the email the invitee typed.
+async function requestGmEmailVerification(req, res) {
+  try {
+    const { email, onboardingToken } = req.body;
+    const linkCheck = await checkGmOnboardingLinkToken(onboardingToken);
+    if (!linkCheck.ok) return res.status(410).json({ error: linkCheck.error, linkExpired: true });
+
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    const otp = generateGmOTP();
+    const expiresAt = getEmailVerificationOTPExpiry();
+
+    const { error: upsertErr } = await supabase
+      .from('gm_email_otps')
+      .upsert(
+        { email: normalizedEmail, otp_code: otp, expires_at: expiresAt.toISOString(), verified: false, verification_token: null, failed_attempts: 0, locked_until: null },
+        { onConflict: 'email' }
+      );
+    if (upsertErr) throw upsertErr;
+
+    try {
+      await sendGmEmail(
+        normalizedEmail,
+        'Verify your email - RentaPay General Manager onboarding',
+        wrapGmEmailHtml(`Your verification code is: ${otp}\n\nThis code expires in 10 minutes. Enter it on the General Manager onboarding form to verify your email.`)
+      );
+    } catch (emailErr) {
+      logger.error('[generalManager] requestGmEmailVerification: failed to send:', emailErr.message);
+      captureException(emailErr);
+      return res.status(502).json({ error: 'Could not send the verification email. Please check the address and try again.' });
+    }
+
+    return res.json({ message: 'Verification code sent to your email.' });
+  } catch (err) {
+    logger.error('[generalManager] requestGmEmailVerification error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to send verification code.' });
+  }
+}
+
+// PUBLIC — step 2: confirm the code, hand back an opaque proof token.
+async function confirmGmEmailVerification(req, res) {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: 'Email and code are required.' });
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const { data: record, error: recordErr } = await supabase
+      .from('gm_email_otps')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .maybeSingle();
+    if (recordErr) throw recordErr;
+    if (!record) return res.status(400).json({ error: 'Request a verification code for this email first.' });
+
+    if (record.locked_until && new Date(record.locked_until) > new Date()) {
+      return res.status(423).json({ error: `Too many incorrect codes. Try again after ${record.locked_until}, or request a new code.` });
+    }
+    if (isGmOTPExpired(record.expires_at)) {
+      return res.status(400).json({ error: 'That code has expired. Request a new one.' });
+    }
+    if (record.otp_code !== String(code).trim()) {
+      const failedAttempts = (record.failed_attempts || 0) + 1;
+      const update = { failed_attempts: failedAttempts };
+      if (failedAttempts >= 5) {
+        const lockUntil = new Date();
+        lockUntil.setMinutes(lockUntil.getMinutes() + 15);
+        update.locked_until = lockUntil.toISOString();
+      }
+      await supabase.from('gm_email_otps').update(update).eq('id', record.id);
+      return res.status(400).json({ error: 'Incorrect code. Please try again.' });
+    }
+
+    const verificationToken = crypto.randomBytes(24).toString('hex');
+    await supabase
+      .from('gm_email_otps')
+      .update({ verified: true, verification_token: verificationToken, failed_attempts: 0, locked_until: null })
+      .eq('id', record.id);
+
+    return res.json({ verified: true, emailVerification: verificationToken });
+  } catch (err) {
+    logger.error('[generalManager] confirmGmEmailVerification error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to verify code.' });
+  }
+}
+
+// PUBLIC — step 3: the invitee's own submission. Creates the account
+// immediately (see note above on why there's no approval queue here)
+// and emails a temp password, same as the old admin-typed-it-in flow.
+async function submitGmOnboarding(req, res) {
+  try {
+    const { fullName, gender, emailVerification, onboardingToken } = req.body;
+    let { phone, email, nationalId } = req.body;
+
+    const linkCheck = await checkGmOnboardingLinkToken(onboardingToken);
+    if (!linkCheck.ok) return res.status(410).json({ error: linkCheck.error, linkExpired: true });
+
+    const required = { fullName, phone, email, nationalId };
+    const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
+    if (missing.length) return res.status(400).json({ error: `Please fill in: ${missing.join(', ')}` });
+
+    if (!isValidEmail(email)) return res.status(400).json({ error: 'Please enter a valid email address.' });
+    email = String(email).trim().toLowerCase();
+
+    try {
+      phone = normalizePhoneOrThrow(phone, 'Phone number');
+    } catch (phoneErr) {
+      return res.status(400).json({ error: phoneErr.message });
+    }
+
+    nationalId = String(nationalId).trim();
+    if (nationalId.length < 4 || nationalId.length > 20 || !/^[A-Za-z0-9-]+$/.test(nationalId)) {
+      return res.status(400).json({ error: 'Please enter a valid national ID number.' });
+    }
+
+    if (gender !== undefined && gender !== null && gender !== '' && !['male', 'female'].includes(gender)) {
+      return res.status(400).json({ error: "gender must be 'male' or 'female'." });
+    }
+
+    if (!emailVerification) {
+      return res.status(400).json({ error: 'Please verify your email address before submitting.', emailNotVerified: true });
+    }
+    const { data: otpRecord, error: otpErr } = await supabase
+      .from('gm_email_otps')
+      .select('verified, verification_token')
+      .eq('email', email)
+      .maybeSingle();
+    if (otpErr) throw otpErr;
+    if (!otpRecord?.verified || otpRecord.verification_token !== emailVerification) {
+      return res.status(400).json({ error: 'Please verify your email address before submitting.', emailNotVerified: true });
+    }
+
+    const phoneConflict = await findPhoneConflict(phone, 'general_manager');
+    if (phoneConflict) return res.status(409).json({ error: phoneConflict });
+    const emailConflict = await findEmailConflict(email, 'general_manager');
+    if (emailConflict) return res.status(409).json({ error: emailConflict });
+
+    const tempPassword = generateTempPassword();
+    const passwordHash = await hashPassword(tempPassword);
+
+    let manager;
+    try {
+      const { data, error } = await supabase
+        .from('general_managers')
+        .insert({
+          full_name: fullName,
+          phone,
+          email,
+          national_id: nationalId,
+          password_hash: passwordHash,
+          is_verified: true,
+          must_change_password: true,
+          gender: gender || null,
+          created_by_admin: linkCheck.generatedBy || 'super-admin',
+        })
+        .select()
+        .single();
+      if (error) throw error;
+      manager = data;
+    } catch (insertErr) {
+      if (insertErr.code === '23505') {
+        return res.status(409).json({ error: 'This phone number or email was just registered by another submission. Please check your details.' });
+      }
+      throw insertErr;
+    }
+
+    const emailBody = templates.generalManagerLoginCredentials(fullName, tempPassword);
+    try {
+      await sendGmEmail(email, "You've been added as a General Manager on RentaPay", wrapGmEmailHtml(emailBody));
+    } catch (emailErr) {
+      logger.error('[generalManager] submitGmOnboarding: CRITICAL - login credentials email failed to send:', emailErr.message);
+      captureException(emailErr);
+    }
+
+    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'general_manager_created', targetType: 'general_manager', targetId: manager.id });
+
+    return res.status(201).json({
+      message: 'Your account has been created. Check your email for your login details.',
+      manager: { id: manager.id },
+    });
+  } catch (err) {
+    logger.error('[generalManager] submitGmOnboarding error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to submit. Please try again.' });
+  }
+}
+
 module.exports = {
   createGeneralManager,
   listGeneralManagers,
@@ -502,4 +800,10 @@ module.exports = {
   changeOperationsPin,
   requestOperationsPinReset,
   resetOperationsPin,
+  getGmOnboardingLinkStatus,
+  generateGmOnboardingLink,
+  validateGmOnboardingLinkToken,
+  requestGmEmailVerification,
+  confirmGmEmailVerification,
+  submitGmOnboarding,
 };

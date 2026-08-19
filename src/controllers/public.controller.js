@@ -47,7 +47,8 @@ async function listVacantUnits(req, res) {
       .select(
         'id, unit_name, unit_type, rent_amount, photo_urls, property_id, landlord_id, ' +
           'listing_status, requires_deposit, deposit_amount_expected, ' +
-          'properties(name, county, constituency, location, maps_link, description)'
+          'properties(name, county, constituency, location, maps_link, description), ' +
+          'landlords(subscription_status)'
       )
       .eq('status', 'vacant')
       // DIRECT REQUEST: landlords/managers can opt a unit out of the
@@ -65,6 +66,11 @@ async function listVacantUnits(req, res) {
     if (error) throw error;
 
     let units = data || [];
+    // BUG FIX: a suspended/inactive landlord's vacant units must not stay
+    // discoverable on the public listings page - filtered server-side
+    // (never trust the frontend) same as the other hard-locks above.
+    units = units.filter((u) => u.landlords?.subscription_status !== 'suspended');
+    units = units.map(({ landlords, ...u }) => u); // internal-only field, not part of the public response shape
     // county/constituency/location live on `properties`, not `units`
     // directly (units with no property_id are ungrouped and have no
     // location at all - excluded from a location-filtered search,
@@ -206,14 +212,16 @@ async function getUnitContact(req, res) {
 
     const { data: unit, error: unitErr } = await supabase
       .from('units')
-      .select('id, unit_name, status, is_publicly_listed, property_id, landlord_id, properties(caretaker_phone)')
+      .select('id, unit_name, status, is_publicly_listed, property_id, landlord_id, properties(caretaker_phone), landlords(subscription_status)')
       .eq('id', unitId)
       .maybeSingle();
     if (unitErr) throw unitErr;
     // Same opt-out respected here as in listVacantUnits/listSearchableAreas
     // above - someone guessing/bookmarking a unitId directly shouldn't be
     // able to reach the contact link for a unit its owner took private.
-    if (!unit || unit.status !== 'vacant' || !unit.is_publicly_listed) {
+    // Also blocks a suspended landlord's unit, same as listVacantUnits -
+    // a direct/bookmarked link shouldn't outlive the public listing itself.
+    if (!unit || unit.status !== 'vacant' || !unit.is_publicly_listed || unit.landlords?.subscription_status === 'suspended') {
       return res.status(404).json({ error: 'This unit is no longer available.' });
     }
 
@@ -424,7 +432,7 @@ async function getToastVacancy(req, res) {
 
     const query = supabase
       .from('units')
-      .select('id, unit_name, properties(county)')
+      .select('id, unit_name, properties(county), landlords(subscription_status)')
       .eq('status', 'vacant')
       .eq('is_publicly_listed', true)
       .order('created_at', { ascending: false })
@@ -433,7 +441,7 @@ async function getToastVacancy(req, res) {
     const { data, error } = await query;
     if (error) throw error;
 
-    let units = data || [];
+    let units = (data || []).filter((u) => u.landlords?.subscription_status !== 'suspended');
     const matched = county ? units.filter((u) => u.properties?.county?.toLowerCase() === county.toLowerCase()) : [];
     // No match in-county (or no county known yet) - fall back to any
     // recent vacancy so the toast still has something real to show

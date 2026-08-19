@@ -90,6 +90,38 @@ async function ruleBasedMatch(message, role) {
 }
 
 // ---------------------------------------------------------------------
+// Tier 0: casual/conversational input - greetings, emojis, single
+// affectionate/short words ("Hey", "Love", "😊"). Handled locally, with
+// zero dependency on any AI provider or the DB-backed rule matcher, so
+// a simple "Good morning" always gets a warm, natural reply even if
+// every AI provider key is unset/down - it should never be possible
+// for a greeting to fall through to the category-menu dead end.
+// ---------------------------------------------------------------------
+
+const EMOJI_RE = /^[\s\p{Extended_Pictographic}\u200d\uFE0F]+$/u;
+const GREETING_RE = /^(hi+|hello+|hey+|yo+|sup|good\s?(morning|afternoon|evening|day)|howdy|greetings)[\s!.,]*$/i;
+const CASUAL_WORD_RE = /^(love|nice|cool|great|thanks|thank you|thanks a lot|ok|okay|k|lol|haha+|😊|❤️?|👍|😂)[\s!.,]*$/i;
+
+const GREETING_REPLIES = [
+  "Hey there! What can I help you with today?",
+  "Hello! What's going on - how can I help?",
+  "Hi! What can I do for you today?",
+];
+
+function detectCasualMessage(message) {
+  const trimmed = String(message || '').trim();
+  if (!trimmed) return false;
+  if (EMOJI_RE.test(trimmed)) return true;
+  if (GREETING_RE.test(trimmed)) return true;
+  if (trimmed.length <= 20 && CASUAL_WORD_RE.test(trimmed)) return true;
+  return false;
+}
+
+function casualReply() {
+  return GREETING_REPLIES[Math.floor(Math.random() * GREETING_REPLIES.length)];
+}
+
+// ---------------------------------------------------------------------
 // Section 7.3: always-escalate topics - require checking THIS user's
 // real account state, which no AI provider can do. Checked before the
 // rule-based matcher and before any AI call is attempted.
@@ -181,7 +213,13 @@ function roleSystemPrompt(role, roleLevel) {
     `HARD RULE: if a question is about how a specific RentaPay feature behaves and the exact behavior is not stated ` +
     `above, do NOT invent, infer, or guess an answer from the feature's name alone. Say you're not certain about the ` +
     `exact behavior and suggest "Talk to an agent" or contacting RentaPay support to confirm. A wrong confident answer ` +
-    `is worse than an honest "I'm not sure."`
+    `is worse than an honest "I'm not sure."\n\n` +
+    `HARD RULE: never reply with a bare refusal like "I cannot help with that" or "I don't have that information" and ` +
+    `stop there. Every reply must do at least one of: answer the question, ask one clarifying question, or explicitly ` +
+    `offer to escalate to a human agent / log it as a support ticket. If something sounds like a genuine bug report ` +
+    `(the user describing something on the platform behaving wrong), acknowledge it specifically, say whether it's ` +
+    `expected behavior or not (using the facts above if it's covered), and offer to escalate it if you're not sure - ` +
+    `never dismiss it or ignore what they described.`
   );
 }
 
@@ -345,6 +383,8 @@ module.exports = {
   getOrCreateSession,
   appendMessage,
   getTodayHistory,
+  detectCasualMessage,
+  casualReply,
   ruleBasedMatch,
   detectAlwaysEscalateTopic,
   detectExplicitEscalationIntent,
