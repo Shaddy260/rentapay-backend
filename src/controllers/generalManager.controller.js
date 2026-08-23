@@ -149,7 +149,7 @@ async function listGeneralManagers(req, res) {
 
     let query = supabase
       .from('general_managers')
-      .select('id, full_name, phone, email, gender, is_active, must_change_password, created_at')
+      .select('id, full_name, phone, email, gender, is_active, must_change_password, created_at, can_grant_loyalty_discounts, can_manage_manual_payments')
       .order('created_at', { ascending: false });
 
     if (search && search.trim()) {
@@ -499,15 +499,22 @@ async function setGeneralManagerStatus(req, res) {
 // onboarding pattern (brandAmbassador.controller.js): admin generates
 // one live link and sends it privately to the specific person they
 // want to invite; that person fills in their own details and verifies
-// their own email, rather than admin typing everything in. Unlike BA,
-// there's no pending-approval queue here — admin already chose this
-// exact person by generating and sending them the link directly, so
-// submission activates the account immediately (same trust model as
-// the old admin-typed-it-in flow it replaces).
+// their own email, rather than admin typing everything in.
+//
+// FIX: this used to skip the approval queue entirely on the theory
+// that "admin already chose this exact person by generating the
+// link" - but the link is a single shared URL, not single-use or
+// tied to any one recipient, so anyone who got hold of it could
+// submit their own details and land an active, credentialed General
+// Manager account with no admin review at all. Submission now behaves
+// exactly like BA onboarding: it creates a 'pending_approval' row
+// (is_active stays false, no credentials are sent) and admin must
+// explicitly approve or reject it - see approveGmApplication /
+// rejectGmApplication below - before the account can log in.
 // ---------------------------------------------------------------------
 
 const { generateOTP: generateGmOTP, getEmailVerificationOTPExpiry, isOTPExpired: isGmOTPExpired } = require('../utils/otp');
-const { sendEmail: sendGmEmail, wrapEmailHtml: wrapGmEmailHtml } = require('../services/email.service');
+const { sendEmail: sendGmEmail, wrapEmailHtml: wrapGmEmailHtml, SUPPORT_EMAIL: GM_SUPPORT_EMAIL } = require('../services/email.service');
 
 const GM_ONBOARDING_LINK_TTL_HOURS = 24;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://rentapay.co.ke';
@@ -691,9 +698,9 @@ async function confirmGmEmailVerification(req, res) {
   }
 }
 
-// PUBLIC — step 3: the invitee's own submission. Creates the account
-// immediately (see note above on why there's no approval queue here)
-// and emails a temp password, same as the old admin-typed-it-in flow.
+// PUBLIC — step 3: the invitee's own submission. Creates a
+// pending_approval row - is_active stays false and no credentials go
+// out until admin approves (see note above).
 async function submitGmOnboarding(req, res) {
   try {
     const { fullName, gender, emailVerification, onboardingToken } = req.body;
@@ -742,10 +749,11 @@ async function submitGmOnboarding(req, res) {
     const emailConflict = await findEmailConflict(email, 'general_manager');
     if (emailConflict) return res.status(409).json({ error: emailConflict });
 
-    const tempPassword = generateTempPassword();
-    const passwordHash = await hashPassword(tempPassword);
-
-    let manager;
+    // No password/credentials are generated at submission time anymore
+    // - those only get created on approval (approveGmApplication),
+    // same as BA onboarding. is_active defaults to false at the
+    // column level, but is set explicitly here for clarity.
+    let application;
     try {
       const { data, error } = await supabase
         .from('general_managers')
@@ -754,16 +762,17 @@ async function submitGmOnboarding(req, res) {
           phone,
           email,
           national_id: nationalId,
-          password_hash: passwordHash,
+          password_hash: null,
           is_verified: true,
-          must_change_password: true,
+          is_active: false,
+          status: 'pending_approval',
           gender: gender || null,
           created_by_admin: linkCheck.generatedBy || 'super-admin',
         })
         .select()
         .single();
       if (error) throw error;
-      manager = data;
+      application = data;
     } catch (insertErr) {
       if (insertErr.code === '23505') {
         return res.status(409).json({ error: 'This phone number or email was just registered by another submission. Please check your details.' });
@@ -771,19 +780,26 @@ async function submitGmOnboarding(req, res) {
       throw insertErr;
     }
 
-    const emailBody = templates.generalManagerLoginCredentials(fullName, tempPassword);
-    try {
-      await sendGmEmail(email, "You've been added as a General Manager on RentaPay", wrapGmEmailHtml(emailBody));
-    } catch (emailErr) {
-      logger.error('[generalManager] submitGmOnboarding: CRITICAL - login credentials email failed to send:', emailErr.message);
-      captureException(emailErr);
+    // Notify admin - best-effort, never blocks the response, same
+    // convention as submitBaOnboarding's admin notify.
+    if (GM_SUPPORT_EMAIL) {
+      sendGmEmail(
+        GM_SUPPORT_EMAIL,
+        'New General Manager application awaiting review',
+        wrapGmEmailHtml(
+          `${fullName} submitted a General Manager onboarding form.\n\nPhone: ${phone}\nEmail: ${email}\nNational ID: ${nationalId}\n\nReview it in the admin portal under General Managers > Pending Applications.`
+        )
+      ).catch((notifyErr) => {
+        logger.error('[generalManager] admin notify failed:', notifyErr.message);
+        captureException(notifyErr);
+      });
     }
 
-    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'general_manager_created', targetType: 'general_manager', targetId: manager.id });
+    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'general_manager_application_submitted', targetType: 'general_manager', targetId: application.id });
 
     return res.status(201).json({
-      message: 'Your account has been created. Check your email for your login details.',
-      manager: { id: manager.id },
+      message: 'Your details have been submitted and are pending admin review. You will receive your login details by email once approved.',
+      application: { id: application.id, status: application.status },
     });
   } catch (err) {
     logger.error('[generalManager] submitGmOnboarding error:', err.message);
@@ -792,10 +808,233 @@ async function submitGmOnboarding(req, res) {
   }
 }
 
+// ADMIN — GET /general-managers/applications?page= : the pending
+// review queue, same shape as listPendingBaApplications.
+async function listPendingGmApplications(req, res) {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const pageSize = 20;
+    const from = (page - 1) * pageSize;
+    const to = from + pageSize - 1;
+
+    const { data, error, count } = await supabase
+      .from('general_managers')
+      .select('id, full_name, email, phone, national_id, gender, status, created_at', { count: 'exact' })
+      .eq('status', 'pending_approval')
+      .order('created_at', { ascending: true })
+      .range(from, to);
+    if (error) throw error;
+
+    return res.json({ applications: data || [], total: count || 0, page, pageSize });
+  } catch (err) {
+    logger.error('[generalManager] listPendingGmApplications error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load pending applications.' });
+  }
+}
+
+// ADMIN — POST /general-managers/:id/approve : flips a pending
+// application to active, generates the temp password, and emails
+// login credentials, mirroring approveBaApplication.
+async function approveGmApplication(req, res) {
+  try {
+    const { id } = req.params;
+    const { data: application, error: findErr } = await supabase
+      .from('general_managers')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+    if (findErr) throw findErr;
+    if (!application) return res.status(404).json({ error: 'Application not found.' });
+    if (application.status !== 'pending_approval') {
+      return res.status(400).json({ error: `This application is already ${application.status}, not pending approval.` });
+    }
+
+    const tempPassword = generateTempPassword();
+    const passwordHash = await hashPassword(tempPassword);
+
+    const { data: approved, error: updateErr } = await supabase
+      .from('general_managers')
+      .update({
+        password_hash: passwordHash,
+        must_change_password: true,
+        is_active: true,
+        status: 'active',
+        reviewed_by_admin_id: req.user?.id || 'super-admin',
+        reviewed_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select()
+      .single();
+    if (updateErr) throw updateErr;
+
+    const emailBody = templates.generalManagerLoginCredentials(application.full_name, tempPassword);
+    try {
+      await sendGmEmail(application.email, "You've been added as a General Manager on RentaPay", wrapGmEmailHtml(emailBody));
+    } catch (emailErr) {
+      logger.error('[generalManager] approveGmApplication: CRITICAL - login credentials email failed to send:', emailErr.message);
+      captureException(emailErr);
+    }
+
+    logActivity({
+      actorType: 'admin',
+      actorId: req.user?.id || 'super-admin',
+      action: 'general_manager_application_approved',
+      targetType: 'general_manager',
+      targetId: approved.id,
+    });
+
+    return res.json({
+      message: 'Application approved. Login credentials were sent to the applicant.',
+      manager: { ...approved, password_hash: undefined },
+      // Fallback in case delivery fails - same convention as
+      // approveBaApplication's tempCredentials return.
+      tempCredentials: { phone: application.phone, email: application.email, tempPassword },
+    });
+  } catch (err) {
+    logger.error('[generalManager] approveGmApplication error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to approve application.' });
+  }
+}
+
+// ADMIN — POST /general-managers/:id/reject, body: { reason? }
+async function rejectGmApplication(req, res) {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const { data: application, error: findErr } = await supabase
+      .from('general_managers')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+    if (findErr) throw findErr;
+    if (!application) return res.status(404).json({ error: 'Application not found.' });
+    if (application.status !== 'pending_approval') {
+      return res.status(400).json({ error: `This application is already ${application.status}, not pending approval.` });
+    }
+
+    const { data: rejected, error: updateErr } = await supabase
+      .from('general_managers')
+      .update({
+        status: 'rejected',
+        rejected_reason: reason || null,
+        reviewed_by_admin_id: req.user?.id || 'super-admin',
+        reviewed_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select()
+      .single();
+    if (updateErr) throw updateErr;
+
+    // Does NOT delete the row (kept for audit history) and does NOT
+    // block a future re-application - the partial unique indexes
+    // exclude status = 'rejected'.
+    sendGmEmail(
+      application.email,
+      'Your RentaPay General Manager application',
+      wrapGmEmailHtml(
+        `Thanks for your submission. Unfortunately your General Manager application wasn't approved at this time.${reason ? `\n\nReason: ${reason}` : ''}`
+      )
+    ).catch((emailErr) => {
+      logger.error('[generalManager] rejectGmApplication: notify email failed:', emailErr.message);
+      captureException(emailErr);
+    });
+
+    logActivity({
+      actorType: 'admin',
+      actorId: req.user?.id || 'super-admin',
+      action: 'general_manager_application_rejected',
+      targetType: 'general_manager',
+      targetId: rejected.id,
+      reason: reason || undefined,
+    });
+
+    return res.json({ message: 'Application rejected.', manager: { ...rejected, password_hash: undefined } });
+  } catch (err) {
+    logger.error('[generalManager] rejectGmApplication error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to reject application.' });
+  }
+}
+
+// ADMIN — PATCH /general-managers/:id/permissions, body:
+// { canGrantLoyaltyDiscounts?, canManageManualPayments? }
+// FEATURE (direct request): per-manager toggles for two features that
+// aren't part of the default General Manager scope - see
+// requireGmPermission in auth.middleware.js for where these are
+// actually enforced.
+async function updateGmPermissions(req, res) {
+  try {
+    const { id } = req.params;
+    const { canGrantLoyaltyDiscounts, canManageManualPayments } = req.body;
+
+    const update = {};
+    if (canGrantLoyaltyDiscounts !== undefined) update.can_grant_loyalty_discounts = !!canGrantLoyaltyDiscounts;
+    if (canManageManualPayments !== undefined) update.can_manage_manual_payments = !!canManageManualPayments;
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'Nothing to update.' });
+    }
+
+    const { data: manager, error: findErr } = await supabase.from('general_managers').select('id').eq('id', id).maybeSingle();
+    if (findErr) throw findErr;
+    if (!manager) return res.status(404).json({ error: 'General Manager not found.' });
+
+    const { data: updated, error } = await supabase
+      .from('general_managers')
+      .update(update)
+      .eq('id', id)
+      .select('id, full_name, can_grant_loyalty_discounts, can_manage_manual_payments')
+      .single();
+    if (error) throw error;
+
+    logActivity({
+      actorType: 'admin',
+      actorId: req.user?.id || 'super-admin',
+      action: 'general_manager_permissions_updated',
+      targetType: 'general_manager',
+      targetId: id,
+      metadata: update,
+    });
+
+    return res.json({ manager: updated });
+  } catch (err) {
+    logger.error('[generalManager] updateGmPermissions error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: "Failed to update this General Manager's permissions." });
+  }
+}
+
+// SELF (general_manager) — GET /manager-account/me/permissions : lets
+// the dashboard pick up an admin toggle change (loyalty
+// grant/manual payments) without forcing a fresh login first.
+async function getMyGmPermissions(req, res) {
+  try {
+    const { data: manager, error } = await supabase
+      .from('general_managers')
+      .select('can_grant_loyalty_discounts, can_manage_manual_payments')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!manager) return res.status(404).json({ error: 'Account not found.' });
+    return res.json({
+      canGrantLoyaltyDiscounts: !!manager.can_grant_loyalty_discounts,
+      canManageManualPayments: !!manager.can_manage_manual_payments,
+    });
+  } catch (err) {
+    logger.error('[generalManager] getMyGmPermissions error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load your permissions.' });
+  }
+}
+
 module.exports = {
   createGeneralManager,
   listGeneralManagers,
   setGeneralManagerStatus,
+  updateGmPermissions,
+  getMyGmPermissions,
   setOperationsPin,
   changeOperationsPin,
   requestOperationsPinReset,
@@ -803,6 +1042,9 @@ module.exports = {
   getGmOnboardingLinkStatus,
   generateGmOnboardingLink,
   validateGmOnboardingLinkToken,
+  listPendingGmApplications,
+  approveGmApplication,
+  rejectGmApplication,
   requestGmEmailVerification,
   confirmGmEmailVerification,
   submitGmOnboarding,

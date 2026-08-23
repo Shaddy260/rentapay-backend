@@ -479,7 +479,7 @@ async function processRentPaymentCallback(payment, resultCode, callbackMetadata)
   const today = new Date();
   const nextCycleDueDate = new Date(today.getFullYear(), today.getMonth() + 1, dueDay);
   const prepaymentInfo = buildPrepaymentSummary(newBalance, rentAmount, nextCycleDueDate);
-  const rentPeriodLabel = buildRentPeriodLabel(paidAtDate, prepaymentInfo);
+  const rentPeriodLabel = buildRentPeriodLabel(paidAtDate, prepaymentInfo, rentAmount);
   await supabase.from('payments').update({ rent_period: rentPeriodLabel, balance_after: newBalance }).eq('id', payment.id);
 
   if (isPartial) {
@@ -933,7 +933,7 @@ async function recordManualPayment(req, res) {
     const paymentDateObj = new Date(paymentDate);
     const nextCycleDueDate = new Date(paymentDateObj.getFullYear(), paymentDateObj.getMonth() + 1, dueDay);
     const prepaymentInfo = buildPrepaymentSummary(newBalance, rentAmount, nextCycleDueDate);
-    const rentPeriodLabel = buildRentPeriodLabel(paymentDateObj, prepaymentInfo);
+    const rentPeriodLabel = buildRentPeriodLabel(paymentDateObj, prepaymentInfo, rentAmount);
 
     const { data: payment, error } = await supabase
       .from('payments')
@@ -1241,7 +1241,7 @@ async function downloadAllReceiptsZip(req, res) {
 
     let query = supabase
       .from('payments')
-      .select('*, tenants(full_name), units(unit_name, property_id, properties(name)), landlords(full_name)')
+      .select('*, tenants(full_name), units(unit_name, property_id, properties(name)), landlords(full_name), utility_invoices:target_invoice_id(utility_type, month_key, amount, amount_paid, status)')
       .eq('landlord_id', landlordId)
       .eq('status', 'completed')
       .order('paid_at', { ascending: false });
@@ -1311,7 +1311,7 @@ async function downloadReceiptPdf(req, res) {
 
     const { data: payment, error } = await supabase
       .from('payments')
-      .select('*, tenants(full_name), units(unit_name, property_id, properties(name)), landlords(full_name, kra_pin)')
+      .select('*, tenants(full_name), units(unit_name, property_id, properties(name)), landlords(full_name, kra_pin), utility_invoices:target_invoice_id(utility_type, month_key, amount, amount_paid, status)')
       .eq('id', paymentId)
       .maybeSingle();
     if (error) throw error;

@@ -735,13 +735,49 @@ async function getOrCreateBillingRun(reading, meter) {
   let totalUsage;
 
   if (!meter.is_shared) {
-    const { data: meterUnit } = await supabase.from('utility_meter_units').select('unit_id').eq('meter_id', meter.id).limit(1).maybeSingle();
+    const { data: meterUnit } = await supabase.from('utility_meter_units').select('unit_id, units(unit_name)').eq('meter_id', meter.id).limit(1).maybeSingle();
+    if (!meterUnit) {
+      throw Object.assign(new Error('This meter is not linked to any unit. Edit the meter and select the unit it belongs to.'), { statusCode: 400 });
+    }
+    // THE FIX (direct request): "meter invoices should send to active
+    // occupied units... nothing is sent even after submitting." Root
+    // cause - this branch built a billing row for whatever unit the
+    // meter was linked to, with NO check that unit actually has an
+    // active tenant right now. A vacant unit's linked meter would
+    // silently sail through review, get finalized, and only THEN
+    // fail at the tenant lookup in finalizeRun - by which point the
+    // run was already marked "finalized" with "0 tenants notified"
+    // and no way to tell why. Checking occupancy here, before a run
+    // even gets created, turns that into an immediate, actionable
+    // error instead of a silent no-op three screens later.
+    const { data: activeTenant } = await supabase
+      .from('tenants')
+      .select('id')
+      .eq('unit_id', meterUnit.unit_id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (!activeTenant) {
+      throw Object.assign(
+        new Error(`${meterUnit.units?.unit_name || 'This unit'} has no active tenant right now, so there's nobody to bill. Assign a tenant to the unit first, or check the meter is linked to the right unit.`),
+        { statusCode: 400 }
+      );
+    }
     totalUsage = reading.usage_amount;
     const amount = Math.round(totalUsage * meter.rate_per_unit * 100) / 100;
     runUnits = [{ unitId: meterUnit.unit_id, occupiedDays: svc.daysInMonth(reading.month_key), amount }];
   } else {
     totalUsage = reading.usage_amount;
     const occupied = await svc.getOccupiedUnitsForMonth(meter.id, reading.month_key);
+    // Same fix, shared-meter side: if every unit this meter covers is
+    // currently vacant, splitSharedUsage([]) would otherwise return
+    // an empty list and finalize would again "succeed" with nothing
+    // billed. Fail loudly here instead, before a draft run is created.
+    if (!occupied || occupied.length === 0) {
+      throw Object.assign(
+        new Error('None of the units on this meter currently have an active tenant, so there\u2019s nobody to bill this reading to.'),
+        { statusCode: 400 }
+      );
+    }
     runUnits = svc.splitSharedUsage(totalUsage, meter.rate_per_unit, occupied);
   }
 
@@ -783,6 +819,7 @@ async function getReview(req, res) {
     const run = await getOrCreateBillingRun(reading, meter);
     return res.json({ reading, meter, run });
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
     logger.error('[utilitySubmetering] getReview error:', err.message);
     captureException(err);
     return res.status(500).json({ error: 'Failed to load review.' });
@@ -889,6 +926,7 @@ async function finalizeRun(req, res) {
 
     const { role, id } = currentActor(req);
     const notifiedUnits = [];
+    const skippedUnits = [];
 
     for (const row of run.utility_billing_run_units) {
       const { data: tenant } = await supabase
@@ -897,7 +935,17 @@ async function finalizeRun(req, res) {
         .eq('unit_id', row.unit_id)
         .eq('is_active', true)
         .maybeSingle();
-      if (!tenant) continue; // shouldn't happen (occupied units only reach here), but never fail the whole run over one missing record
+      if (!tenant) {
+        // Can still happen even after the review-time check added
+        // above, if the tenant moved out in the gap between opening
+        // review and clicking Finalize - rare, but silently
+        // discarding the charge would mean it's gone for good. Skip
+        // this one unit, keep going for the rest, and report it by
+        // name at the end instead of a bare "0 tenants" with no clue
+        // why.
+        skippedUnits.push(row.units?.unit_name || row.unit_id);
+        continue;
+      }
 
       // Phase 2: utility charges are billed as their own invoice only
       // - they no longer touch tenants.balance_due, which is rent-only
@@ -936,9 +984,16 @@ async function finalizeRun(req, res) {
       .eq('id', runId);
     await supabase.from('utility_readings').update({ status: 'finalized' }).eq('id', run.reading_id);
 
-    logActivity({ actorType: role, actorId: id, action: 'utility_billing_finalized', targetType: 'utility_billing_run', targetId: runId, metadata: { unitsCharged: notifiedUnits.length } });
+    logActivity({ actorType: role, actorId: id, action: 'utility_billing_finalized', targetType: 'utility_billing_run', targetId: runId, metadata: { unitsCharged: notifiedUnits.length, skippedUnits } });
 
-    return res.json({ message: `Finalized. ${notifiedUnits.length} tenant${notifiedUnits.length === 1 ? '' : 's'} notified and billed.`, unitsCharged: notifiedUnits.length });
+    const skippedNote = skippedUnits.length > 0
+      ? ` ${skippedUnits.length} unit${skippedUnits.length === 1 ? '' : 's'} skipped (no active tenant): ${skippedUnits.join(', ')}.`
+      : '';
+    return res.json({
+      message: `Finalized. ${notifiedUnits.length} tenant${notifiedUnits.length === 1 ? '' : 's'} notified and billed.${skippedNote}`,
+      unitsCharged: notifiedUnits.length,
+      skippedUnits,
+    });
   } catch (err) {
     logger.error('[utilitySubmetering] finalizeRun error:', err.message);
     captureException(err);

@@ -11,7 +11,7 @@ const landlordLeadController = require('../controllers/landlordLead.controller')
 const generalManagerController = require('../controllers/generalManager.controller');
 const generalManagerLogController = require('../controllers/generalManagerLog.controller');
 const generalManagerRevertController = require('../controllers/generalManagerRevert.controller');
-const { verifyToken, requireRole, blockGeneralManagerFinancial, requireOperationsPinConfirmation } = require('../middleware/auth.middleware');
+const { verifyToken, requireRole, blockGeneralManagerFinancial, requireOperationsPinConfirmation, requireGmPermission } = require('../middleware/auth.middleware');
 
 // SECTION 5 (General Manager spec): a General Manager sees everything
 // admin sees on this router - same data, same endpoints - with two
@@ -115,10 +115,17 @@ router.post('/announcements/broadcast', announcementController.createPlatformAnn
 // SECTION 5: these carry subscription payment amounts (platform
 // revenue) - kept out of GM's "financial breakdown" exception, same
 // as the routes above.
+// UPDATED (direct request): every General Manager can now see this
+// queue - the GET list is open to any authenticated GM. Only the
+// write actions (confirm/reject/delete) require admin to have
+// explicitly toggled can_manage_manual_payments on for that specific
+// GM (see GeneralManagersPanel.jsx). This intentionally reverses the
+// earlier "GM without the flag doesn't get the menu item at all"
+// behavior - the mandate now gates the ACTION, not the VISIBILITY.
 router.get('/landlord-manual-subscription-payments', blockGeneralManagerFinancial, manualSubPaymentController.listManualSubscriptionPayments);
-router.post('/landlord-manual-subscription-payments/:id/confirm', blockGeneralManagerFinancial, manualSubPaymentController.confirmManualSubscriptionPayment);
-router.post('/landlord-manual-subscription-payments/:id/reject', blockGeneralManagerFinancial, manualSubPaymentController.rejectManualSubscriptionPayment);
-router.delete('/landlord-manual-subscription-payments/:id', blockGeneralManagerFinancial, manualSubPaymentController.deleteManualSubscriptionPayment);
+router.post('/landlord-manual-subscription-payments/:id/confirm', blockGeneralManagerFinancial, requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.confirmManualSubscriptionPayment);
+router.post('/landlord-manual-subscription-payments/:id/reject', blockGeneralManagerFinancial, requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.rejectManualSubscriptionPayment);
+router.delete('/landlord-manual-subscription-payments/:id', blockGeneralManagerFinancial, requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.deleteManualSubscriptionPayment);
 
 // Rating flag review queue (see sql/add-rating-flag-for-review.sql and
 // ratingFlag.controller.js): a landlord flags a rating as bad-faith,
@@ -148,10 +155,17 @@ router.post('/general-managers', requireRole('admin'), generalManagerController.
 // registered separately (see generalManager.routes.js).
 router.get('/general-managers/onboarding-link', requireRole('admin'), generalManagerController.getGmOnboardingLinkStatus);
 router.post('/general-managers/onboarding-link/generate', requireRole('admin'), generalManagerController.generateGmOnboardingLink);
+// Pending-approval queue for onboarding-link submissions - admin must
+// explicitly approve or reject each one before the account can log
+// in. Same pattern as the Brand Ambassador applications queue.
+router.get('/general-managers/applications', requireRole('admin'), generalManagerController.listPendingGmApplications);
+router.post('/general-managers/:id/approve', requireRole('admin'), generalManagerController.approveGmApplication);
+router.post('/general-managers/:id/reject', requireRole('admin'), generalManagerController.rejectGmApplication);
 // Suspend / reactivate a General Manager's own account - admin-only,
 // same reasoning as the roster/creation routes above (a General
 // Manager can never manage another General Manager's account).
 router.patch('/general-managers/:id/status', requireRole('admin'), generalManagerController.setGeneralManagerStatus);
+router.patch('/general-managers/:id/permissions', requireRole('admin'), generalManagerController.updateGmPermissions);
 
 // SECTION 8 (General Manager spec) - admin browsing a specific
 // General Manager's own dedicated log page (day/week/month views).

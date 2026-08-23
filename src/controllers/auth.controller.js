@@ -1217,6 +1217,16 @@ async function generalManagerLogin(req, res) {
       return res.status(401).json({ error: invalidCredsMsg });
     }
 
+    // A submission via the self-service onboarding link sits as
+    // 'pending_approval' (no password set yet) until admin reviews
+    // it - see submitGmOnboarding / approveGmApplication. Give that
+    // case its own message rather than the generic "suspended" one.
+    if (manager.status === 'pending_approval') {
+      return res.status(403).json({ error: 'Your application is still pending admin review. You will receive your login details by email once approved.', applicationPending: true });
+    }
+    if (manager.status === 'rejected') {
+      return res.status(403).json({ error: 'Your application was not approved. Contact RentaPay support for more information.', applicationRejected: true });
+    }
     if (!manager.is_active) {
       return res.status(403).json({ error: 'Your access has been removed. Contact RentaPay support for more information.', accountSuspended: true });
     }
@@ -1242,6 +1252,13 @@ async function generalManagerLogin(req, res) {
       // that's done - to Operations PIN setup, per Section 4.
       mustChangePassword: manager.must_change_password || false,
       operationsPinSet: !!manager.operations_pin_hash,
+      // FEATURE (direct request) - per-manager toggles set by admin;
+      // the frontend uses these to decide whether to render the
+      // Loyalty Discounts edit controls / show the Landlord Manual
+      // Payments menu item at all for this GM.
+      canGrantLoyaltyDiscounts: !!manager.can_grant_loyalty_discounts,
+      canManageManualPayments: !!manager.can_manage_manual_payments,
+      photoUrl: manager.photo_url || null,
     });
   } catch (err) {
     logger.error('[auth] generalManagerLogin error:', err.message);
@@ -1975,38 +1992,50 @@ async function adminVerifyOTP(req, res) {
 // DIRECT REQUEST: "there should be a way an admin changes lol password
 // from the admin login page... currently it's only in-app... when
 // requesting to change password just send the reset code, don't ask
-// admin to enter email, just send it already, and move to the next
-// page entering otp and new password and confirmation."
-//
-// There is exactly one super-admin account (see the "SUPER ADMIN
-// LOGIN" block above - hardcoded single account), so there's nothing
-// to ask the admin to identify themselves with. The instant this is
-// called, a reset code goes to the one known admin address
-// (SUPER_ADMIN_EMAIL / SUPPORT_EMAIL, same target adminLogin's OTP
-// alert already uses) - no email input field, no "check if this
-// account exists" step.
+// FIX (direct request: "when he taps forgot password, first it
+// should ask for email, and it should only accept the correct admin
+// email, otherwise no code should ever unlock... only send email if
+// the email is the right one"): now requires the caller to submit an
+// email address, and only ever generates/sends a real reset code when
+// it exactly matches the one known admin address. A wrong email gets
+// the exact same generic response as a right one (no "that's not the
+// admin email" signal) - but no OTP is stored, so no code sent to
+// anyone else could ever pair with a live reset session. That's the
+// actual security boundary here, not the copy on the response.
 // ---------------------------------------------------------------------
 async function adminForgotPassword(req, res) {
   try {
+    const { email } = req.body;
     const adminEmail = process.env.SUPER_ADMIN_EMAIL || SUPPORT_EMAIL;
-    const otp = generateOTP();
-    global.__adminPasswordResetOtpStore = { otp, expiresAt: getPasswordResetOTPExpiry() };
+    const submitted = String(email || '').trim().toLowerCase();
+    const matches = submitted && adminEmail && submitted === String(adminEmail).trim().toLowerCase();
 
-    try {
-      await sendEmail(adminEmail, 'Your RentaPay admin password reset code', wrapEmailHtml(templates.adminOtpMessage(otp)));
-    } catch (emailErr) {
-      // Same reasoning as the login-OTP email failure below: the OTP
-      // was already generated and stored, so a broken email provider
-      // must not strand the admin with no way to see it - log it
-      // loudly rather than 500ing the request.
-      logger.error('[auth] adminForgotPassword: reset code email failed to send. Code is still valid - check here:', otp, '| Error:', emailErr.message);
-      captureException(emailErr);
+    if (matches) {
+      const otp = generateOTP();
+      global.__adminPasswordResetOtpStore = { otp, expiresAt: getPasswordResetOTPExpiry() };
+
+      try {
+        await sendEmail(adminEmail, 'Your RentaPay admin password reset code', wrapEmailHtml(templates.adminOtpMessage(otp)));
+      } catch (emailErr) {
+        // Same reasoning as the login-OTP email failure below: the OTP
+        // was already generated and stored, so a broken email provider
+        // must not strand the admin with no way to see it - log it
+        // loudly rather than 500ing the request.
+        logger.error('[auth] adminForgotPassword: reset code email failed to send. Code is still valid - check here:', otp, '| Error:', emailErr.message);
+        captureException(emailErr);
+      }
+    } else {
+      // Wrong (or missing) email: deliberately do nothing that could
+      // produce a working reset - no OTP generated, no email sent -
+      // while still returning the same response shape as the match
+      // case below, so the response itself can't be used to probe for
+      // the real admin address.
+      global.__adminPasswordResetOtpStore = null;
     }
 
-    // Deliberately vague on delivery specifics in the response itself
-    // (no email address echoed back) - the point of this endpoint is
-    // that the admin doesn't need to know or provide it.
-    return res.json({ message: 'A reset code has been sent. Enter it on the next screen along with your new password.' });
+    // Same generic response either way - never confirms or denies
+    // whether the submitted email was the real admin address.
+    return res.json({ message: 'If that email is registered as the admin account, a reset code has been sent to it.' });
   } catch (err) {
     logger.error('[auth] adminForgotPassword error:', err.message);
     captureException(err);

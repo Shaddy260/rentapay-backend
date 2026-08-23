@@ -582,6 +582,39 @@ function effectiveBaId(req) {
   return req.user.id;
 }
 
+/**
+ * FEATURE (direct request) - per-General-Manager feature toggles set
+ * by admin from GeneralManagersPanel.jsx (see
+ * generalManager.controller.js's updateGmPermissions). Admin always
+ * passes through untouched. A General Manager is blocked with a
+ * clear message unless their own general_managers.<column> is true -
+ * this runs for EVERY method (including GET), unlike
+ * requireOperationsPinConfirmation, since some of these toggles gate
+ * visibility itself (e.g. "can this GM even see the manual payments
+ * queue"), not just the write actions on it.
+ */
+function requireGmPermission(column) {
+  return async (req, res, next) => {
+    if (!req.user || req.user.role !== 'general_manager') return next();
+    try {
+      const { data: manager, error } = await supabase
+        .from('general_managers')
+        .select(column)
+        .eq('id', req.user.id)
+        .maybeSingle();
+      if (error) throw error;
+      if (!manager || !manager[column]) {
+        return res.status(403).json({ error: 'Your admin has not enabled this for your account.', permissionDenied: true });
+      }
+      next();
+    } catch (err) {
+      logger.error('[auth] requireGmPermission error:', err.message);
+      captureException(err);
+      return res.status(500).json({ error: 'Failed to verify permission.' });
+    }
+  };
+}
+
 module.exports = {
   signToken,
   verifyToken,
@@ -594,6 +627,7 @@ module.exports = {
   requireBrandAmbassador,
   blockGeneralManagerFinancial,
   requireOperationsPinConfirmation,
+  requireGmPermission,
   effectiveLandlordId,
   effectiveBaId,
   getManagerAssignedPropertyIds,

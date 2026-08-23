@@ -221,7 +221,7 @@ async function editOnboardingRequest(req, res) {
     // a request built by hand against the API can't change it either.
     // If a tenant's email is genuinely wrong, the fix is to delete the
     // request and have them resubmit with a freshly-verified address.
-    const editable = ['fullName', 'primaryPhone', 'secondaryPhone', 'idNumber', 'moveInDate', 'emergencyContactName', 'emergencyContactPhone', 'unitId'];
+    const editable = ['fullName', 'primaryPhone', 'secondaryPhone', 'idNumber', 'moveInDate', 'emergencyContactName', 'emergencyContactPhone', 'unitId', 'depositAmountPaid'];
     const columnMap = {
       fullName: 'full_name',
       primaryPhone: 'primary_phone',
@@ -231,6 +231,7 @@ async function editOnboardingRequest(req, res) {
       emergencyContactName: 'emergency_contact_name',
       emergencyContactPhone: 'emergency_contact_phone',
       unitId: 'unit_id',
+      depositAmountPaid: 'deposit_amount_paid',
     };
 
     const update = {};
@@ -238,6 +239,24 @@ async function editOnboardingRequest(req, res) {
       if (req.body[key] === undefined) continue;
       update[columnMap[key]] = req.body[key];
     }
+
+    // DIRECT REQUEST: "highlight the deposit field so the landlord or
+    // whoever is submitting should see, and correct if it's wrong" -
+    // this is the correction path. Empty string means "clear it back
+    // to blank", anything else must be a valid non-negative number.
+    if (Object.prototype.hasOwnProperty.call(update, 'deposit_amount_paid')) {
+      const raw = update.deposit_amount_paid;
+      if (raw === null || raw === '' || raw === undefined) {
+        update.deposit_amount_paid = null;
+      } else {
+        const parsed = Number(raw);
+        if (Number.isNaN(parsed) || parsed < 0) {
+          return res.status(400).json({ error: 'Deposit amount paid must be a valid, non-negative number.' });
+        }
+        update.deposit_amount_paid = parsed;
+      }
+    }
+
 
     if (update.primary_phone) {
       try {
@@ -339,6 +358,14 @@ async function confirmOnboardingRequest(req, res) {
       moveInDate: request.move_in_date,
       emergencyContactName: request.emergency_contact_name,
       emergencyContactPhone: request.emergency_contact_phone,
+      // DIRECT REQUEST: the deposit the tenant self-reported (and the
+      // landlord/manager/caretaker has had the chance to review and
+      // correct via editOnboardingRequest) is what actually lands on
+      // the tenant record - same field addTenant's manual "Deposit
+      // amount" input writes to, just sourced from the confirmed
+      // request instead of typed in fresh here.
+      depositAmount: request.deposit_amount_paid,
+      depositPaidAt: request.deposit_amount_paid != null ? request.move_in_date : undefined,
       createdByRole: req.user.role === 'manager' ? 'manager' : 'landlord',
       // DIRECT REQUEST ("verification of email should be once"): this
       // request could only have reached 'pending' status at all if
@@ -437,13 +464,26 @@ async function getOnboardingForm(req, res) {
 
     const { data: units, error: unitsErr } = await supabase
       .from('units')
-      .select('id, unit_name, unit_type')
+      .select('id, unit_name, unit_type, requires_deposit, deposit_amount_expected')
       .eq('property_id', link.property_id)
       .eq('status', 'vacant')
       .order('unit_name');
     if (unitsErr) throw unitsErr;
 
-    return res.json({ propertyName: link.properties?.name || 'this property', units: units || [] });
+    // DIRECT REQUEST: the deposit question on the onboarding form
+    // needs to know, per unit, whether this landlord's property even
+    // requires a deposit at all - and if so, what amount is expected -
+    // so the form can hint the tenant appropriately instead of asking
+    // a bare, context-free "deposit paid?" question.
+    const unitsWithDeposit = (units || []).map((u) => ({
+      id: u.id,
+      unit_name: u.unit_name,
+      unit_type: u.unit_type,
+      requiresDeposit: !!u.requires_deposit,
+      depositAmountExpected: u.requires_deposit ? (u.deposit_amount_expected ?? null) : null,
+    }));
+
+    return res.json({ propertyName: link.properties?.name || 'this property', units: unitsWithDeposit });
   } catch (err) {
     logger.error('[tenantOnboarding] getOnboardingForm error:', err.message);
     captureException(err);
@@ -652,13 +692,26 @@ async function submitOnboardingRequest(req, res) {
     if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: 'This onboarding link is invalid.' });
 
-    const { unitId, fullName, email, idNumber, moveInDate, emergencyContactName } = req.body;
+    const { unitId, fullName, email, idNumber, moveInDate, emergencyContactName, depositAmountPaid } = req.body;
     let { primaryPhone, secondaryPhone, emergencyContactPhone } = req.body;
 
     const required = { unitId, fullName, primaryPhone, email, idNumber, moveInDate, emergencyContactName, emergencyContactPhone };
     const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
     if (missing.length) return res.status(400).json({ error: `Please fill in: ${missing.join(', ')}` });
     if (!isValidEmail(email)) return res.status(400).json({ error: 'Please enter a valid, active email address.' });
+
+    // DIRECT REQUEST: deposit amount paid is optional - a tenant who
+    // hasn't paid anything (or hasn't paid yet) just leaves it empty.
+    // Validated here (not just parsed) so a garbage value doesn't
+    // silently become NaN/0 in the database.
+    let depositAmountPaidValue = null;
+    if (depositAmountPaid !== undefined && depositAmountPaid !== null && String(depositAmountPaid).trim() !== '') {
+      const parsed = Number(depositAmountPaid);
+      if (Number.isNaN(parsed) || parsed < 0) {
+        return res.status(400).json({ error: 'Deposit amount paid must be a valid, non-negative number.' });
+      }
+      depositAmountPaidValue = parsed;
+    }
 
     // DIRECT REQUEST ("if not verified, throw an error for them to
     // verify the email first"): enforced server-side, not just as a
@@ -709,12 +762,29 @@ async function submitOnboardingRequest(req, res) {
       });
     }
 
-    const { data: unit, error: unitErr } = await supabase.from('units').select('id, unit_name, property_id, status').eq('id', unitId).maybeSingle();
+    const { data: unit, error: unitErr } = await supabase
+      .from('units')
+      .select('id, unit_name, property_id, status, requires_deposit')
+      .eq('id', unitId)
+      .maybeSingle();
     if (unitErr) throw unitErr;
     if (!unit || unit.property_id !== link.property_id) return res.status(404).json({ error: 'That unit could not be found.' });
     if (unit.status !== 'vacant') {
       return res.status(400).json({ error: 'This unit is already onboarded. Please contact your landlord or manager directly for changes.' });
     }
+
+    // DIRECT REQUEST: "system should mark that as zero if the
+    // landlord's apartment is marked as requires deposit but N/A" -
+    // if this unit requires a deposit and the tenant left the field
+    // empty, record it as an explicit 0 rather than leaving it blank/
+    // unknown, so the reviewing landlord/manager/caretaker sees "0"
+    // to correct, not an ambiguous dash that could just mean "wasn't
+    // asked". Units that don't require a deposit at all are left null -
+    // there's nothing to default there.
+    if (unit.requires_deposit && depositAmountPaidValue === null) {
+      depositAmountPaidValue = 0;
+    }
+
 
     // Resubmission logic: same tenant (same phone), same unit, on
     // this link, submitting again while still pending updates their
@@ -747,6 +817,7 @@ async function submitOnboardingRequest(req, res) {
       move_in_date: moveInDate,
       emergency_contact_name: emergencyContactName,
       emergency_contact_phone: emergencyContactPhone,
+      deposit_amount_paid: depositAmountPaidValue,
       status: 'pending',
     };
 

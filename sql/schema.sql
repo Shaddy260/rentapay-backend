@@ -85,7 +85,7 @@ create table units (
   property_id uuid references properties(id) on delete set null, -- optional grouping; null = ungrouped/default
 
   unit_name text not null,         -- e.g. "A1"
-  unit_payment_code text not null unique, -- e.g. "RPA-A1-001" (blueprint 4.2)
+  unit_payment_code text not null, -- e.g. "RPA-A1-001" (blueprint 4.2) - unique per landlord, see unique constraint below (NOT globally unique: two different landlords can both have "RPA-A1-001")
   unit_type text,                  -- e.g. "Bedsitter", "1 Bedroom"
 
   rent_amount numeric(12,2) not null,
@@ -102,6 +102,11 @@ create table units (
 );
 
 create index idx_units_landlord on units(landlord_id);
+-- Scoped per landlord, not global: two different landlords commonly
+-- name units the same thing ("A1", "House 1", ...), which produces
+-- the same code text - that's fine as long as it's unique within one
+-- landlord's own units. See sql/2026-08-fix-unit-payment-code-scope.sql.
+create unique index idx_units_landlord_payment_code on units(landlord_id, unit_payment_code);
 create index idx_units_property on units(property_id);
 
 -- ---------------------------------------------------------------------

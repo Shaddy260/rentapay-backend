@@ -1174,7 +1174,7 @@ async function listLandlordsOnboarded(req, res) {
 
     let query = supabase
       .from('landlords')
-      .select('id, full_name, phone, location, county, ba_id, created_at')
+      .select('id, full_name, phone, location, county, ba_id, created_at, subscription_expires_at, subscription_status')
       .order('created_at', { ascending: false })
       .limit(1000);
     if (from) query = query.gte('created_at', from);
@@ -1201,6 +1201,8 @@ async function listLandlordsOnboarded(req, res) {
       location: l.location,
       county: l.county,
       createdAt: l.created_at,
+      subscriptionExpiresAt: l.subscription_expires_at,
+      subscriptionStatus: l.subscription_status,
       baId: l.ba_id,
       baName: l.ba_id ? baById[l.ba_id]?.full_name || null : null,
       baCode: l.ba_id ? baById[l.ba_id]?.ba_code || null : null,

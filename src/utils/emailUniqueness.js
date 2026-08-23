@@ -42,7 +42,10 @@ async function findEmailConflict(email, forRole) {
     supabase.from('brand_ambassadors').select('id, status').ilike('email', normalized).neq('status', 'rejected').maybeSingle(),
     // General Manager accounts (admin-provisioned only - see
     // 2026-08-general-manager-role.sql).
-    supabase.from('general_managers').select('id').ilike('email', normalized).maybeSingle(),
+    // Excludes rejected applications, mirroring the partial unique
+    // index on general_managers(lower(email)) WHERE status <>
+    // 'rejected' - see 2026-08-general-manager-onboarding-approval.sql.
+    supabase.from('general_managers').select('id, status').ilike('email', normalized).neq('status', 'rejected').maybeSingle(),
   ]);
 
   // PRIVACY FIX: see phoneUniqueness.js - when forRole is

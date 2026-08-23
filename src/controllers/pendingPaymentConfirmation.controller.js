@@ -17,7 +17,7 @@ const supabase = require('../config/supabase');
 const { effectiveLandlordId, getManagerAssignedPropertyIds } = require('../middleware/auth.middleware');
 const { notify } = require('../services/notify.service');
 const { logActivity } = require('../services/activityLog.service');
-const { applyPaymentToBalance, buildPrepaymentSummary } = require('../utils/prepayment');
+const { applyPaymentToBalance, buildPrepaymentSummary, buildRentPeriodLabel } = require('../utils/prepayment');
 const { buildPaymentInstructions } = require('../utils/paymentInstructions');
 const { blockIfSubscriptionExpired } = require('../utils/subscriptionGate');
 const { captureException } = require('../services/sentry.service');
@@ -217,6 +217,18 @@ async function confirmPendingPayment(req, res) {
     let newBalance = 0;
     let prepaymentInfo = null;
     let billLabel = 'Paybill payment';
+    // FIX (receipt showed "Rent period —" and "Balance after this
+    // payment —" for a confirmed self-reported paybill payment): this
+    // insert into `payments` was missing rent_period and balance_after
+    // entirely - the two other payment-recording paths (STK push,
+    // manual subscription) both set these via buildRentPeriodLabel/
+    // newBalance, but this one (a landlord/manager confirming a
+    // tenant's submitted M-Pesa code) never did, even though it
+    // already computes newBalance and prepaymentInfo right below. Left
+    // null for utility-bill payments (target_type === 'utility') -
+    // "rent period" genuinely doesn't apply to a utility bill.
+    let rentPeriodLabel = null;
+    let rentBalanceAfter = null;
 
     if (record.target_type === 'utility' && record.target_invoice_id) {
       const { data: invoice, error: invoiceErr } = await supabase
@@ -241,6 +253,8 @@ async function confirmPendingPayment(req, res) {
       const today = new Date();
       const nextCycleDueDate = new Date(today.getFullYear(), today.getMonth() + 1, dueDay);
       prepaymentInfo = buildPrepaymentSummary(newBalance, rentAmount, nextCycleDueDate);
+      rentPeriodLabel = buildRentPeriodLabel(new Date(nowIso), prepaymentInfo, rentAmount);
+      rentBalanceAfter = newBalance;
       await supabase.from('tenants').update({ balance_due: newBalance }).eq('id', record.tenant_id);
     }
 
@@ -263,6 +277,8 @@ async function confirmPendingPayment(req, res) {
         recorded_note: `Confirmed by ${actingUser.name}`,
         target_type: record.target_type || 'rent',
         target_invoice_id: record.target_invoice_id || null,
+        rent_period: rentPeriodLabel,
+        balance_after: rentBalanceAfter,
       })
       .select()
       .single();

@@ -59,6 +59,9 @@ function tableForRole(role) {
   // as every other portal, per ProfilePhotoUpload.jsx's shared
   // upload/remove flow.
   if (role === 'brand_ambassador') return 'brand_ambassadors';
+  // FEATURE (direct request): General Manager accounts get a profile
+  // picture too, same upload/remove flow as every other portal.
+  if (role === 'general_manager') return 'general_managers';
   return 'tenants';
 }
 

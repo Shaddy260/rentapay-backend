@@ -105,14 +105,50 @@ function buildPrepaymentSummary(balanceDue, monthlyRent, nextDueDate) {
 // (isAhead) and the credit spans more than one month, label the period
 // as the full range it covers (starting from paidAtDate) instead of a
 // single month, and say explicitly how many months that is.
-function buildRentPeriodLabel(paidAtDate, prepaymentInfo) {
+// FIX (fixes spec item 2.2, "receipts don't reflect advance/extra-month
+// payments"): rent_period on the payment row used to always be just the
+// current calendar month, even when the payment fully covered several
+// months ahead - so a receipt for an advance payment looked identical
+// to a receipt for an ordinary single-month payment, and gave no hint
+// the tenant had paid ahead. When the payment leaves the tenant ahead
+// (isAhead) and the credit spans more than one month, label the period
+// as the full range it covers (starting from paidAtDate) instead of a
+// single month, and say explicitly how many months that is.
+//
+// UPDATED per direct request ("if one has covered 1.5 months or any
+// amount past one month, show the balance remaining for that month
+// and the month/date it applies to - the main period should always
+// read as a complete month or months covered, never a fraction"):
+// the headline period now only ever states whole months (never "1.5
+// months"). Any leftover partial coverage - the fraction beyond the
+// last whole month - is reported separately as its own clause: how
+// much is still owed for that next month, and exactly which month/
+// date that balance is against. monthlyRent is needed to turn that
+// leftover fraction into a real KES amount, so it's now a required
+// third argument.
+function buildRentPeriodLabel(paidAtDate, prepaymentInfo, monthlyRent) {
   const base = paidAtDate.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
-  if (!prepaymentInfo?.isAhead || !prepaymentInfo.fullMonthsCovered || prepaymentInfo.fullMonthsCovered <= 1) {
+  if (!prepaymentInfo?.isAhead || !prepaymentInfo.fullMonthsCovered) {
     return base;
   }
+
   const endDate = addMonths(paidAtDate, prepaymentInfo.fullMonthsCovered - 1);
   const end = endDate.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
-  return `${base} – ${end} (${prepaymentInfo.fullMonthsCovered} months, paid in advance)`;
+  let label = prepaymentInfo.fullMonthsCovered > 1
+    ? `${base} – ${end} (${prepaymentInfo.fullMonthsCovered} months, paid in advance)`
+    : `${base} (paid in full)`;
+
+  // nextPaymentAmount < a full month's rent means there's a partial
+  // credit sitting on top of the whole months already accounted for
+  // above - e.g. 1.5 months covered: fullMonthsCovered=1 goes into the
+  // label above, and this clause reports the remaining half-month.
+  const rent = Number(monthlyRent || 0);
+  if (rent > 0 && prepaymentInfo.nextPaymentAmount < rent - 0.5) {
+    const credited = Math.round((rent - prepaymentInfo.nextPaymentAmount) * 100) / 100;
+    const partialMonthLabel = prepaymentInfo.nextPaymentDueDate.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+    label += `. KES ${credited.toLocaleString()} also credited toward ${partialMonthLabel} - KES ${prepaymentInfo.nextPaymentAmount.toLocaleString()} still due for that month.`;
+  }
+  return label;
 }
 
 module.exports = { applyPaymentToBalance, buildPrepaymentSummary, buildRentPeriodLabel };

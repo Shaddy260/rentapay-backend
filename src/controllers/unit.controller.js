@@ -252,65 +252,104 @@ async function bulkCreateUnits(req, res) {
       }
     }
 
-    // One query for every existing unit name (case-insensitive
-    // compare, same as createUnit), instead of one query per unit.
-    const { data: existingRows, error: existingErr } = await supabase
-      .from('units')
-      .select('unit_name, unit_payment_code')
-      .eq('landlord_id', landlordId);
-    if (existingErr) throw existingErr;
-
-    const existingNames = new Set((existingRows || []).map((r) => (r.unit_name || '').toLowerCase()));
-    let maxCodeNumber = 0;
-    for (const row of existingRows || []) {
-      const match = /-(\d{3,})$/.exec(row.unit_payment_code || '');
-      if (match) maxCodeNumber = Math.max(maxCodeNumber, parseInt(match[1], 10));
-    }
-
-    const toInsert = [];
-    const skipped = [];
-    const seenInBatch = new Set();
-    for (const u of normalized) {
-      const key = u.unitName.toLowerCase();
-      if (existingNames.has(key) || seenInBatch.has(key)) {
-        skipped.push({ unitName: u.unitName, reason: 'A unit with this name already exists.' });
-        continue;
-      }
-      seenInBatch.add(key);
-      maxCodeNumber += 1;
-      const cleanUnitName = u.unitName.replace(/\s+/g, '').toUpperCase();
-      toInsert.push({
-        landlord_id: landlordId,
-        property_id: propertyId || null,
-        unit_name: u.unitName,
-        unit_payment_code: `RPA-${cleanUnitName}-${String(maxCodeNumber).padStart(3, '0')}`,
-        unit_type: u.unitType,
-        rent_amount: u.rentAmount,
-        // FEATURE (direct request: "duplicate should be as fast as
-        // during signup"): AddUnit.jsx's Duplicate form collects ONE
-        // due-day and ONE deposit setting for the whole batch (not
-        // per-unit), so applied uniformly here - same as it would be
-        // if each unit were created individually via createUnit.
-        // Defaults match createUnit's own defaults when not sent at
-        // all, so this stays a no-op for the setup wizard's existing
-        // calls (which never send these).
-        due_day_of_month: dueDayOfMonth || 1,
-        requires_deposit: !!requiresDeposit,
-        deposit_amount_expected: requiresDeposit ? (depositAmountExpected ?? null) : null,
-        extra_charges: [],
-        status: 'vacant',
-      });
-    }
-
+    // HARDENING: createUnit() (the single "+Add" path) self-heals when
+    // two requests land close together and compute the same "next"
+    // payment-code number, by regenerating the code against
+    // freshly-committed data and retrying. This bulk path used to have
+    // no equivalent - it read existing names/codes ONCE, built the
+    // whole batch off that single snapshot, and did one insert. If
+    // ANY row in that insert collided with a payment code committed by
+    // a sibling request in flight (a double-tap on "Continue" or
+    // "Duplicate", or the wizard's own retry-after-failure re-sending
+    // while the first attempt was still landing), Postgres's unique
+    // constraint rejected the WHOLE batch, and every unit - not just
+    // the colliding one - came back as "Failed to save units. None
+    // were added", even though the failure was a timing collision, not
+    // a real duplicate. Retrying with a freshly re-read snapshot (same
+    // idea as createUnit, just re-deriving the whole batch instead of
+    // one code) resolves this automatically instead of surfacing a
+    // confusing all-or-nothing failure.
+    let toInsert = [];
+    let skipped = [];
     let inserted = [];
-    if (toInsert.length > 0) {
-      const { data, error } = await supabase.from('units').insert(toInsert).select();
-      if (error) {
-        logger.error('[unit] bulkCreateUnits insert error:', error.message);
-        captureException(error);
-        return res.status(500).json({ error: 'Failed to save units. None were added - try again.' });
+    let insertError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      // One query for every existing unit name (case-insensitive
+      // compare, same as createUnit), instead of one query per unit.
+      // Re-read fresh on every attempt so a retry sees whatever a
+      // sibling request just committed.
+      const { data: existingRows, error: existingErr } = await supabase
+        .from('units')
+        .select('unit_name, unit_payment_code')
+        .eq('landlord_id', landlordId);
+      if (existingErr) throw existingErr;
+
+      const existingNames = new Set((existingRows || []).map((r) => (r.unit_name || '').toLowerCase()));
+      let maxCodeNumber = 0;
+      for (const row of existingRows || []) {
+        const match = /-(\d{3,})$/.exec(row.unit_payment_code || '');
+        if (match) maxCodeNumber = Math.max(maxCodeNumber, parseInt(match[1], 10));
       }
-      inserted = data || [];
+
+      toInsert = [];
+      skipped = [];
+      const seenInBatch = new Set();
+      for (const u of normalized) {
+        const key = u.unitName.toLowerCase();
+        if (existingNames.has(key) || seenInBatch.has(key)) {
+          skipped.push({ unitName: u.unitName, reason: 'A unit with this name already exists.' });
+          continue;
+        }
+        seenInBatch.add(key);
+        maxCodeNumber += 1;
+        const cleanUnitName = u.unitName.replace(/\s+/g, '').toUpperCase();
+        toInsert.push({
+          landlord_id: landlordId,
+          property_id: propertyId || null,
+          unit_name: u.unitName,
+          unit_payment_code: `RPA-${cleanUnitName}-${String(maxCodeNumber).padStart(3, '0')}`,
+          unit_type: u.unitType,
+          rent_amount: u.rentAmount,
+          // FEATURE (direct request: "duplicate should be as fast as
+          // during signup"): AddUnit.jsx's Duplicate form collects ONE
+          // due-day and ONE deposit setting for the whole batch (not
+          // per-unit), so applied uniformly here - same as it would be
+          // if each unit were created individually via createUnit.
+          // Defaults match createUnit's own defaults when not sent at
+          // all, so this stays a no-op for the setup wizard's existing
+          // calls (which never send these).
+          due_day_of_month: dueDayOfMonth || 1,
+          requires_deposit: !!requiresDeposit,
+          deposit_amount_expected: requiresDeposit ? (depositAmountExpected ?? null) : null,
+          extra_charges: [],
+          status: 'vacant',
+        });
+      }
+
+      if (toInsert.length === 0) {
+        insertError = null;
+        break;
+      }
+
+      const { data, error } = await supabase.from('units').insert(toInsert).select();
+      if (!error) {
+        inserted = data || [];
+        insertError = null;
+        break;
+      }
+      insertError = error;
+      // Postgres unique-violation code. Only worth retrying for that -
+      // any other error (bad column, connection issue, etc) should
+      // fail immediately rather than retry blindly.
+      if (error.code !== '23505') break;
+    }
+    if (insertError) {
+      logger.error('[unit] bulkCreateUnits insert error:', insertError.message);
+      captureException(insertError);
+      if (insertError.code === '23505') {
+        return res.status(409).json({ error: 'Some of these units collided with ones just added elsewhere. Refresh your units list and try again.' });
+      }
+      return res.status(500).json({ error: 'Failed to save units. None were added - try again.' });
     }
 
     // Activity log doesn't need to block the response - the units are

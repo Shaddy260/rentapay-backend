@@ -1,6 +1,6 @@
 // src/routes/settings.routes.js
 const express = require('express');
-const { verifyToken, requireRole } = require('../middleware/auth.middleware');
+const { verifyToken, requireRole, requireGmPermission, requireOperationsPinConfirmation } = require('../middleware/auth.middleware');
 const ctrl = require('../controllers/settings.controller');
 const pricingCtrl = require('../controllers/subscriptionPricing.controller');
 
@@ -41,10 +41,13 @@ adminRouter.get('/subscription-pricing', verifyToken, requireRole('admin', 'gene
 adminRouter.patch('/subscription-pricing', verifyToken, requireRole('admin'), pricingCtrl.updateSubscriptionPricing);
 
 // Loyalty discounts for landlords who've subscribed consecutively.
-adminRouter.get('/loyalty-discounts/candidates', verifyToken, requireRole('admin'), pricingCtrl.getLoyaltyCandidates);
-adminRouter.get('/loyalty-discounts/active', verifyToken, requireRole('admin'), pricingCtrl.getActiveLoyaltyDiscounts);
-adminRouter.get('/loyalty-discounts/history', verifyToken, requireRole('admin'), pricingCtrl.getLoyaltyDiscountHistory);
-adminRouter.post('/loyalty-discounts/bulk-grant', verifyToken, requireRole('admin'), pricingCtrl.bulkGrantLoyaltyDiscount);
-adminRouter.delete('/loyalty-discounts/:landlordId', verifyToken, requireRole('admin'), pricingCtrl.revokeLoyaltyDiscount);
+// FEATURE (direct request): a General Manager can always VIEW these
+// three (candidates/active/history) - the toggle from
+// GeneralManagersPanel.jsx only gates the two write actions below.
+adminRouter.get('/loyalty-discounts/candidates', verifyToken, requireRole('admin', 'general_manager'), pricingCtrl.getLoyaltyCandidates);
+adminRouter.get('/loyalty-discounts/active', verifyToken, requireRole('admin', 'general_manager'), pricingCtrl.getActiveLoyaltyDiscounts);
+adminRouter.get('/loyalty-discounts/history', verifyToken, requireRole('admin', 'general_manager'), pricingCtrl.getLoyaltyDiscountHistory);
+adminRouter.post('/loyalty-discounts/bulk-grant', verifyToken, requireRole('admin', 'general_manager'), requireGmPermission('can_grant_loyalty_discounts'), requireOperationsPinConfirmation, pricingCtrl.bulkGrantLoyaltyDiscount);
+adminRouter.delete('/loyalty-discounts/:landlordId', verifyToken, requireRole('admin', 'general_manager'), requireGmPermission('can_grant_loyalty_discounts'), requireOperationsPinConfirmation, pricingCtrl.revokeLoyaltyDiscount);
 
 module.exports = { publicRouter, adminRouter };

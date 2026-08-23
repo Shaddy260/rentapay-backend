@@ -13,6 +13,20 @@ const { drawBrandedHeader, drawBrandedFooter, LOGO_PATH } = require('./pdfBrandi
 
 const KES = (n) => `KES ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 0 })}`;
 
+// utility_invoices.month_key is stored as 'YYYY-MM' (see
+// 2026-08-utility-invoices-and-first-reading.sql) - turned into the
+// same "Month Year" style every other date on a receipt already uses.
+function utilityMonthLabel(monthKey) {
+  if (!monthKey || !/^\d{4}-\d{2}$/.test(monthKey)) return monthKey || '—';
+  const [year, month] = monthKey.split('-').map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+}
+
+function utilityTypeLabel(type) {
+  if (!type) return 'Utility';
+  return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
 /**
  * @param {import('express').Response} res - PDF is piped directly into this
  * @param {object} params
@@ -213,8 +227,34 @@ async function generatePaymentReceiptPdf(target, { payment, tenantName, unitName
   doc.fontSize(28).fillColor('#2e7d32').font('Helvetica-Bold').text(KES(payment.amount), left + 24, doc.y + 2);
   doc.moveDown(0.8);
 
+  const isUtility = payment.target_type === 'utility';
+  const utilityInvoice = payment.utility_invoices || null;
+
+  // FIX: "Rent period" is pulled out of the fixed-height table rows
+  // below and rendered as its own wrapped block instead - it used to
+  // always be a short one-line value ("August 2026"), but can now be
+  // a full sentence for an advance/partial-month payment (e.g.
+  // "August 2026 (paid in full). KES 425 also credited toward
+  // September 2026 - KES 900 still due for that month."), which the
+  // fixed 20px table rows below have no room or wrapping for.
+  //
+  // FEATURE (direct request - "ensure utility meters also have the
+  // receipt and can be downloaded"): a utility bill payment has no
+  // "rent period" at all - it was already correctly left blank by
+  // the payment-recording code (see pendingPaymentConfirmation
+  // .controller.js), but showing a literal "Rent period —" on a water/
+  // electricity receipt reads as broken, not merely empty. This swaps
+  // in the actual utility bill's own period/type instead, and the
+  // billing month it was for.
+  const periodLabel = isUtility ? 'Billing period' : 'Rent period';
+  const periodValue = isUtility
+    ? (utilityInvoice ? `${utilityMonthLabel(utilityInvoice.month_key)} (${utilityTypeLabel(utilityInvoice.utility_type)} bill)` : '—')
+    : (payment.rent_period || '—');
+  doc.fontSize(10).fillColor('#666').font('Helvetica-Bold').text(periodLabel, left + 24, doc.y);
+  doc.fontSize(10).fillColor('#1a1a1a').font('Helvetica').text(periodValue, left + 24, doc.y + 2, { width: right - left - 48 });
+  doc.moveDown(0.8);
+
   const summaryRows = [
-    ['Rent period', payment.rent_period || '—'],
     ['Date paid', payment.paid_at ? new Date(payment.paid_at).toLocaleString('en-GB') : '—'],
     ['Payment method', (payment.payment_method || '—').replace('_', ' ')],
   ];
@@ -227,14 +267,26 @@ async function generatePaymentReceiptPdf(target, { payment, tenantName, unitName
   // non-positive value, which silently hid a prepayment instead of
   // showing it. Three real states now: owing (arrears), exactly
   // settled, or ahead (credit carried toward future rent).
+  //
+  // For a utility payment, "balance_after" (the tenant's RENT ledger)
+  // was never meant to apply here at all - the meaningful balance is
+  // the utility invoice's own remaining amount, read straight off the
+  // joined utility_invoices row instead.
   let balanceAfterLabel = '—';
-  if (payment.balance_after != null) {
+  let balanceAfterRowLabel = 'Balance after this payment';
+  if (isUtility) {
+    balanceAfterRowLabel = 'Bill balance after this payment';
+    if (utilityInvoice) {
+      const remaining = Math.round((Number(utilityInvoice.amount) - Number(utilityInvoice.amount_paid || 0)) * 100) / 100;
+      balanceAfterLabel = remaining > 0 ? `${KES(remaining)} still due` : 'KES 0 (fully settled)';
+    }
+  } else if (payment.balance_after != null) {
     const balanceAfterNum = Number(payment.balance_after);
     if (balanceAfterNum > 0) balanceAfterLabel = `${KES(balanceAfterNum)} (arrears)`;
     else if (balanceAfterNum < 0) balanceAfterLabel = `${KES(Math.abs(balanceAfterNum))} credit (paid in advance)`;
     else balanceAfterLabel = 'KES 0 (fully settled)';
   }
-  summaryRows.push(['Balance after this payment', balanceAfterLabel]);
+  summaryRows.push([balanceAfterRowLabel, balanceAfterLabel]);
 
   writeRows(doc, summaryRows, left, right);
 
@@ -544,4 +596,5 @@ module.exports = {
   generateEarningsStatementPdf,
   generateBaRewardReportPdf,
   receiptNumber,
+  utilityMonthLabel,
 };

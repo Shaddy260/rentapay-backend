@@ -38,5 +38,6 @@ router.post('/operations-pin/reset', generalManagerController.resetOperationsPin
 // req.user.id - there is no id param here, so a General Manager can
 // never browse anyone else's history this way.
 router.get('/my-logs', generalManagerLogController.getMyLogs);
+router.get('/me/permissions', generalManagerController.getMyGmPermissions);
 
 module.exports = router;

@@ -43,12 +43,27 @@ async function generateUnitCode(landlordId, unitName) {
   // Guard against a rare race (two units created at the same instant)
   // by retrying on a unique-constraint violation with the next number,
   // instead of just failing the request.
+  //
+  // FIX: this existence check used to be unscoped (checked ANY
+  // landlord's units for the candidate code), which relied on
+  // unit_payment_code being globally unique in the database. That
+  // constraint was wrong - see sql/2026-08-fix-unit-payment-code-scope.sql
+  // - and codes are built from the landlord's own literal unit name
+  // (e.g. "A1" -> "RPA-A1-001"), so two different landlords who both
+  // name a unit "A1" always produced the identical code. Scoping this
+  // check to landlord_id (matching the DB constraint and matching
+  // maxNumber above, which was already landlord-scoped) means a
+  // collision can now only happen against this SAME landlord's own
+  // units - a genuine, retryable race - instead of a permanent clash
+  // with a complete stranger's property that no amount of retrying
+  // could ever resolve.
   for (let attempt = 0; attempt < 5; attempt++) {
     const candidateNumber = maxNumber + 1 + attempt;
     const candidateCode = `RPA-${cleanUnitName}-${String(candidateNumber).padStart(3, '0')}`;
     const { data: existing } = await supabase
       .from('units')
       .select('id')
+      .eq('landlord_id', landlordId)
       .eq('unit_payment_code', candidateCode)
       .maybeSingle();
     if (!existing) return candidateCode;

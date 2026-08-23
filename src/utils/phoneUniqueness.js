@@ -48,7 +48,10 @@ async function findPhoneConflict(phone, forRole) {
     // 2026-08-general-manager-role.sql). No archive/soft-delete
     // concept exists for this role yet (Section 2 only), so any row
     // here counts as active.
-    supabase.from('general_managers').select('id').eq('phone', phone).maybeSingle(),
+    // Excludes rejected applications, mirroring the partial unique
+    // index on general_managers.phone (WHERE status <> 'rejected') -
+    // see 2026-08-general-manager-onboarding-approval.sql.
+    supabase.from('general_managers').select('id, status').eq('phone', phone).neq('status', 'rejected').maybeSingle(),
   ]);
 
   // PRIVACY FIX: when the account being registered is a Brand

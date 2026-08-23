@@ -18,7 +18,7 @@ const supabase = require('../config/supabase');
 const jwt = require('jsonwebtoken');
 const { getPropertyReputationsByIds } = require('../services/propertyReputation.service');
 const reputationService = require('../services/reputation.service');
-const { receiptNumber } = require('../services/pdfReport.service');
+const { receiptNumber, utilityMonthLabel: monthKeyLabel } = require('../services/pdfReport.service');
 const { getPublicKey } = require('../services/webpush.service');
 const {
   saveVacancyAlertSubscription,
@@ -295,7 +295,7 @@ async function verifyReceipt(req, res) {
 
     const { data: payment, error } = await supabase
       .from('payments')
-      .select('id, amount, paid_at, rent_period, payment_method, status, tenants(full_name), units(unit_name, properties(name))')
+      .select('id, amount, paid_at, rent_period, payment_method, status, target_type, tenants(full_name), units(unit_name, properties(name)), utility_invoices:target_invoice_id(utility_type, month_key)')
       .eq('id', paymentId)
       .maybeSingle();
     if (error) throw error;
@@ -304,12 +304,24 @@ async function verifyReceipt(req, res) {
       return res.status(404).json({ error: 'No verified receipt matches this code.' });
     }
 
+    // FEATURE (direct request - utility payments get a real receipt
+    // too): mirrors the same branching as the downloadable PDF
+    // (pdfReport.service.js) - a utility bill payment has no
+    // "rent period" at all, so this reports its own billing period/
+    // type instead of a blank/misleading rent field.
+    const isUtility = payment.target_type === 'utility';
+    const periodLabel = isUtility
+      ? (payment.utility_invoices
+          ? `${monthKeyLabel(payment.utility_invoices.month_key)} (${(payment.utility_invoices.utility_type || 'utility').replace(/^\w/, (c) => c.toUpperCase())} bill)`
+          : null)
+      : (payment.rent_period || null);
+
     return res.json({
       valid: true,
       receiptNumber: receiptNumber(payment.id),
       amount: payment.amount,
       paidAt: payment.paid_at,
-      rentPeriod: payment.rent_period || null,
+      rentPeriod: periodLabel,
       paymentMethod: payment.payment_method,
       tenantName: payment.tenants?.full_name || null,
       unitName: payment.units?.unit_name || null,
