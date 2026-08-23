@@ -111,6 +111,13 @@ async function logGmActivity({
         context: context && Object.keys(context).length ? context : null,
         ip_address: ipAddress || null,
         is_revertible: isRevertible,
+        // ADMIN CONFIRMATION QUEUE (direct request): the GM's Operations
+        // PIN confirms the action for THEM and lets it go ahead right
+        // away, but every sensitive/revertible action still needs a
+        // separate admin sign-off afterward. Only the same set Section
+        // 10 already calls revertible ever enters this queue - routine,
+        // non-sensitive GM activity is never held up waiting on admin.
+        admin_review_status: isRevertible ? 'pending' : null,
       })
       .select('id')
       .single();
@@ -268,11 +275,105 @@ async function revertGmLogsInRange(generalManagerId, fromIso, toIso, revertedBy)
   return results;
 }
 
+// ---------------------------------------------------------------------
+// ADMIN CONFIRMATION QUEUE — every sensitive GM action lands here
+// (admin_review_status = 'pending') for admin to confirm or reject,
+// one-by-one or in bulk, on top of (not instead of) the GM's own
+// Operations-PIN confirmation. Rejecting reuses revertGmLog() so the
+// affected record is restored to its exact prior state.
+// ---------------------------------------------------------------------
+
+/** Every action currently awaiting admin review, across all General Managers, newest first. */
+async function listPendingReviews() {
+  const { data, error } = await supabase
+    .from('general_manager_activity_logs')
+    .select('*, general_managers(full_name, email)')
+    .eq('admin_review_status', 'pending')
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+/** Lightweight count for the admin sidebar badge / incoming-items banner. */
+async function countPendingReviews() {
+  const { count, error } = await supabase
+    .from('general_manager_activity_logs')
+    .select('id', { count: 'exact', head: true })
+    .eq('admin_review_status', 'pending');
+  if (error) throw error;
+  return count || 0;
+}
+
+/**
+ * Resolves one pending action: 'confirm' just acknowledges it (the
+ * action already took effect - this simply clears it from the queue),
+ * 'reject' undoes it immediately via the same exact-state revert
+ * Section 10 uses, then marks it rejected.
+ */
+async function reviewGmLog(logId, decision, reviewedBy) {
+  if (decision !== 'confirm' && decision !== 'reject') {
+    return { ok: false, error: 'Decision must be "confirm" or "reject".' };
+  }
+
+  const { data: log, error } = await supabase.from('general_manager_activity_logs').select('*').eq('id', logId).maybeSingle();
+  if (error) throw error;
+  if (!log) return { ok: false, error: 'Log entry not found.' };
+  if (log.admin_review_status !== 'pending') {
+    return { ok: false, error: 'This action has already been reviewed.' };
+  }
+
+  if (decision === 'reject' && !log.reverted_at) {
+    const revertResult = await revertGmLog(logId, reviewedBy);
+    if (!revertResult.ok) return revertResult;
+  }
+
+  const { error: updErr } = await supabase
+    .from('general_manager_activity_logs')
+    .update({
+      admin_review_status: decision === 'confirm' ? 'confirmed' : 'rejected',
+      reviewed_at: new Date().toISOString(),
+      reviewed_by: reviewedBy || 'super-admin',
+    })
+    .eq('id', logId);
+  if (updErr) throw updErr;
+
+  return { ok: true };
+}
+
+/**
+ * Reviews several specific pending log ids at once (checkbox
+ * multi-select). Each is resolved independently - one failure doesn't
+ * stop the rest - and the response reports exactly which ids
+ * succeeded and which didn't.
+ */
+async function bulkReviewGmLogs(logIds, decision, reviewedBy) {
+  const results = { succeeded: [], failed: [] };
+  for (const id of logIds || []) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await reviewGmLog(id, decision, reviewedBy);
+    if (result.ok) results.succeeded.push(id);
+    else results.failed.push({ id, error: result.error });
+  }
+  return results;
+}
+
+/** "Confirm/reject ALL" — resolves every action currently awaiting review, across every manager. */
+async function reviewAllPending(decision, reviewedBy) {
+  const { data: pending, error } = await supabase.from('general_manager_activity_logs').select('id').eq('admin_review_status', 'pending');
+  if (error) throw error;
+  return bulkReviewGmLogs((pending || []).map((p) => p.id), decision, reviewedBy);
+}
+
 module.exports = {
   logGmActivity,
   listManagerLogs,
   listManagerLogsBetween,
   revertGmLog,
   revertGmLogsInRange,
+  listPendingReviews,
+  countPendingReviews,
+  reviewGmLog,
+  bulkReviewGmLogs,
+  reviewAllPending,
   humanize,
 };

@@ -1267,6 +1267,138 @@ async function generalManagerLogin(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// GENERAL MANAGER FORGOT PASSWORD (direct request: "general manager
+// dont have a way to reset their password ... add it and also add it
+// from the login screen"). Same email + OTP mechanics as the shared
+// requestPasswordReset/resetPassword pair above, but deliberately its
+// own self-contained functions scoped to ONLY the general_managers
+// table - general_managers is intentionally never part of
+// ALL_ACCOUNT_TYPES (see generalManagerLogin's header note above), so
+// this reuses the same building blocks (generateOTP, sendEmail,
+// validatePasswordStrength, ...) without touching that shared
+// multi-account-type auto-detect logic at all.
+// ---------------------------------------------------------------------
+async function generalManagerForgotPassword(req, res) {
+  try {
+    let { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email is required.' });
+    email = String(email).trim();
+
+    // Same anti-enumeration rate-limit-before-lookup pattern as the
+    // shared requestPasswordReset - a blocked/allowed response never
+    // differs based on whether the email is actually registered.
+    const rateCheck = checkAndRecordResend('password-reset', `gm:${email}`);
+    if (!rateCheck.allowed) {
+      return res.status(429).json({ error: `Too many attempts. Please try again in ${rateCheck.retryAfterMinutes} minute(s).` });
+    }
+
+    const { data: manager } = await supabase.from('general_managers').select('*').ilike('email', email).maybeSingle();
+
+    // Same generic response either way (below) so this can't be used
+    // to check which emails belong to a General Manager account -
+    // matches every other role's forgot-password behaviour.
+    if (manager) {
+      if (!manager.is_active || manager.status === 'rejected') {
+        // Deliberate departure, same as the shared flow: a
+        // suspended/rejected account is told plainly and gets nothing
+        // sent, rather than the generic "if registered..." message.
+        return res.status(403).json({ error: 'This account is not active. Contact RentaPay support for more information.' });
+      }
+      if (manager.status === 'pending_approval') {
+        return res.status(403).json({ error: 'Your application is still pending admin review.' });
+      }
+
+      const otp = generateOTP();
+      const otpExpiresAt = getPasswordResetOTPExpiry();
+
+      await supabase.from('general_managers').update({ otp_code: otp, otp_expires_at: otpExpiresAt.toISOString() }).eq('id', manager.id);
+
+      try {
+        await sendEmail(manager.email, 'Your RentaPay password reset code', wrapEmailHtml(templates.passwordResetOtpMessage(otp)));
+      } catch (emailErr) {
+        logger.error('[auth] generalManagerForgotPassword: email send failed:', emailErr.message);
+        captureException(emailErr);
+      }
+
+      // Same admin-portal recoverability every other role's reset
+      // code gets (see requestPasswordReset above), in case the email
+      // never arrives.
+      try {
+        await supabase.from('password_reset_requests').insert({
+          landlord_id: null,
+          role: 'general_manager',
+          account_id: manager.id,
+          full_name: manager.full_name,
+          phone: manager.phone || '',
+          otp,
+          expires_at: otpExpiresAt.toISOString(),
+        });
+      } catch (logErr) {
+        logger.warn('[auth] generalManagerForgotPassword: failed to log to password_reset_requests (non-fatal):', logErr.message);
+        captureException(logErr);
+      }
+    }
+
+    return res.json({ message: 'If that email is registered as a General Manager, a reset code has been sent to it.' });
+  } catch (err) {
+    logger.error('[auth] generalManagerForgotPassword error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to process reset request.' });
+  }
+}
+
+async function generalManagerResetPassword(req, res) {
+  try {
+    let { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ error: 'email, otp, and newPassword are required.' });
+    }
+    email = String(email).trim();
+
+    const genericError = { error: 'Invalid code.' };
+
+    const { data: manager } = await supabase.from('general_managers').select('*').ilike('email', email).maybeSingle();
+    if (!manager || !manager.otp_code || manager.otp_code !== otp) {
+      return res.status(400).json(genericError);
+    }
+    if (isOTPExpired(manager.otp_expires_at)) {
+      return res.status(400).json({ error: 'That code has expired. Request a new one.' });
+    }
+    if (!manager.is_active) {
+      return res.status(403).json({ error: 'This account is not active. Contact RentaPay support for more information.' });
+    }
+
+    const { isValid, errors } = validatePasswordStrength(newPassword, { phone: manager.phone, name: manager.full_name });
+    if (!isValid) {
+      return res.status(400).json({ error: errors.join(' ') });
+    }
+
+    const newHash = await hashPassword(newPassword);
+    const { error: updateError } = await supabase
+      .from('general_managers')
+      .update({ password_hash: newHash, otp_code: null, otp_expires_at: null, must_change_password: false })
+      .eq('id', manager.id);
+    if (updateError) throw updateError;
+
+    try {
+      await sendEmail(manager.email, 'Your RentaPay password was reset', wrapEmailHtml(templates.passwordChanged(manager.full_name)));
+    } catch (emailErr) {
+      logger.warn('[auth] generalManagerResetPassword: confirmation email failed (non-fatal, password was already changed):', emailErr.message);
+      captureException(emailErr);
+    }
+
+    logActivity({ actorType: 'general_manager', actorId: manager.id, action: 'password_reset', targetType: 'general_manager', targetId: manager.id });
+
+    clearResendAttempts('password-reset', `gm:${email}`);
+    return res.json({ message: 'Password reset successfully. You can now log in with your new password.' });
+  } catch (err) {
+    logger.error('[auth] generalManagerResetPassword error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to reset password.' });
+  }
+}
+
 async function login(req, res) {
   try {
     const { password } = req.body;
@@ -3058,6 +3190,8 @@ module.exports = {
   login,
   loginWithGoogle,
   generalManagerLogin,
+  generalManagerForgotPassword,
+  generalManagerResetPassword,
   adminLogin,
   adminVerifyOTP,
   adminForgotPassword,

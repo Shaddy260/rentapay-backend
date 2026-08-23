@@ -57,11 +57,11 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
   const [{ data: rosterLandlords, error: rosterErr }, { data: rosterProperties, error: rosterPropsErr }] = await Promise.all([
     supabase
       .from('landlords')
-      .select('id, full_name, phone, county, ba_id, ba_qualification_status')
+      .select('id, full_name, phone, county, ba_id, subscription_status')
       .not('ba_id', 'is', null),
     supabase
       .from('properties')
-      .select('id, name, county, ba_id, ba_qualification_status, landlord_id, landlords(full_name, phone)')
+      .select('id, name, county, ba_id, subscription_status, landlord_id, landlords(full_name, phone)')
       .not('ba_id', 'is', null),
   ]);
   if (rosterErr) throw rosterErr;
@@ -75,7 +75,7 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
     phone: p.landlords?.phone || null,
     county: p.county,
     ba_id: p.ba_id,
-    ba_qualification_status: p.ba_qualification_status,
+    subscription_status: p.subscription_status,
     propertyId: p.id,
     propertyName: p.name,
   }));
@@ -146,7 +146,15 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
     // two. Property rows always show as qualified-but-not-yet-earning
     // until that commission wiring exists.
     const earning = l.entryType === 'property' ? null : earningsByLandlord.get(`${l.ba_id}:${l.id}`);
-    const qualifiesThisCycle = l.ba_qualification_status === 'qualified' && !!earning;
+    // FIX (direct request: "qualification right now is based on
+    // whether the landlord onboarded is active or not... this one
+    // reuses the previous [multi-condition] one"): drop the
+    // ba_qualification_status-based check entirely (that was the old
+    // "has ever made a qualifying payment" concept) in favor of the
+    // landlord/property's actual current subscription_status - a
+    // landlord only counts as qualifying while their subscription is
+    // presently 'active', not based on history.
+    const qualifiesThisCycle = l.subscription_status === 'active';
 
     baMap.get(ba.id).landlords.push({
       landlordId: l.id,
@@ -156,7 +164,7 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
       name: l.full_name,
       phone: l.phone,
       county: l.county,
-      qualificationStatus: l.ba_qualification_status,
+      qualificationStatus: l.subscription_status,
       qualifiesThisCycle,
       paymentAmount: earning ? earning.paymentAmount : 0,
       percentageApplied: earning ? earning.percentageApplied : null,
@@ -224,13 +232,13 @@ async function buildAndPersistReport({ periodKey, adminId, adminName }) {
         property_name: l.propertyName || null,
         onboarded_at: null,
         qualifies: l.qualifiesThisCycle,
-        reason: l.qualifiesThisCycle
-          ? null
-          : l.qualificationStatus !== 'qualified'
-            ? 'Not yet qualified'
-            : l.entryType === 'property'
-              ? 'Qualified, but commission recording for added properties is not yet wired'
-              : 'No completed payment in this cycle',
+        // Not-qualifying now only ever means "hasn't subscribed/paid
+        // yet at all" - a qualified landlord who simply has no NEW
+        // payment this specific cycle (already renewed earlier, or a
+        // property whose commission isn't wired yet) still counts as
+        // qualifying above; that just shows as KES 0 owed this cycle
+        // rather than as a disqualification.
+        reason: l.qualifiesThisCycle ? null : 'Subscription not active',
         payment_amount: l.paymentAmount,
         percentage_applied: l.percentageApplied,
         commission_amount: l.commissionAmount,

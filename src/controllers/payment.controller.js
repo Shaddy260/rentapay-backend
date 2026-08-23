@@ -1056,6 +1056,51 @@ async function listOpenUtilityInvoicesForProperty(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// List one tenant's own currently-open (not yet fully paid) utility
+// invoices - the per-tenant counterpart to
+// listOpenUtilityInvoicesForProperty above. Lets the NORMAL "Record
+// payment" modal on a tenant's unit page (UnitDetail.jsx) offer their
+// water/electricity bills alongside rent, instead of a landlord/
+// manager needing a second, separate "Record a utility payment"
+// screen just to record one tenant's bill.
+//
+// DIRECT REQUEST: "the manual recording aspect can be covered under
+// the normal record payment under tenant/unit... the bills should be
+// included, only if the landlord or manager has included the
+// meters." This naturally falls out of the data: a tenant only ever
+// HAS a row in utility_invoices if a meter was set up and a reading
+// was billed against their unit (see utilitySubmetering.controller.js
+// Section 7). No meter configured for their unit -> this simply
+// returns an empty list -> the normal modal shows Rent only, exactly
+// as it already does today.
+// ---------------------------------------------------------------------
+async function listOpenUtilityInvoicesForTenant(req, res) {
+  try {
+    const landlordId = effectiveLandlordId(req);
+    const { tenantId } = req.query;
+    if (!tenantId) return res.status(400).json({ error: 'tenantId is required.' });
+
+    const { data: tenant, error: tenantErr } = await supabase.from('tenants').select('id, landlord_id').eq('id', tenantId).maybeSingle();
+    if (tenantErr) throw tenantErr;
+    if (!tenant || tenant.landlord_id !== landlordId) return res.status(404).json({ error: 'Tenant not found on your account.' });
+
+    const { data: invoices, error } = await supabase
+      .from('utility_invoices')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .neq('status', 'paid')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    return res.json({ invoices: invoices || [] });
+  } catch (err) {
+    logger.error('[payment] listOpenUtilityInvoicesForTenant error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load open bills for this tenant.' });
+  }
+}
+
 async function recordManualUtilityPayment(req, res) {
   try {
     const landlordId = effectiveLandlordId(req);
@@ -1360,6 +1405,7 @@ module.exports = {
   recordManualPayment,
   recordManualUtilityPayment,
   listOpenUtilityInvoicesForProperty,
+  listOpenUtilityInvoicesForTenant,
   getLandlordPaymentHistory,
   deletePayment,
   downloadReceiptPdf,

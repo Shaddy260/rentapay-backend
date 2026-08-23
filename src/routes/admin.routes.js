@@ -11,6 +11,7 @@ const landlordLeadController = require('../controllers/landlordLead.controller')
 const generalManagerController = require('../controllers/generalManager.controller');
 const generalManagerLogController = require('../controllers/generalManagerLog.controller');
 const generalManagerRevertController = require('../controllers/generalManagerRevert.controller');
+const generalManagerReviewController = require('../controllers/generalManagerReview.controller');
 const { verifyToken, requireRole, blockGeneralManagerFinancial, requireOperationsPinConfirmation, requireGmPermission } = require('../middleware/auth.middleware');
 
 // SECTION 5 (General Manager spec): a General Manager sees everything
@@ -29,6 +30,7 @@ const { verifyToken, requireRole, blockGeneralManagerFinancial, requireOperation
 router.use(verifyToken, requireRole('admin', 'general_manager'), requireOperationsPinConfirmation);
 
 router.get('/dashboard', adminController.getDashboardMetrics);
+router.get('/search', adminController.globalSearch);
 router.get('/landlords', adminController.listAllLandlords);
 // FEATURE (spec item 10): landlords who started but never finished
 // the registration/setup wizard, with which step they stopped at.
@@ -64,6 +66,12 @@ router.patch('/landlords/:landlordId/status', adminController.setLandlordStatus)
 router.delete('/landlords/:landlordId', adminController.deleteLandlordAccount);
 router.patch('/landlords/:landlordId/subscription', adminController.editLandlordSubscription);
 router.get('/landlords/:landlordId/properties', adminController.getLandlordProperties);
+// Managers/caretakers share the landlord's dashboard/data model rather
+// than having their own admin tab - surfaced nested under their
+// landlord (both in the landlords drilldown and via global search
+// deep-link) with the same suspend/activate actions as a landlord.
+router.get('/landlords/:landlordId/managers', adminController.getLandlordManagers);
+router.patch('/managers/:managerId/status', adminController.setManagerStatus);
 router.get('/first-time-credentials', credentialsController.listAllFirstTimeCredentialsForAdmin);
 router.get('/password-reset-requests', credentialsController.listAllPasswordResetRequestsForAdmin);
 router.get('/activity-log', adminController.getActivityLog);
@@ -191,5 +199,19 @@ router.get('/general-managers/:id/logs/export.pdf', requireRole('admin'), genera
 // generalManagerRevert.controller.js's header note.
 router.post('/general-managers/:id/logs/:logId/revert', requireRole('admin'), generalManagerRevertController.revertSingleLog);
 router.post('/general-managers/:id/logs/revert-range', requireRole('admin'), generalManagerRevertController.revertRange);
+
+// ADMIN CONFIRMATION QUEUE (direct request) — every sensitive GM
+// action (same set Section 10 marks is_revertible) lands here for
+// admin to confirm or reject, on top of the GM's own Operations-PIN
+// confirmation. Listed across ALL managers (not scoped to one :id
+// like the routes above) so it can power a single dedicated admin-
+// portal page + incoming-items banner. Admin-only; a General Manager
+// never sees this queue. Confirm/reject one-by-one, a checkbox-
+// selected batch, or everything pending at once — see
+// generalManagerReview.controller.js.
+router.get('/general-managers/pending-reviews', requireRole('admin'), generalManagerReviewController.listPending);
+router.get('/general-managers/pending-reviews/count', requireRole('admin'), generalManagerReviewController.getPendingCount);
+router.post('/general-managers/pending-reviews/bulk-review', requireRole('admin'), generalManagerReviewController.reviewBulk);
+router.post('/general-managers/pending-reviews/:logId/review', requireRole('admin'), generalManagerReviewController.reviewOne);
 
 module.exports = router;

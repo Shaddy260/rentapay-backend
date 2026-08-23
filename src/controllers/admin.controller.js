@@ -380,6 +380,136 @@ async function getLandlordProperties(req, res) {
 }
 
 // ---------------------------------------------------------------------
+// MANAGERS/CARETAKERS NESTED UNDER A LANDLORD (admin/GM)
+//
+// Managers and caretakers don't have their own portal or dashboard -
+// they log into the SAME landlord dashboard the landlord uses (see
+// propertyManager.controller.js's doc comment), so admin doesn't get a
+// standalone "Managers" tab either. Instead they're surfaced nested
+// under their landlord, both from the landlords drilldown/table (an
+// expandable row) and via global search deep-link, with the same
+// suspend/activate actions a landlord row gets.
+//
+// listManagers (propertyManager.controller.js) can't be reused as-is:
+// it resolves the landlord to scope to via effectiveLandlordId(req),
+// which for an admin/GM token resolves to the admin's own id, not the
+// landlord being looked at. This is a small, admin-specific sibling
+// that takes the landlordId explicitly from the URL and - unlike the
+// landlord-facing listing - always includes suspended (is_active:
+// false) managers too, since seeing/reactivating a suspended one is
+// the whole point of this view.
+// ---------------------------------------------------------------------
+async function getLandlordManagers(req, res) {
+  try {
+    const { landlordId } = req.params;
+
+    const { data: landlord, error: landlordError } = await supabase
+      .from('landlords')
+      .select('id, full_name')
+      .eq('id', landlordId)
+      .maybeSingle();
+    if (landlordError) throw landlordError;
+    if (!landlord) return res.status(404).json({ error: 'Landlord not found.' });
+
+    const { data: managers, error } = await supabase
+      .from('property_managers')
+      .select('id, full_name, phone, email, photo_url, is_active, is_verified, role_level, gender, created_at, whatsapp_number')
+      .eq('landlord_id', landlordId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const managerIds = (managers || []).map((m) => m.id);
+    let assignmentsByManager = {};
+    if (managerIds.length) {
+      const { data: assignments, error: aErr } = await supabase
+        .from('property_manager_assignments')
+        .select('property_manager_id, property_id, properties(id, name)')
+        .in('property_manager_id', managerIds);
+      if (aErr) throw aErr;
+      assignmentsByManager = (assignments || []).reduce((acc, a) => {
+        acc[a.property_manager_id] = acc[a.property_manager_id] || [];
+        acc[a.property_manager_id].push({ id: a.property_id, name: a.properties?.name });
+        return acc;
+      }, {});
+    }
+
+    return res.json({
+      landlord,
+      managers: (managers || []).map((m) => ({ ...m, assignedProperties: assignmentsByManager[m.id] || [] })),
+    });
+  } catch (err) {
+    logger.error('[admin] getLandlordManagers error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to fetch managers/caretakers for this landlord.' });
+  }
+}
+
+// ---------------------------------------------------------------------
+// SUSPEND / ACTIVATE A MANAGER OR CARETAKER (admin/GM)
+//
+// Mirrors setLandlordStatus above - same password/PIN confirmation
+// gate via confirmAdminOrGmAction, same activity-log shape. Managers
+// don't have a subscription_status column like landlords; property_managers
+// has always modeled "removed" as is_active: false (see
+// propertyManager.controller.js's removeManager), so 'suspended' here
+// maps to is_active: false and 'active' maps to is_active: true. This
+// also, for the first time, gives admin a way to REVERSE that - the
+// landlord-facing removeManager route only ever turns is_active off,
+// with no matching "restore" endpoint.
+// ---------------------------------------------------------------------
+async function setManagerStatus(req, res) {
+  try {
+    const { managerId } = req.params;
+    const { status } = req.body; // 'active' | 'suspended'
+
+    if (!['active', 'suspended'].includes(status)) {
+      return res.status(400).json({ error: "status must be 'active' or 'suspended'." });
+    }
+
+    const { data: before } = await supabase
+      .from('property_managers')
+      .select('full_name, is_active, landlord_id, role_level')
+      .eq('id', managerId)
+      .maybeSingle();
+    if (!before) return res.status(404).json({ error: 'Manager/caretaker not found.' });
+
+    const confirmed = await confirmAdminOrGmAction(req);
+    if (!confirmed.ok) {
+      return res.status(401).json({ error: `${confirmed.error} Account was NOT ${status === 'suspended' ? 'suspended' : 'activated'}.` });
+    }
+
+    const { error } = await supabase
+      .from('property_managers')
+      .update({ is_active: status === 'active' })
+      .eq('id', managerId);
+    if (error) throw error;
+
+    logActivity({
+      actorType: isGmAction(req) ? 'general_manager' : 'admin',
+      actorId: isGmAction(req) ? req.user.id : 'super-admin',
+      action: `${before.role_level === 'caretaker' ? 'caretaker' : 'manager'}_${status}`,
+      targetType: 'property_manager',
+      targetId: managerId,
+      metadata: isGmAction(req)
+        ? {
+            reason: req.pinConfirmedReason,
+            affectedPersonLabel: before.full_name,
+            before: { is_active: before.is_active },
+            after: { is_active: status === 'active' },
+          }
+        : undefined,
+      ipAddress: req.ip,
+    });
+
+    return res.json({ message: `${before.role_level === 'caretaker' ? 'Caretaker' : 'Manager'} account ${status}.` });
+  } catch (err) {
+    logger.error('[admin] setManagerStatus error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to update manager/caretaker status.' });
+  }
+}
+
+// ---------------------------------------------------------------------
 // EDIT ANY SUBSCRIPTION (blueprint 13.2: extend, shorten, change period)
 // ---------------------------------------------------------------------
 async function editLandlordSubscription(req, res) {
@@ -1216,12 +1346,120 @@ async function listLandlordsOnboarded(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// GLOBAL SEARCH
+// ---------------------------------------------------------------------
+async function globalSearch(req, res) {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 2) return res.json({ results: [] });
+    const like = `%${q}%`;
+
+    const [landlordsRes, tenantsRes, managersRes, gmsRes, basRes] = await Promise.all([
+      supabase
+        .from('landlords')
+        .select('id, full_name, email, phone, estate_name')
+        .ilike('email', like)
+        .limit(10),
+      supabase
+        .from('tenants')
+        .select('id, full_name, email, primary_phone, landlord_id, unit_id, landlords(full_name), units(unit_name)')
+        .ilike('email', like)
+        .limit(10),
+      supabase
+        .from('property_managers')
+        .select('id, full_name, email, phone, landlord_id, role_level, is_active, landlords(full_name)')
+        .ilike('email', like)
+        .limit(10),
+      supabase
+        .from('general_managers')
+        .select('id, full_name, email, phone')
+        .ilike('email', like)
+        .limit(10),
+      supabase
+        .from('brand_ambassadors')
+        .select('id, full_name, email, phone, ba_code, status')
+        .ilike('email', like)
+        .limit(10),
+    ]);
+
+    for (const r of [landlordsRes, tenantsRes, managersRes, gmsRes, basRes]) {
+      if (r.error) throw r.error;
+    }
+
+    const results = [
+      ...(landlordsRes.data || []).map((l) => ({
+        role: 'landlord',
+        roleLabel: 'Landlord',
+        id: l.id,
+        name: l.full_name,
+        email: l.email,
+        phone: l.phone,
+        context: l.estate_name || null,
+      })),
+      ...(tenantsRes.data || []).map((t) => ({
+        role: 'tenant',
+        roleLabel: 'Tenant',
+        id: t.id,
+        name: t.full_name,
+        email: t.email,
+        phone: t.primary_phone,
+        context: [t.landlords?.full_name, t.units?.unit_name].filter(Boolean).join(' · ') || null,
+        landlordId: t.landlord_id,
+        landlordName: t.landlords?.full_name || null,
+        unitId: t.unit_id || null,
+        unitName: t.units?.unit_name || null,
+      })),
+      ...(managersRes.data || []).map((m) => ({
+        role: 'manager',
+        roleLabel: m.role_level === 'caretaker' ? 'Caretaker' : 'Manager',
+        id: m.id,
+        name: m.full_name,
+        email: m.email,
+        phone: m.phone,
+        context: [m.landlords?.full_name ? `Works for ${m.landlords.full_name}` : null, m.is_active ? null : 'Suspended'].filter(Boolean).join(' · ') || null,
+        landlordId: m.landlord_id,
+        landlordName: m.landlords?.full_name || null,
+        roleLevel: m.role_level || 'manager',
+        isActive: m.is_active,
+      })),
+      ...(gmsRes.data || []).map((g) => ({
+        role: 'general_manager',
+        roleLabel: 'General Manager',
+        id: g.id,
+        name: g.full_name,
+        email: g.email,
+        phone: g.phone,
+        context: null,
+      })),
+      ...(basRes.data || []).map((b) => ({
+        role: 'brand_ambassador',
+        roleLabel: 'Brand Ambassador',
+        id: b.id,
+        name: b.full_name,
+        email: b.email,
+        phone: b.phone,
+        context: b.ba_code ? `${b.ba_code} · ${b.status}` : b.status,
+        status: b.status,
+        baCode: b.ba_code || null,
+      })),
+    ];
+
+    return res.json({ results, query: q });
+  } catch (err) {
+    logger.error('[admin] globalSearch error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Search failed.' });
+  }
+}
+
 module.exports = {
   getDashboardMetrics,
   listAllLandlords,
   getIncompleteSignups,
   listAllTenants,
   listAllUnits,
+  globalSearch,
   getRevenueBreakdown,
   getRevenueTrend,
   getRevenueDashboard,
@@ -1233,6 +1471,8 @@ module.exports = {
   deleteLandlordAccount,
   editLandlordSubscription,
   getLandlordProperties,
+  getLandlordManagers,
+  setManagerStatus,
   getActivityLog,
   deleteActivityLogEntry,
   deleteActivityLogsForDay,

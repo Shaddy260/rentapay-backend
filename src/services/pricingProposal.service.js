@@ -129,12 +129,25 @@ async function getPricingProposal({ targetMarginPct, monthKeyStr } = {}) {
   // Step 5: proposed price = total cost per unit / (1 - target margin).
   let rawProposedPrice = totalCostPerUnit / (1 - margin);
 
-  // Step 6: guardrails - never below break-even, cap the swing to
-  // roughly +/-20% of the current price, round to the nearest KES 5.
+  // Step 6: guardrails - never below break-even, never more than ~20%
+  // above the current price, round to the nearest KES 5.
+  //
+  // FIX ("proposed price is stuck at 60 even when I move the slider,
+  // only the % moves"): this used to ALSO clamp the price up to a
+  // capLow of currentPricePerUnit * 0.8 - so whenever the real,
+  // margin-driven price (totalCostPerUnit / (1 - margin)) computed
+  // below that floor, which it does for basically the entire 5-80%
+  // slider range whenever true cost-per-unit is well under the
+  // current price, capLow silently won and the proposed price was
+  // pinned to the exact same number regardless of the margin chosen.
+  // The break-even floor just above is already the correct lower
+  // bound (never propose a price that loses money) - re-flooring at
+  // 80% of the CURRENT price on top of that defeats the whole point
+  // of the slider. Only the upper cap remains, to stop a cost spike
+  // from proposing a wild price jump.
   rawProposedPrice = Math.max(rawProposedPrice, breakEvenPricePerUnit);
-  const capLow = currentPricePerUnit * 0.8;
   const capHigh = currentPricePerUnit * 1.2;
-  rawProposedPrice = Math.min(Math.max(rawProposedPrice, capLow), capHigh);
+  rawProposedPrice = Math.min(rawProposedPrice, capHigh);
   const proposedPricePerUnit = Math.max(5, roundToNearest(rawProposedPrice, 5));
 
   // Commission proposal, calculated AT the proposed price (not the

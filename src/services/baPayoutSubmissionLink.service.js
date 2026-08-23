@@ -143,6 +143,28 @@ async function findEligibleBa(email, purpose) {
   return data;
 }
 
+// Notice sent to a BA who tries the 'submit' flow again after already
+// submitting: no OTP, just a heads-up that the one-time submission
+// channel is closed and how to actually get a correction made. Includes
+// the current live 24h edit link when one exists so they can go
+// straight to it; if none is live right now, points them to ask admin
+// for one instead of linking somewhere that would just 404/expire.
+async function notifyAlreadySubmitted(ba) {
+  const editStatus = await getEditLinkStatus();
+  const subject = 'You\u2019ve already submitted your RentaPay payout details';
+  const body = editStatus.link
+    ? `Hi ${ba.full_name || 'there'},\n\nWe noticed you tried to submit your payout details again, but our records show you've already submitted these once - each Brand Ambassador can only use the submission link one time.\n\nIf something needs correcting, use this correction link instead (valid for 24 hours from when it was generated):\n${editStatus.link}\n\nIf this link has expired by the time you click it, just reply to this email or contact RentaPay admin for a new one.`
+    : `Hi ${ba.full_name || 'there'},\n\nWe noticed you tried to submit your payout details again, but our records show you've already submitted these once - each Brand Ambassador can only use the submission link one time.\n\nIf something needs correcting, please contact RentaPay admin and ask for a correction link - there isn't one currently active.`;
+
+  try {
+    await sendEmail(ba.email, subject, wrapEmailHtml(body));
+  } catch (emailErr) {
+    logger.error('[baPayoutSubmissionLink] notifyAlreadySubmitted send failed:', emailErr.message);
+    // Best-effort, same convention as every other notification send in
+    // this file - never blocks or rolls back the caller's request.
+  }
+}
+
 // PUBLIC - step 1 for either flow: send a code to the typed email, IF
 // (and only if) it belongs to an eligible BA. Always resolves the same
 // way regardless of match, so the response itself never reveals
@@ -162,7 +184,25 @@ async function requestOtp({ email, purpose, editLinkToken }) {
 
   const ba = await findEligibleBa(normalizedEmail, purpose);
   if (!ba) {
-    // Dead end, on purpose: no email sent, no error, no OTP wasted.
+    // FIX (direct request: "when the ones who had already submitted...
+    // it does not send email... it fails to notice the users, it
+    // should notice them and ask for the correction link instead"):
+    // a BA who already submitted hits exactly this branch on the
+    // 'submit' flow (findEligibleBa excludes them on purpose - see
+    // above), and used to just dead-end silently with no email at
+    // all, leaving them thinking the form is broken. Only the
+    // 'submit' flow gets this extra check - 'edit' has no equivalent
+    // "already-edited" state to notice them about. The API response
+    // itself stays exactly the same generic { requested: true } either
+    // way, so this still never reveals account existence to whoever's
+    // calling the endpoint - only a real, already-submitted BA's own
+    // inbox gets anything.
+    if (purpose === 'submit') {
+      const alreadySubmittedBa = await findEligibleBa(normalizedEmail, 'edit');
+      if (alreadySubmittedBa) {
+        await notifyAlreadySubmitted(alreadySubmittedBa);
+      }
+    }
     return genericResult;
   }
 

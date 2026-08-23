@@ -27,6 +27,8 @@ router.post('/forgot-password/reset', authController.resetPassword);
 // (see App.jsx), not the shared /login used by landlords/managers/
 // tenants and not the hidden /admin/login screen either.
 router.post('/manager-account/login', authController.generalManagerLogin);
+router.post('/manager-account/forgot-password', authController.generalManagerForgotPassword);
+router.post('/manager-account/reset-password', authController.generalManagerResetPassword);
 router.post('/admin/login', authController.adminLogin);
 router.post('/admin/verify-otp', authController.adminVerifyOTP);
 router.post('/admin/forgot-password', authController.adminForgotPassword);

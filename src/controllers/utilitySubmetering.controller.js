@@ -297,11 +297,17 @@ async function updateMeter(req, res) {
   }
 }
 
-// Permanently remove a meter that has never had any readings
-// submitted against it - e.g. cleaning up a duplicate created by
-// mistake. Meters with reading history can't be deleted (their
-// numbers may already be reflected in past invoices); edit them
-// instead.
+// Remove a meter, always - the one thing that changes is HOW:
+//   - No readings on file yet -> permanently deleted, nothing to
+//     preserve (e.g. cleaning up a duplicate or a meter set up wrong).
+//   - Has reading history -> archived instead of deleted outright.
+//     Its numbers may already be reflected in past invoices, so the
+//     rows stay in place, but it disappears from the active meter
+//     list (listMeters) exactly like a deleted one would - same
+//     result for the landlord/manager, without corrupting billing
+//     history underneath it.
+// Either way, this always succeeds from the landlord/manager's point
+// of view - there's no dead end anymore.
 async function deleteMeter(req, res) {
   try {
     const { meterId } = req.params;
@@ -310,8 +316,19 @@ async function deleteMeter(req, res) {
     if (accessError) return res.status(accessError.statusCode).json(accessError);
 
     const { data: anyReading } = await supabase.from('utility_readings').select('id').eq('meter_id', meterId).limit(1).maybeSingle();
+    const { role, id } = currentActor(req);
+
     if (anyReading) {
-      return res.status(409).json({ error: 'This meter already has readings on file and cannot be deleted. Edit it instead if something needs to change.' });
+      const { error } = await supabase
+        .from('utility_meters')
+        .update({ is_archived: true, archived_at: new Date().toISOString() })
+        .eq('id', meterId);
+      if (error) throw error;
+      logActivity({ actorType: role, actorId: id, action: 'utility_meter_archived', targetType: 'utility_meter', targetId: meterId });
+      return res.json({
+        archived: true,
+        message: 'This meter has past readings, so it was archived instead of deleted - it\'s off your active list, but its history stays intact for any invoices already sent.',
+      });
     }
 
     const { error: linkErr } = await supabase.from('utility_meter_units').delete().eq('meter_id', meterId);
@@ -319,7 +336,6 @@ async function deleteMeter(req, res) {
     const { error } = await supabase.from('utility_meters').delete().eq('id', meterId);
     if (error) throw error;
 
-    const { role, id } = currentActor(req);
     logActivity({ actorType: role, actorId: id, action: 'utility_meter_deleted', targetType: 'utility_meter', targetId: meterId });
 
     return res.json({ deleted: true });
@@ -345,11 +361,18 @@ async function listMeters(req, res) {
       if (assignedIds && assignedIds.length === 1) propertyId = assignedIds[0];
     }
 
+    // Archived meters (see deleteMeter below) are excluded by default -
+    // that's the whole point of archiving one, it should behave like
+    // it's gone from every list a landlord/manager normally sees.
+    // ?includeArchived=true opts back in, for anywhere that still
+    // needs to show/reference them (e.g. a past invoice's meter).
+    const includeArchived = req.query.includeArchived === 'true';
     let query = supabase
       .from('utility_meters')
       .select('*, utility_meter_units(unit_id, units(unit_name))')
       .eq('landlord_id', landlordId)
       .order('created_at', { ascending: false });
+    if (!includeArchived) query = query.eq('is_archived', false);
     if (propertyId) query = query.eq('property_id', propertyId);
 
     const { data, error } = await query;
@@ -574,7 +597,23 @@ async function bulkSubmitReadings(req, res) {
       }
       try {
         const result = await submitReadingCore(req, { meterId, monthKey, readingValue, photoUrl, isBaseline, previousReadingValue });
-        results.push({ meterId, ok: true, ...result.body });
+        // BUG FIX (direct request: "no way to add a base reading" for
+        // units billed on both water and electricity, submitted
+        // together here): submitReadingCore returns needsPreviousReading
+        // with NOTHING actually saved when a meter's very first
+        // reading arrives with no baseline/previous value attached -
+        // that's a normal, expected outcome from this endpoint, not a
+        // failure. But this loop was spreading it into the result
+        // with ok:true regardless, so the bulk screen counted it as
+        // "saved" and moved on - the reading was silently lost, and
+        // there was no way to notice or supply the missing previous
+        // reading afterwards. Marked ok:false here so it surfaces in
+        // the "failed" list with a clear, actionable message instead.
+        if (result.body?.needsPreviousReading) {
+          results.push({ meterId, ok: false, needsPreviousReading: true, error: result.body.message });
+        } else {
+          results.push({ meterId, ok: true, ...result.body });
+        }
       } catch (err) {
         if (err && err.statusCode) {
           results.push({ meterId, ok: false, error: err.error });

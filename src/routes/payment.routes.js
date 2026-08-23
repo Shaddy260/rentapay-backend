@@ -72,6 +72,11 @@ router.get(
   requireRole('landlord', 'manager'),
   paymentController.listOpenUtilityInvoicesForProperty
 );
+router.get(
+  '/utility-manual/open-invoices-for-tenant',
+  requireRole('landlord', 'manager'),
+  paymentController.listOpenUtilityInvoicesForTenant
+);
 
 // Manual Paybill payment confirmation flow (landlord/manager side) -
 // same requireRole('landlord', 'manager') pattern used everywhere else
