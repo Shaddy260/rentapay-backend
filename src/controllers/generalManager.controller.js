@@ -149,7 +149,7 @@ async function listGeneralManagers(req, res) {
 
     let query = supabase
       .from('general_managers')
-      .select('id, full_name, phone, email, gender, is_active, must_change_password, created_at, can_grant_loyalty_discounts, can_manage_manual_payments')
+      .select('id, full_name, phone, email, gender, is_active, must_change_password, created_at, can_grant_loyalty_discounts, can_manage_manual_payments, can_manage_help_requests, can_manage_help_contacts')
       .order('created_at', { ascending: false });
 
     if (search && search.trim()) {
@@ -968,11 +968,13 @@ async function rejectGmApplication(req, res) {
 async function updateGmPermissions(req, res) {
   try {
     const { id } = req.params;
-    const { canGrantLoyaltyDiscounts, canManageManualPayments } = req.body;
+    const { canGrantLoyaltyDiscounts, canManageManualPayments, canManageHelpRequests, canManageHelpContacts } = req.body;
 
     const update = {};
     if (canGrantLoyaltyDiscounts !== undefined) update.can_grant_loyalty_discounts = !!canGrantLoyaltyDiscounts;
     if (canManageManualPayments !== undefined) update.can_manage_manual_payments = !!canManageManualPayments;
+    if (canManageHelpRequests !== undefined) update.can_manage_help_requests = !!canManageHelpRequests;
+    if (canManageHelpContacts !== undefined) update.can_manage_help_contacts = !!canManageHelpContacts;
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'Nothing to update.' });
     }
@@ -985,7 +987,7 @@ async function updateGmPermissions(req, res) {
       .from('general_managers')
       .update(update)
       .eq('id', id)
-      .select('id, full_name, can_grant_loyalty_discounts, can_manage_manual_payments')
+      .select('id, full_name, can_grant_loyalty_discounts, can_manage_manual_payments, can_manage_help_requests, can_manage_help_contacts')
       .single();
     if (error) throw error;
 
@@ -1013,7 +1015,7 @@ async function getMyGmPermissions(req, res) {
   try {
     const { data: manager, error } = await supabase
       .from('general_managers')
-      .select('can_grant_loyalty_discounts, can_manage_manual_payments')
+      .select('can_grant_loyalty_discounts, can_manage_manual_payments, can_manage_help_requests, can_manage_help_contacts')
       .eq('id', req.user.id)
       .maybeSingle();
     if (error) throw error;
@@ -1021,6 +1023,8 @@ async function getMyGmPermissions(req, res) {
     return res.json({
       canGrantLoyaltyDiscounts: !!manager.can_grant_loyalty_discounts,
       canManageManualPayments: !!manager.can_manage_manual_payments,
+      canManageHelpRequests: !!manager.can_manage_help_requests,
+      canManageHelpContacts: !!manager.can_manage_help_contacts,
     });
   } catch (err) {
     logger.error('[generalManager] getMyGmPermissions error:', err.message);

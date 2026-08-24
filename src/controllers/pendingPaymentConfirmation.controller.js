@@ -25,6 +25,9 @@ const tenantRatingReminderService = require('../services/tenantRatingReminder.se
 const logger = require('../utils/logger');
 
 const TENANT_JOIN_SELECT =
+  // '*' already brings back payment_instructions_snapshot (the
+  // frozen account/description captured at submission time - see
+  // 2026-08-payment-confirmation-instructions-snapshot.sql).
   '*, tenants(full_name, photo_url, primary_phone, email), ' +
   'units(unit_name, unit_payment_code, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description, ' +
   'properties(name, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description)), ' +
@@ -107,9 +110,18 @@ async function getPendingConfirmations(req, res) {
       .eq('id', landlordId)
       .maybeSingle();
 
+    // FIX (bug report): "payments were made before when the account
+    // was different, but when it was changed recently, the earliest
+    // payments changed too - it should only affect future payments
+    // that come after the change." A record submitted after
+    // payment_instructions_snapshot shipped has its account/till/
+    // description frozen at submission time - use that instead of
+    // recomputing live off the landlord's/unit's CURRENT settings.
+    // Older records with no snapshot fall back to the live
+    // computation, same behavior this list has always had for them.
     const withPaymentInstructions = (confirmations || []).map((record) => ({
       ...record,
-      paymentInstructions: buildPaymentInstructions(landlord, record.units, record.units?.properties),
+      paymentInstructions: record.payment_instructions_snapshot || buildPaymentInstructions(landlord, record.units, record.units?.properties),
     }));
 
     // "A resubmitted request should appear at the top of all other

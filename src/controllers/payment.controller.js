@@ -14,6 +14,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { activateLandlordAfterPayment } = require('./auth.controller');
 const { signToken } = require('../middleware/auth.middleware');
 const { blockIfSubscriptionExpired } = require('../utils/subscriptionGate');
+const { buildPaymentInstructions } = require('../utils/paymentInstructions');
 
 // PERMANENT FIX (direct request: "landlord has to go through signup
 // TWICE before reaching the dashboard - this keeps coming back, fix
@@ -785,6 +786,35 @@ async function submitPaybillTransaction(req, res) {
       .maybeSingle();
     const isResubmission = mostRecent?.status === 'rejected';
 
+    // FIX (bug report): freeze the account/till/description the
+    // tenant was actually shown at the moment they paid, so a later
+    // change to the landlord's/unit's/property's payment settings
+    // never rewrites what this historical record displays. Mirrors
+    // exactly what buildPaymentInstructions would compute live -
+    // just captured once, now, instead of recomputed on every future
+    // read (see getPendingConfirmations in
+    // pendingPaymentConfirmation.controller.js).
+    let paymentInstructionsSnapshot = null;
+    try {
+      const [{ data: snapshotLandlord }, { data: snapshotUnit }] = await Promise.all([
+        supabase
+          .from('landlords')
+          .select('full_name, payment_method, paybill_number, paybill_account_number, till_number, stk_phone_number, payment_description')
+          .eq('id', tenant.landlord_id)
+          .maybeSingle(),
+        supabase
+          .from('units')
+          .select('unit_name, unit_number, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description)')
+          .eq('id', tenant.unit_id)
+          .maybeSingle(),
+      ]);
+      paymentInstructionsSnapshot = buildPaymentInstructions(snapshotLandlord, snapshotUnit, snapshotUnit?.properties);
+    } catch (snapshotErr) {
+      // Non-fatal: worst case this record falls back to the live
+      // computation, same behavior as before this fix existed.
+      logger.error('[payment] submitPaybillTransaction: payment instructions snapshot failed (non-blocking):', snapshotErr.message);
+    }
+
     const { data: record, error: insertErr } = await supabase
       .from('pending_payment_confirmations')
       .insert({
@@ -802,6 +832,7 @@ async function submitPaybillTransaction(req, res) {
         resubmission_of: isResubmission ? mostRecent.id : null,
         target_type: targetType,
         target_invoice_id: targetType === 'utility' ? targetInvoiceId : null,
+        payment_instructions_snapshot: paymentInstructionsSnapshot,
       })
       .select()
       .single();

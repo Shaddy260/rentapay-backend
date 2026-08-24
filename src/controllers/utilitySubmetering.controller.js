@@ -377,7 +377,40 @@ async function listMeters(req, res) {
 
     const { data, error } = await query;
     if (error) throw error;
-    return res.json({ meters: data || [] });
+
+    // DIRECT REQUEST: "when a unit has no tenant... the meter just
+    // gets greyed and nothing should be keyed in." Previously a
+    // vacant unit's meter looked completely normal - you could submit
+    // a reading, go through review, click Finalize, and only THEN
+    // find out (in the finalize result message, easy to miss) that
+    // nothing actually got billed because there was nobody to bill.
+    // Front-loading the check here means the UI can grey the meter
+    // out and block input before any of that wasted effort happens,
+    // instead of after.
+    const allUnitIds = [...new Set((data || []).flatMap((m) => (m.utility_meter_units || []).map((u) => u.unit_id)).filter(Boolean))];
+    let occupiedUnitIds = new Set();
+    if (allUnitIds.length > 0) {
+      const { data: activeTenants, error: tenantsErr } = await supabase
+        .from('tenants')
+        .select('unit_id')
+        .in('unit_id', allUnitIds)
+        .eq('is_active', true);
+      if (tenantsErr) throw tenantsErr;
+      occupiedUnitIds = new Set((activeTenants || []).map((t) => t.unit_id));
+    }
+    const metersWithOccupancy = (data || []).map((m) => {
+      const linkedUnitIds = (m.utility_meter_units || []).map((u) => u.unit_id).filter(Boolean);
+      return {
+        ...m,
+        // true if AT LEAST ONE unit this meter covers currently has an
+        // active tenant - a shared meter split across several units
+        // should still be usable as long as one of them is occupied;
+        // a single-unit meter is simply that one unit's own status.
+        has_active_tenant: linkedUnitIds.length > 0 && linkedUnitIds.some((id) => occupiedUnitIds.has(id)),
+      };
+    });
+
+    return res.json({ meters: metersWithOccupancy });
   } catch (err) {
     logger.error('[utilitySubmetering] listMeters error:', err.message);
     captureException(err);
@@ -422,6 +455,27 @@ async function submitReadingCore(req, { meterId, monthKey, readingValue, photoUr
   const meter = await getMeterOr404(meterId);
   const accessError = await assertMeterAccess(req, meter);
   if (accessError) throw { statusCode: accessError.statusCode, error: accessError.error };
+
+  // DIRECT REQUEST: "when a unit has no tenant... nothing should be
+  // keyed in." The UI now greys this meter out before a reading can
+  // even be typed (see listMeters' has_active_tenant), but this is
+  // the actual enforcement point - blocks it here too so a reading
+  // can never be recorded against a vacant unit regardless of how
+  // the request got made, not just when the normal UI happens to be
+  // the one making it.
+  const { data: meterUnitLinks } = await supabase.from('utility_meter_units').select('unit_id').eq('meter_id', meterId);
+  const linkedUnitIds = (meterUnitLinks || []).map((u) => u.unit_id).filter(Boolean);
+  if (linkedUnitIds.length > 0) {
+    const { data: activeTenants, error: activeTenantsErr } = await supabase
+      .from('tenants')
+      .select('unit_id')
+      .in('unit_id', linkedUnitIds)
+      .eq('is_active', true);
+    if (activeTenantsErr) throw activeTenantsErr;
+    if (!activeTenants || activeTenants.length === 0) {
+      throw { statusCode: 409, error: 'This meter\u2019s unit has no active tenant right now, so there\u2019s nobody to bill. Assign a tenant first, or edit the meter if it\u2019s linked to the wrong unit.' };
+    }
+  }
 
   const { data: existing } = await supabase
     .from('utility_readings')
@@ -789,12 +843,32 @@ async function getOrCreateBillingRun(reading, meter) {
     // and no way to tell why. Checking occupancy here, before a run
     // even gets created, turns that into an immediate, actionable
     // error instead of a silent no-op three screens later.
-    const { data: activeTenant } = await supabase
+    // BUG FIX (direct request: "i finalized and reviewed and
+    // submitted to the tenant... but nothing arrived"): this used to
+    // be `.maybeSingle()`, which returns an ERROR (not just empty
+    // data) if more than one row matches - e.g. a unit with a stale
+    // tenant record still marked is_active=true from before a
+    // changeover, sitting alongside the real current tenant. That
+    // error was being silently discarded (only `data` was ever
+    // destructured), so it looked identical to "no active tenant" and
+    // this unit would get quietly dropped from billing - the run
+    // would still "finalize successfully" for every OTHER unit, with
+    // nothing on screen loud enough to flag that this one specific
+    // unit's tenant never got an invoice. `.limit(1)` never errors on
+    // multiple matches - it just takes the most recently created
+    // active record, which is the actual current tenant in every
+    // real "stale record left behind" case - so billing no longer
+    // silently fails here. Genuine query errors are no longer
+    // swallowed either.
+    const { data: activeTenants, error: activeTenantErr } = await supabase
       .from('tenants')
       .select('id')
       .eq('unit_id', meterUnit.unit_id)
       .eq('is_active', true)
-      .maybeSingle();
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (activeTenantErr) throw activeTenantErr;
+    const activeTenant = activeTenants?.[0] || null;
     if (!activeTenant) {
       throw Object.assign(
         new Error(`${meterUnit.units?.unit_name || 'This unit'} has no active tenant right now, so there's nobody to bill. Assign a tenant to the unit first, or check the meter is linked to the right unit.`),
@@ -968,12 +1042,27 @@ async function finalizeRun(req, res) {
     const skippedUnits = [];
 
     for (const row of run.utility_billing_run_units) {
-      const { data: tenant } = await supabase
+      // SAME BUG FIX as getOrCreateBillingRun above, and the one that
+      // actually matters for "nothing arrived": THIS is the lookup
+      // that decides whether utility_invoices gets a row at all. A
+      // silently-discarded error from a duplicate active-tenant match
+      // here means the invoice is never created - finalize still
+      // reports overall "success" (every other unit in the run went
+      // through fine), with the one skipped unit only mentioned in a
+      // line of plain text on the result screen that's easy to skim
+      // past. `.limit(1)` + explicit error handling instead of
+      // `.maybeSingle()` fixes the root cause; the result screen
+      // itself is also being made impossible to miss when this
+      // happens (see UtilityReviewScreen.jsx).
+      const { data: tenants, error: tenantErr } = await supabase
         .from('tenants')
         .select('id, full_name, balance_due, phone, primary_phone')
         .eq('unit_id', row.unit_id)
         .eq('is_active', true)
-        .maybeSingle();
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (tenantErr) throw tenantErr;
+      const tenant = tenants?.[0] || null;
       if (!tenant) {
         // Can still happen even after the review-time check added
         // above, if the tenant moved out in the gap between opening
@@ -1040,6 +1129,62 @@ async function finalizeRun(req, res) {
   }
 }
 
+// ---------------------------------------------------------------------
+// DIRECT REQUEST: "when a landlord submits it nothing arrives to the
+// tenant dashboard." Root cause: submitting a reading only creates a
+// DRAFT (utility_readings.status='submitted') - nothing is billed and
+// no tenant is notified until someone explicitly opens Review and
+// clicks Finalize (see finalizeRun below, which is what actually
+// inserts the utility_invoices row the tenant portal reads). That
+// second step is intentional - it's where an anomalous reading gets
+// caught before a tenant is charged for it - but there was nowhere in
+// the UI that surfaced "these are still sitting unfinalized", so
+// landlords using the bulk "enter both readings" shortcut in
+// particular had no way to know one more step was needed. This
+// endpoint powers a visible "N reading(s) not yet billed" list on the
+// meters panel so that step can't go unnoticed anymore.
+// ---------------------------------------------------------------------
+async function listPendingReviews(req, res) {
+  try {
+    const landlordId = effectiveLandlordId(req);
+    const { propertyId } = req.query;
+    let meterQuery = supabase.from('utility_meters').select('id, label, utility_type').eq('landlord_id', landlordId);
+    if (propertyId) meterQuery = meterQuery.eq('property_id', propertyId);
+    const { data: landlordMeters, error: metersErr } = await meterQuery;
+    if (metersErr) throw metersErr;
+    const meterById = Object.fromEntries((landlordMeters || []).map((m) => [m.id, m]));
+    const meterIds = Object.keys(meterById);
+    if (meterIds.length === 0) return res.json({ pending: [] });
+
+    const { data: readings, error } = await supabase
+      .from('utility_readings')
+      .select('id, meter_id, month_key, reading_value, usage_amount, anomaly_flag, anomaly_reason, status, is_baseline, submitted_at:created_at')
+      .in('meter_id', meterIds)
+      .in('status', ['submitted', 'in_review'])
+      .eq('is_baseline', false)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    const pending = (readings || []).map((r) => ({
+      readingId: r.id,
+      meterId: r.meter_id,
+      meterLabel: meterById[r.meter_id]?.label || 'Meter',
+      utilityType: meterById[r.meter_id]?.utility_type || null,
+      monthKey: r.month_key,
+      usage: r.usage_amount,
+      anomalyFlag: r.anomaly_flag,
+      anomalyReason: r.anomaly_reason,
+      submittedAt: r.submitted_at,
+    }));
+
+    return res.json({ pending });
+  } catch (err) {
+    logger.error('[utilitySubmetering] listPendingReviews error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to load pending readings.' });
+  }
+}
+
 module.exports = {
   createMeter,
   bulkCreateMeters,
@@ -1054,4 +1199,5 @@ module.exports = {
   getReview,
   overrideRunUnit,
   finalizeRun,
+  listPendingReviews,
 };

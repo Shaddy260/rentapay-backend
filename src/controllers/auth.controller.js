@@ -1258,6 +1258,8 @@ async function generalManagerLogin(req, res) {
       // Payments menu item at all for this GM.
       canGrantLoyaltyDiscounts: !!manager.can_grant_loyalty_discounts,
       canManageManualPayments: !!manager.can_manage_manual_payments,
+      canManageHelpRequests: !!manager.can_manage_help_requests,
+      canManageHelpContacts: !!manager.can_manage_help_contacts,
       photoUrl: manager.photo_url || null,
     });
   } catch (err) {

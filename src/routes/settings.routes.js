@@ -17,15 +17,20 @@ publicRouter.get('/public/subscription-pricing', pricingCtrl.getPublicSubscripti
 
 // Admin router - mount at /api/admin/settings.
 const adminRouter = express.Router();
-adminRouter.get('/', verifyToken, requireRole('admin'), ctrl.getAdminSettings);
-adminRouter.patch('/help-contacts', verifyToken, requireRole('admin'), ctrl.updateHelpContacts);
+adminRouter.get('/', verifyToken, requireRole('admin', 'general_manager'), ctrl.getAdminSettings);
+// FIX (direct request): a General Manager can always SEE the Help &
+// Contact Details screen (support email, call numbers, WhatsApp
+// numbers) - same visibility-vs-mandate split used for manual
+// payments/help requests above. Editing still needs admin to have
+// explicitly granted can_manage_help_contacts to that specific GM.
+adminRouter.patch('/help-contacts', verifyToken, requireRole('admin', 'general_manager'), requireGmPermission('can_manage_help_contacts'), ctrl.updateHelpContacts);
 
 // Item 3: multiple call/WhatsApp numbers - list/add/edit/remove,
 // rather than overwriting one fixed field.
-adminRouter.get('/help-contacts/numbers', verifyToken, requireRole('admin'), ctrl.listHelpContactNumbers);
-adminRouter.post('/help-contacts/numbers', verifyToken, requireRole('admin'), ctrl.createHelpContactNumber);
-adminRouter.patch('/help-contacts/numbers/:id', verifyToken, requireRole('admin'), ctrl.updateHelpContactNumber);
-adminRouter.delete('/help-contacts/numbers/:id', verifyToken, requireRole('admin'), ctrl.deleteHelpContactNumber);
+adminRouter.get('/help-contacts/numbers', verifyToken, requireRole('admin', 'general_manager'), ctrl.listHelpContactNumbers);
+adminRouter.post('/help-contacts/numbers', verifyToken, requireRole('admin', 'general_manager'), requireGmPermission('can_manage_help_contacts'), ctrl.createHelpContactNumber);
+adminRouter.patch('/help-contacts/numbers/:id', verifyToken, requireRole('admin', 'general_manager'), requireGmPermission('can_manage_help_contacts'), ctrl.updateHelpContactNumber);
+adminRouter.delete('/help-contacts/numbers/:id', verifyToken, requireRole('admin', 'general_manager'), requireGmPermission('can_manage_help_contacts'), ctrl.deleteHelpContactNumber);
 
 // Subscription fee (base rate + period discount tiers) - affects
 // signup, adding a property, adding units, and renewals everywhere,

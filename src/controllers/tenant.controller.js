@@ -2314,6 +2314,9 @@ async function getMyReputationAsLandlord(req, res) {
  * tenant's own property, so the tenant portal knows who it can offer
  * a "rate" button for. Same "no assignment rows = covers every
  * property" convention used in public.controller.js's getUnitContact.
+ * Only surfaces a manager/caretaker who is both still active (not
+ * removed by the landlord) AND has actually logged in and set a real
+ * password at least once (not just invited) - see isSetUp below.
  */
 async function listRateableStaff(req, res) {
   try {
@@ -2324,14 +2327,26 @@ async function listRateableStaff(req, res) {
 
     const { data: managers, error: mErr } = await supabase
       .from('property_managers')
-      .select('id, full_name, role_level, property_manager_assignments(property_id)')
+      .select('id, full_name, role_level, must_change_password, property_manager_assignments(property_id)')
       .eq('landlord_id', tenant.landlord_id)
       .eq('is_active', true);
     if (mErr) throw mErr;
 
+    // FIX (direct request): "manager and caretaker accounts that have
+    // not been set up... should not be listed to be rated." is_active
+    // alone only rules out a REMOVED manager - a landlord adding a
+    // brand-new manager creates their row as is_active: true right
+    // away (so the temp-password email works immediately), but that
+    // person hasn't actually done anything as a manager yet until
+    // they log in and set a real password. must_change_password only
+    // flips to false once that first real login happens (see
+    // auth.controller.js's changePassword) - a reliable "has this
+    // account actually been set up" signal, distinct from is_active.
+    const isSetUp = (m) => m.must_change_password !== true;
+
     const coversThisProperty = (m) => !propertyId || !m.property_manager_assignments?.length || m.property_manager_assignments.some((a) => a.property_id === propertyId);
 
-    const pick = (roleLevel) => (managers || []).find((m) => m.role_level === roleLevel && coversThisProperty(m));
+    const pick = (roleLevel) => (managers || []).find((m) => m.role_level === roleLevel && isSetUp(m) && coversThisProperty(m));
 
     const manager = pick('manager');
     const caretaker = pick('caretaker');

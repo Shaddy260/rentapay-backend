@@ -28,5 +28,6 @@ router.get('/readings/:readingId/corrections', ctrl.getReadingCorrections);
 router.get('/readings/:readingId/review', ctrl.getReview);
 router.patch('/runs/:runId/units/:runUnitId', ctrl.overrideRunUnit);
 router.post('/runs/:runId/finalize', ctrl.finalizeRun);
+router.get('/readings/pending-review', ctrl.listPendingReviews);
 
 module.exports = router;

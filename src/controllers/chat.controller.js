@@ -29,7 +29,7 @@ const logger = require('../utils/logger');
 async function resolveScope(req) {
   const { role, id } = req.user;
 
-  if (role === 'admin') {
+  if (role === 'admin' || role === 'general_manager') {
     return { landlordId: req.body.landlordId || req.query.landlordId || null, tenantId: req.body.tenantId || req.query.tenantId || null };
   }
 
@@ -87,7 +87,7 @@ async function resolveScope(req) {
 // fallback string.
 function senderRoleTag(req) {
   const { role, roleLevel } = req.user;
-  if (role === 'admin') return 'RentaPay Support';
+  if (role === 'admin' || role === 'general_manager') return 'RentaPay Support';
   if (role === 'landlord') return 'Landlord';
   if (role === 'manager') return roleLevel === 'caretaker' ? 'Caretaker' : 'Property Manager';
   return 'Tenant';
@@ -99,7 +99,7 @@ function senderNameFallback(req) {
 
 async function lookupSenderName(req) {
   const { role, id } = req.user;
-  if (role === 'admin') return 'RentaPay Support';
+  if (role === 'admin' || role === 'general_manager') return 'RentaPay Support';
   const table = role === 'landlord' ? 'landlords' : role === 'manager' ? 'property_managers' : 'tenants';
   const { data } = await supabase.from(table).select('full_name').eq('id', id).maybeSingle();
   return data?.full_name || senderNameFallback(req);
@@ -190,7 +190,7 @@ async function insertChatMessage({ threadType, landlordId, tenantId, role, roleL
   // Read receipts: whichever side is sending has implicitly "read"
   // their own message; the other side(s) start unread.
   const readFlags = {
-    read_by_admin: role === 'admin',
+    read_by_admin: role === 'admin' || role === 'general_manager',
     read_by_landlord: role === 'landlord' || role === 'manager',
     read_by_tenant: role === 'tenant',
   };
@@ -203,7 +203,7 @@ async function insertChatMessage({ threadType, landlordId, tenantId, role, roleL
       tenant_id: tenantId,
       sender_role: role,
       sender_role_level: role === 'manager' ? (roleLevel === 'caretaker' ? 'caretaker' : 'manager') : null,
-      sender_id: role === 'admin' ? null : senderId,
+      sender_id: role === 'admin' || role === 'general_manager' ? null : senderId,
       sender_name: senderName,
       body,
       reply_to_id: replyToId || null,
@@ -236,9 +236,9 @@ async function insertChatMessage({ threadType, landlordId, tenantId, role, roleL
         } else {
           await sendPushToRecipient('tenant', tenantId, { title: `New message from ${senderName}`, body });
         }
-      } else if (threadType === 'admin_tenant' && role === 'admin') {
+      } else if (threadType === 'admin_tenant' && (role === 'admin' || role === 'general_manager')) {
         await sendPushToRecipient('tenant', tenantId, { title: `New message from ${senderName}`, body });
-      } else if (threadType === 'admin_landlord' && role === 'admin') {
+      } else if (threadType === 'admin_landlord' && (role === 'admin' || role === 'general_manager')) {
         await sendPushToRecipient('landlord', landlordId, { title: `New message from ${senderName}`, body });
       }
     } catch (pushErr) {
@@ -297,7 +297,7 @@ async function listMessages(req, res) {
     // previously fell through to read_by_tenant here, which is wrong
     // and would incorrectly mark a tenant's messages as read by a
     // manager viewing their OWN sent messages back.
-    const readField = role === 'admin' ? 'read_by_admin' : role === 'landlord' || role === 'manager' ? 'read_by_landlord' : 'read_by_tenant';
+    const readField = role === 'admin' || role === 'general_manager' ? 'read_by_admin' : role === 'landlord' || role === 'manager' ? 'read_by_landlord' : 'read_by_tenant';
     const unreadIds = (messages || []).filter((m) => !m[readField]).map((m) => m.id);
     if (unreadIds.length) {
       await supabase.from('chat_messages').update({ [readField]: true }).in('id', unreadIds);
@@ -387,7 +387,12 @@ async function listThreads(req, res) {
   try {
     const { role, id } = req.user;
 
-    if (role === 'admin') {
+    // General Managers see the exact same platform-wide "Chat with an
+    // agent" inboxes admin does (landlord and tenant support threads)
+    // - this is ordinary operational visibility, not the financial/
+    // profit data carved out for GM elsewhere, so it mirrors the admin
+    // branch below rather than being blocked or scoped down.
+    if (role === 'admin' || role === 'general_manager') {
       const [{ data: landlordThreads }, { data: tenantThreads }] = await Promise.all([
         supabase
           .from('chat_messages')
@@ -576,7 +581,7 @@ async function deleteMessage(req, res) {
     // ownership rules as sendMessage/listMessages rather than trusting
     // the messageId alone.
     let authorized = false;
-    if (role === 'admin') {
+    if (role === 'admin' || role === 'general_manager') {
       authorized = true;
     } else if (role === 'landlord') {
       authorized = message.landlord_id === id;
@@ -596,22 +601,22 @@ async function deleteMessage(req, res) {
     }
 
     // scope === 'everyone'
-    if (message.sender_role === 'admin') {
+    if (message.sender_role === 'admin' || message.sender_role === 'general_manager') {
       return res.status(403).json({ error: 'RentaPay support messages cannot be deleted for everyone.' });
     }
 
     const isOwnMessage = message.sender_id === id && message.sender_role === role;
     const isCaretakerMessage = message.sender_role === 'manager' && message.sender_role_level === 'caretaker';
     const isFullManagerOrLandlord = role === 'landlord' || (role === 'manager' && req.user.roleLevel !== 'caretaker');
-    const sameAccount = role === 'admin' || (role === 'landlord' ? message.landlord_id === id : role === 'manager' ? message.landlord_id === effectiveLandlordId(req) : false);
+    const sameAccount = role === 'admin' || role === 'general_manager' || (role === 'landlord' ? message.landlord_id === id : role === 'manager' ? message.landlord_id === effectiveLandlordId(req) : false);
 
     let allowed = false;
     if (isCaretakerMessage) {
-      // Only a manager/landlord on this account (or admin) can erase a
+      // Only a manager/landlord on this account (or admin/GM) can erase a
       // caretaker's message for everyone - never the caretaker itself.
-      allowed = role === 'admin' || (isFullManagerOrLandlord && sameAccount);
+      allowed = role === 'admin' || role === 'general_manager' || (isFullManagerOrLandlord && sameAccount);
     } else {
-      allowed = role === 'admin' || isOwnMessage || (isFullManagerOrLandlord && sameAccount);
+      allowed = role === 'admin' || role === 'general_manager' || isOwnMessage || (isFullManagerOrLandlord && sameAccount);
     }
 
     if (!allowed) {

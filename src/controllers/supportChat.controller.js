@@ -126,12 +126,44 @@ async function selectMenuOption(req, res) {
       return res.json({ reply, escalate: true, tel: svc.CALL_HANDOFF_TEL, escalationId: escalation.id });
     }
 
-    // Narrow to the next menu level for that category, informed by
-    // what's already been discussed (still always ending in "agent").
-    const submenu = svc.buildCategoryMenu(role, roleLevel, category);
-    const reply = `Got it - here's a bit more detail on ${category.replace('_', ' ')}, or talk to an agent if this doesn't cover it:`;
-    await svc.appendMessage(session.id, 'assistant', reply, 'menu', category);
-    return res.json({ reply, escalate: false, menu: submenu, category });
+    // LOOP FIX: this used to call buildCategoryMenu(role, roleLevel, category)
+    // again here, which just returns the SAME top-level list minus the
+    // option just tapped - so picking "Payment issue" showed another
+    // menu, picking one of those showed another menu again, forever,
+    // with no actual answer ever appearing. A menu tap should always
+    // move the conversation forward, exactly like typing a message
+    // does: log it as this user's turn, then run it through the same
+    // rule-based -> AI fallback chain sendMessage() uses, and only
+    // fall back to "talk to an agent" (never back to another menu) if
+    // every tier comes up empty.
+    const categoryQuestion = svc.categoryQuestion(category);
+    if (!categoryQuestion) {
+      return res.status(400).json({ error: 'Unknown category.' });
+    }
+    await svc.appendMessage(session.id, 'user', categoryQuestion, null, category);
+
+    const history = await svc.getTodayHistory(session.id);
+    const effectiveRole = role === 'manager' && roleLevel === 'caretaker' ? 'caretaker' : role;
+    const ruleMatch = await svc.ruleBasedMatch(categoryQuestion, effectiveRole);
+    if (ruleMatch) {
+      await svc.appendMessage(session.id, 'assistant', ruleMatch.text, 'rule_based', ruleMatch.category || category);
+      return res.json({ reply: ruleMatch.text, escalate: false, category, tier: 'rule_based' });
+    }
+
+    const systemPrompt = svc.roleSystemPrompt(role, roleLevel);
+    const { turns } = svc.toProviderMessages(systemPrompt, history, categoryQuestion);
+    const aiResult = await svc.getAIResponse(systemPrompt, turns);
+    if (aiResult) {
+      await svc.appendMessage(session.id, 'assistant', aiResult.text, aiResult.tier, category);
+      return res.json({ reply: aiResult.text, escalate: false, category, tier: aiResult.tier });
+    }
+
+    // Every automated tier failed for this category - go straight to
+    // the agent handoff rather than showing yet another menu.
+    const escalation = await svc.logEscalation({ sessionId: session.id, userType, userId, roleLevel, reason: 'menu_no_ai_answer', category });
+    const reply = "I couldn't find a specific answer for that - connecting you with a support agent.";
+    await svc.appendMessage(session.id, 'assistant', reply, 'system', category);
+    return res.json({ reply, escalate: true, tel: svc.CALL_HANDOFF_TEL, escalationId: escalation.id, category });
   } catch (err) {
     logger.error('[supportChat] selectMenuOption error:', err.message);
     return res.status(500).json({ error: 'Failed to process selection.' });

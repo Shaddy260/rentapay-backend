@@ -24,8 +24,32 @@
 // works for every unit without the landlord touching it per-unit.
 // A value with no {unit} token (a plain fixed account number) passes
 // through untouched, so this is fully backward compatible.
+// Direct request / bug report: a landlord typed a literal instruction
+// into the account-number field itself - e.g. "888917#your room
+// number" - meaning to tell the tenant to append their own room/unit
+// number, the way you'd type it by hand into the M-Pesa app. Since
+// the {unit} token already exists for exactly this ("RENT-{unit}"),
+// but this landlord didn't know about it, every tenant was shown that
+// raw instruction text verbatim instead of their actual unit - e.g.
+// "888917#your room number" instead of "888917#GH03". The system
+// already knows each tenant's own unit, so there's no need to make
+// them type anything: detect this common instructional phrasing and
+// substitute their real unit label automatically, same as {unit}
+// does. A landlord who already uses {unit} is unaffected (checked
+// first, in applyUnitTemplate).
+const INSTRUCTIONAL_PHRASE_PATTERN = /(your|the)\s+(room|unit|house|door)\s+number/i;
+
+function applyInstructionalPhraseFallback(value, unit) {
+  if (!value || typeof value !== 'string') return value;
+  if (!INSTRUCTIONAL_PHRASE_PATTERN.test(value)) return value;
+  const unitLabel = (unit && (unit.unit_name || unit.unit_number)) || '';
+  if (!unitLabel) return value; // nothing to substitute yet - leave as-is
+  return value.replace(INSTRUCTIONAL_PHRASE_PATTERN, unitLabel);
+}
+
 function applyUnitTemplate(value, unit) {
-  if (!value || typeof value !== 'string' || value.indexOf('{unit}') === -1) return value;
+  if (!value || typeof value !== 'string') return value;
+  if (value.indexOf('{unit}') === -1) return applyInstructionalPhraseFallback(value, unit);
   const unitLabel = (unit && (unit.unit_name || unit.unit_number)) || '';
   return value.split('{unit}').join(unitLabel);
 }

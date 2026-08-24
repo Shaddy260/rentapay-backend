@@ -239,7 +239,13 @@ async function callGemini(systemPrompt, turns) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY not set');
   const contents = turns.map((t) => ({ role: t.role === 'assistant' ? 'model' : 'user', parts: [{ text: t.content }] }));
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, {
+  // MODEL FIX: this was pinned to gemini-1.5-flash, a model line Google
+  // has since retired - every call was failing with a 404 regardless of
+  // whether the API key was valid, which silently pushed every request
+  // straight to Groq (or further down the chain, or to the dead-end
+  // category menu if those were also unset). gemini-2.5-flash-lite is
+  // the current free-tier-eligible replacement.
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents, systemInstruction: { parts: [{ text: systemPrompt }] } }),
@@ -364,6 +370,25 @@ function buildCategoryMenu(role, roleLevel, alreadyCoveredCategory) {
   return [...options.map((o) => ({ key: o.key, label: o.label })), { key: 'agent', label: 'Talk to an agent' }];
 }
 
+// Human-readable label for each category key, plus a natural-language
+// stand-in question sent through the AI chain when someone taps a menu
+// button - see selectMenuOption in the controller. Tapping a category
+// used to just show buildCategoryMenu() again (same list minus the
+// tapped item), which felt like an endless loop with no real answer
+// ever given. Now a tap is treated exactly like typing that question,
+// so it gets a real, specific reply - not another menu.
+const CATEGORY_QUESTIONS = {
+  payment: { label: 'Payment issue', question: 'I have a payment issue - can you help me understand payments on RentaPay?' },
+  tenant_unit: { label: 'Tenant or unit issue', question: 'I have an issue with a tenant or a unit - can you help?' },
+  account_subscription: { label: 'Account & subscription', question: 'I have a question about my account or subscription.' },
+  maintenance: { label: 'Maintenance request', question: 'I have a question about maintenance requests on RentaPay.' },
+  other: { label: 'Something else', question: 'I have a question about RentaPay that does not fit the other categories.' },
+};
+
+function categoryQuestion(category) {
+  return CATEGORY_QUESTIONS[category]?.question || null;
+}
+
 // ---------------------------------------------------------------------
 // Section 8 - escalation logging
 // ---------------------------------------------------------------------
@@ -394,5 +419,6 @@ module.exports = {
   toProviderMessages,
   getAIResponse,
   buildCategoryMenu,
+  categoryQuestion,
   logEscalation,
 };

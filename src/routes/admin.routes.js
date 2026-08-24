@@ -130,10 +130,20 @@ router.post('/announcements/broadcast', announcementController.createPlatformAnn
 // GM (see GeneralManagersPanel.jsx). This intentionally reverses the
 // earlier "GM without the flag doesn't get the menu item at all"
 // behavior - the mandate now gates the ACTION, not the VISIBILITY.
-router.get('/landlord-manual-subscription-payments', blockGeneralManagerFinancial, manualSubPaymentController.listManualSubscriptionPayments);
-router.post('/landlord-manual-subscription-payments/:id/confirm', blockGeneralManagerFinancial, requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.confirmManualSubscriptionPayment);
-router.post('/landlord-manual-subscription-payments/:id/reject', blockGeneralManagerFinancial, requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.rejectManualSubscriptionPayment);
-router.delete('/landlord-manual-subscription-payments/:id', blockGeneralManagerFinancial, requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.deleteManualSubscriptionPayment);
+//
+// FIX (direct request): blockGeneralManagerFinancial used to still be
+// mounted on ALL FOUR routes below, including the GET, which
+// unconditionally 403'd every General Manager regardless of the
+// comment above - nobody, granted or not, could ever actually see or
+// use this queue. requireGmPermission already gives admin its own
+// unrestricted pass-through and blocks an ungranted GM with a clear
+// "your admin has not enabled this" message on the write routes, so
+// blockGeneralManagerFinancial (meant for the separate profit/revenue
+// breakdown, not this queue) is removed from all four here.
+router.get('/landlord-manual-subscription-payments', manualSubPaymentController.listManualSubscriptionPayments);
+router.post('/landlord-manual-subscription-payments/:id/confirm', requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.confirmManualSubscriptionPayment);
+router.post('/landlord-manual-subscription-payments/:id/reject', requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.rejectManualSubscriptionPayment);
+router.delete('/landlord-manual-subscription-payments/:id', requireGmPermission('can_manage_manual_payments'), manualSubPaymentController.deleteManualSubscriptionPayment);
 
 // Rating flag review queue (see sql/add-rating-flag-for-review.sql and
 // ratingFlag.controller.js): a landlord flags a rating as bad-faith,
