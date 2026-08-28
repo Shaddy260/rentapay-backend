@@ -3,9 +3,17 @@ const { effectiveLandlordId, getManagerAssignedPropertyIds, checkLandlordOwnersh
 //
 // Implements blueprint section 4 (Tenant Onboarding), section 6
 // (balance edits), and section 8 (Vacating Notice).
-// NOTE: the interest/"waive interest" feature has been removed entirely
-// per direct request - late payments are tracked (isOverdue, days late)
-// but no longer accrue any extra charge, and there is nothing to waive.
+// NOTE: the old automatic, always-on interest feature was removed
+// entirely per an earlier direct request - late payments were tracked
+// (isOverdue, days late) but nothing accrued on top of what was owed.
+// UPDATE: a new, DIFFERENT late-payment penalty feature has since
+// been added - unlike the old one, it is off by default, configured
+// once PER PROPERTY/APARTMENT (Settings -> Finances, apartment
+// picker - not per landlord account, not per unit), and entirely the
+// landlord's own call. See utils/latePenalty.js /
+// services/latePenalty.service.js -
+// getBalance() below is where it's layered onto the tenant portal's
+// "amount due" figure.
 
 const crypto = require('crypto');
 const supabase = require('../config/supabase');
@@ -16,7 +24,7 @@ const { isValidEmail } = require('../utils/email');
 const { findPhoneConflict } = require('../utils/phoneUniqueness');
 const { findEmailConflict } = require('../utils/emailUniqueness');
 const { buildPrepaymentSummary } = require('../utils/prepayment');
-const { buildPaymentInstructions } = require('../utils/paymentInstructions');
+const { buildPaymentInstructions, buildUtilityPaymentInstructions } = require('../utils/paymentInstructions');
 const { notify } = require('../services/notify.service');
 const { blockIfSubscriptionExpired } = require('../utils/subscriptionGate');
 const { sendEmail, wrapEmailHtml } = require('../services/email.service');
@@ -28,6 +36,7 @@ const { checkComment } = require('../utils/commentModeration');
 const landlordReputationService = require('../services/landlordReputation.service');
 const staffReputationService = require('../services/staffReputation.service');
 const propertyReputationService = require('../services/propertyReputation.service');
+const latePenaltyService = require('../services/latePenalty.service');
 const tenantRatingReminderService = require('../services/tenantRatingReminder.service');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
@@ -453,12 +462,48 @@ async function getBalance(req, res) {
     // buildPrepaymentSummary, so both use the exact same real date.)
     const displayedDueDate = currentBalance <= 0 ? nextCycleDueDate : dueDate;
 
+    // Late payment penalty (opt-in, per property/apartment - see
+    // Settings -> Finances). Computed live, on top of the existing
+    // balance figure; never stored. Only relevant once something is
+    // actually overdue (currentBalance > 0 and past dueDate) - skip
+    // the DB round-trips otherwise.
+    let penalty = { penaltyAmount: 0, calculationBreakdown: [], overrideApplied: null, periodsOverdue: 0 };
+    if (currentBalance > 0 && today > dueDate) {
+      try {
+        const { data: recentPayments } = await supabase
+          .from('payments')
+          .select('amount, paid_at, status')
+          .eq('tenant_id', tenantId)
+          .eq('status', 'completed')
+          .gte('paid_at', dueDate.toISOString())
+          .order('paid_at', { ascending: true });
+
+        penalty = await latePenaltyService.computePenaltyForTenant({
+          propertyId: unit.property_id,
+          tenantId,
+          outstandingBalance: currentBalance,
+          dueDate,
+          payments: (recentPayments || []).map((p) => ({ amount: p.amount, paidAt: p.paid_at })),
+          asOf: today,
+        });
+      } catch (penaltyErr) {
+        // Never let a penalty-calculation problem break the core
+        // balance screen - log it and show the balance without a
+        // penalty line rather than a 500.
+        logger.error('[tenant] getBalance penalty calc error:', penaltyErr.message);
+        captureException(penaltyErr);
+      }
+    }
+
     const breakdown = {
       rentAmount,
       extraCharges,
       extrasTotal,
       carriedArrears: Math.max(currentBalance, 0),
-      totalDue: Math.max(currentBalance, 0),
+      lateFee: penalty.penaltyAmount, // separate, clearly-labeled line item - never folded into totalDue's other parts silently
+      lateFeeBreakdown: penalty.calculationBreakdown,
+      lateFeeOverride: penalty.overrideApplied,
+      totalDue: Math.round((Math.max(currentBalance, 0) + penalty.penaltyAmount) * 100) / 100,
       balance: currentBalance, // signed: positive = owed (show in red), negative = credit
       isOverdue: currentBalance > 0 && today > dueDate,
       dueDate: displayedDueDate.toISOString(), // reflects next cycle once current one is settled
@@ -2199,7 +2244,48 @@ async function getUtilityInvoices(req, res) {
     }
     for (const key of Object.keys(byType)) byType[key].totalOwed = Math.round(byType[key].totalOwed * 100) / 100;
 
-    return res.json({ invoices, byType: Object.values(byType) });
+    // Direct request/bug report: "Pay Water"/"Pay Electricity" showed
+    // the tenant the rent Paybill/Till details instead of a dedicated
+    // per-utility payment method a landlord can set on the meter
+    // itself (utility_meters.payment_override_*). Resolve each
+    // utility type's OWN payment instructions here - using its most
+    // recent invoice's meter - so the "Pay Water" screen can show the
+    // water-specific method (falling back to the usual rent method
+    // when the meter has no override configured, same as before).
+    const groups = Object.values(byType);
+    if (groups.length > 0) {
+      const [{ data: tenantRow }] = await Promise.all([
+        supabase
+          .from('tenants')
+          .select(
+            'landlord_id, unit_id, landlords(full_name, payment_method, paybill_number, paybill_account_number, till_number, stk_phone_number, payment_description), units(unit_name, unit_number, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description))'
+          )
+          .eq('id', tenantId)
+          .maybeSingle(),
+      ]);
+
+      const meterIds = [...new Set(groups.map((g) => g.invoices[0]?.meter_id).filter(Boolean))];
+      let metersById = {};
+      if (meterIds.length > 0) {
+        const { data: meters } = await supabase
+          .from('utility_meters')
+          .select('id, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description')
+          .in('id', meterIds);
+        metersById = Object.fromEntries((meters || []).map((m) => [m.id, m]));
+      }
+
+      for (const group of groups) {
+        const meter = group.invoices[0]?.meter_id ? metersById[group.invoices[0].meter_id] : null;
+        group.paymentInstructions = buildUtilityPaymentInstructions(
+          meter,
+          tenantRow?.landlords,
+          tenantRow?.units,
+          tenantRow?.units?.properties
+        );
+      }
+    }
+
+    return res.json({ invoices, byType: groups });
   } catch (err) {
     logger.error('[tenant] getUtilityInvoices error:', err.message);
     captureException(err);

@@ -99,6 +99,20 @@ async function notifyVacancyAlertSubscribers(unit) {
     }
     if (subs.length === 0) return;
 
+    // FIX (direct request: "should only appear to a user once in a
+    // day"): notifyVacancyAlertSubscribers used to fire a push to
+    // every matching subscriber on EVERY vacancy, with no cooldown -
+    // in an active market that's several pushes a day per person.
+    // Skip anyone already notified within the last 24h; they'll
+    // simply catch the next vacancy after their window resets.
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const dueSubs = subs.filter((sub) => {
+      if (!sub.last_notified_at) return true;
+      return now - new Date(sub.last_notified_at).getTime() >= ONE_DAY_MS;
+    });
+    if (dueSubs.length === 0) return;
+
     const payload = JSON.stringify({
       title: 'A new vacancy just opened up' + (county ? ` in ${county}` : ''),
       body: `Unit "${unit.unitName}" just went vacant${county ? ` in ${county}` : ''}. Check it out on RentaPay.`,
@@ -106,7 +120,7 @@ async function notifyVacancyAlertSubscribers(unit) {
     });
 
     await Promise.allSettled(
-      subs.map(async (sub) => {
+      dueSubs.map(async (sub) => {
         try {
           await withTimeout(
             webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, payload),

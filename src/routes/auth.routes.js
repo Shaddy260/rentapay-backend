@@ -2,8 +2,13 @@ const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/auth.controller');
 const { verifyToken, requireRole, requireNotCaretaker } = require('../middleware/auth.middleware');
+// Phase 2: shared Zod validation on write payloads (see
+// middleware/validate.middleware.js + validation/schemas.js).
+const { validate } = require('../middleware/validate.middleware');
+const { landlordRegisterSchema, loginSchema, forgotPasswordRequestSchema, resetPasswordSchema, changePasswordSchema } = require('../validation/schemas');
+const twoFactorController = require('../controllers/twoFactor.controller');
 
-router.post('/landlord/register', authController.registerLandlord);
+router.post('/landlord/register', validate(landlordRegisterSchema), authController.registerLandlord);
 router.post('/verify-otp', authController.verifyOTP);
 router.post('/resend-otp', authController.resendOTP);
 // DIRECT REQUEST (same-page verification): verify email BEFORE the
@@ -18,22 +23,42 @@ router.post('/verify-landlord-email', authController.verifyLandlordEmailOTP);
 router.post('/resend-landlord-email-otp', authController.resendLandlordEmailOTP);
 router.post('/update-landlord-registration-email', authController.updateLandlordRegistrationEmail);
 router.post('/landlord/initiate-payment', authController.initiateLandlordSubscriptionPayment);
-router.post('/login', authController.login);
+router.post('/login', validate(loginSchema), authController.login);
+// Second step of the OPTIONAL per-account 2FA toggle (landlord/tenant/
+// manager/brand_ambassador) - only reached when login() above sees
+// totp_enabled on the account and stops short of issuing a token.
+router.post('/verify-login-totp', authController.verifyLoginTotp);
 router.post('/google', authController.loginWithGoogle);
-router.post('/forgot-password/request', authController.requestPasswordReset);
-router.post('/forgot-password/reset', authController.resetPassword);
+router.post('/forgot-password/request', validate(forgotPasswordRequestSchema), authController.requestPasswordReset);
+router.post('/forgot-password/reset', validate(resetPasswordSchema), authController.resetPassword);
 // SECTION 3 (General Manager dedicated login) - deliberately its own
 // endpoint, mirroring the dedicated frontend route at /manager-account
 // (see App.jsx), not the shared /login used by landlords/managers/
 // tenants and not the hidden /admin/login screen either.
 router.post('/manager-account/login', authController.generalManagerLogin);
+// Mandatory 2FA (TOTP) for general managers - see generalManagerLogin's
+// header comment. Same endpoint handles first-time setup confirmation
+// and every regular login's second step.
+router.post('/manager-account/verify-totp', authController.generalManagerVerifyTotp);
 router.post('/manager-account/forgot-password', authController.generalManagerForgotPassword);
 router.post('/manager-account/reset-password', authController.generalManagerResetPassword);
 router.post('/admin/login', authController.adminLogin);
 router.post('/admin/verify-otp', authController.adminVerifyOTP);
+// Mandatory 2FA (TOTP) for admin - see adminLogin's header comment for
+// why this replaced the emailed-code flow (fixes the "works once,
+// then always wrong" bug and avoids per-login email cost).
+router.post('/admin/confirm-totp-setup', authController.confirmAdminTotpSetup);
 router.post('/admin/forgot-password', authController.adminForgotPassword);
 router.post('/admin/reset-password', authController.adminResetPassword);
 router.post('/admin/change-password', verifyToken, requireRole('admin'), authController.changeAdminPassword);
+
+// OPTIONAL self-service 2FA toggle for landlord/tenant/manager/
+// brand_ambassador accounts (admin and general_manager are mandatory
+// and managed by the dedicated flows above, not here).
+router.get('/2fa/status', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador'), twoFactorController.status);
+router.post('/2fa/enable/start', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador'), twoFactorController.startEnable);
+router.post('/2fa/enable/confirm', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador'), twoFactorController.confirmEnable);
+router.post('/2fa/disable', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador'), twoFactorController.disable);
 
 // FIX ("fingerprint login flickers back to the login screen after a
 // few seconds during an admin lockdown, instead of just saying so"):
@@ -62,7 +87,7 @@ router.patch('/landlord/payment-method', verifyToken, requireRole('landlord', 'm
 
 // Protected: either role - used both for the forced first-login
 // change and for a voluntary change later from the account menu.
-router.post('/change-password', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador', 'general_manager'), authController.changePassword);
+router.post('/change-password', verifyToken, requireRole('landlord', 'tenant', 'manager', 'brand_ambassador', 'general_manager'), validate(changePasswordSchema), authController.changePassword);
 router.post('/dismiss-onboarding', verifyToken, requireRole('landlord', 'tenant', 'manager'), authController.dismissOnboarding);
 
 module.exports = router;

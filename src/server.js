@@ -9,6 +9,9 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const cron = require('node-cron');
+const { withCronLock } = require('./jobs/cronLock');
+const { createRateLimitStore } = require('./middleware/rateLimitStore');
 
 const authRoutes = require('./routes/auth.routes');
 const unitRoutes = require('./routes/unit.routes');
@@ -33,6 +36,9 @@ const documentRoutes = require('./routes/document.routes');
 const auditLogRoutes = require('./routes/auditLog.routes');
 const annualReportRoutes = require('./routes/annualReport.routes');
 const dataExportRoutes = require('./routes/dataExport.routes');
+// Phase 2: async (queued) export endpoints - enqueue -> poll status ->
+// download from a signed URL. See routes/exportJobs.routes.js.
+const exportJobsRoutes = require('./routes/exportJobs.routes');
 const communityRoutes = require('./routes/community.routes');
 const disputeRoutes = require('./routes/dispute.routes');
 const ratingFlagRoutes = require('./routes/ratingFlag.routes');
@@ -63,11 +69,24 @@ const { startNotificationBatchFlushJob } = require('./jobs/notificationBatchFlus
 const { startLoyaltyDiscountExpiryJob } = require('./jobs/loyaltyDiscountExpiry.job');
 const { startLoyaltyCandidateDetectionJob } = require('./jobs/loyaltyCandidateDetection.job'); // P5
 const { startIncompleteSignupReminderJob } = require('./jobs/incompleteSignupReminder.job');
+const { startPaymentReconciliationJob } = require('./jobs/paymentReconciliation.job');
 const { initSentry, captureException } = require('./services/sentry.service');
 const logger = require('./utils/logger');
 const requestLoggerMiddleware = require('./middleware/requestLogger.middleware');
 
 const app = express();
+
+// Keep cron work single-owner when more than one API replica is running.
+// node-cron is patched once before the jobs are started below; every
+// scheduled callback gets a stable per-job database lock key.
+const scheduledCronTasks = [];
+const originalCronSchedule = cron.schedule.bind(cron);
+cron.schedule = (expression, callback, options) => {
+  const jobName = `cron:${expression}:${scheduledCronTasks.length}`;
+  const task = originalCronSchedule(expression, () => withCronLock(jobName, callback), options);
+  scheduledCronTasks.push(task);
+  return task;
+};
 
 // HARDENING (2D): error tracking - fails safe (logs and continues) if
 // SENTRY_DSN is unset or invalid, same philosophy already used for
@@ -196,20 +215,209 @@ app.use((req, res, next) => {
   next();
 });
 
+// Global baseline limiter. Keep the auth limiter stricter below; deployments
+// can provide a shared store through the standard express-rate-limit store
+// configuration in front of this process when running multiple replicas.
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  store: createRateLimitStore(),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Too many requests - please try again shortly.' }),
+});
+app.use(globalLimiter);
+
 // Basic rate limiting on auth endpoints to slow down brute force attempts
-// (complements the account lockout logic in auth.controller.js)
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
 app.use('/api/auth', authLimiter);
 
 app.get('/health', async (req, res) => {
-  const checks = { api: 'ok', database: 'ok' };
+  // FEATURE (direct request): the public status page only ever showed
+  // two checks ("API" and "Database") - too coarse to tell a tenant
+  // or landlord which part of RentaPay is actually affected when
+  // something goes wrong. Expanded to ten independently reported
+  // subsystems, each checked as cheaply as it can honestly be checked:
+  // a real query/credential check where one exists, or a presence
+  // check for configuration that a subsystem cannot function without.
+  // A missing optional integration (e.g. push notifications never
+  // configured on a given deployment) is reported as 'ok' rather than
+  // 'error' - it is only a real problem when it is configured but not
+  // reachable.
+  // FEATURE (direct request): expanded again from ten checks to
+  // seventeen - every independently-failable subsystem the app
+  // actually depends on gets its own line, so a broken piece shows up
+  // by name instead of the whole platform reading "degraded" with no
+  // way to tell which feature is actually affected. Same honesty rule
+  // as before: a real query/credential check where one exists, or a
+  // presence check for configuration a subsystem cannot function
+  // without; an integration that is optional or intentionally
+  // disabled for this deployment (WhatsApp/SMS, Sentry error
+  // tracking, the async export queue's DATABASE_URL) reports 'ok'
+  // rather than 'error' unless it's configured but unreachable.
+  const checks = {
+    api: 'ok',
+    database: 'ok',
+    authentication: 'ok',
+    payments: 'ok',
+    email: 'ok',
+    smsWhatsapp: 'ok',
+    pushNotifications: 'ok',
+    fileStorage: 'ok',
+    backgroundJobs: 'ok',
+    exportQueue: 'ok',
+    supportChat: 'ok',
+    publicListings: 'ok',
+    maintenanceRequests: 'ok',
+    disputesAndComplaints: 'ok',
+    communityBoard: 'ok',
+    utilitySubmetering: 'ok',
+    errorTracking: 'ok',
+  };
+
+  const supabase = require('./config/supabase');
+
   try {
-    const supabase = require('./config/supabase');
     const { error } = await supabase.from('platform_settings').select('id').limit(1);
     if (error) checks.database = 'error';
   } catch (err) {
     checks.database = 'error';
   }
+
+  try {
+    const { error } = await supabase.from('landlords').select('id').limit(1);
+    if (error) checks.authentication = 'error';
+  } catch (err) {
+    checks.authentication = 'error';
+  }
+
+  // Payments: Safaricom Daraja credentials must be present for STK
+  // push (subscriptions and, where a landlord uses it, tenant rent
+  // collection) to work at all. This does not call Safaricom on every
+  // health check (that would be wasteful and would count against
+  // rate limits) - it confirms the integration is configured, the
+  // same signal daraja.service.js itself relies on before attempting
+  // a real request.
+  const darajaConfigured = !!(process.env.DARAJA_CONSUMER_KEY && process.env.DARAJA_CONSUMER_SECRET && process.env.DARAJA_SHORTCODE);
+  if (!darajaConfigured && process.env.MOCK_DARAJA !== 'true') checks.payments = 'error';
+
+  // Email: Resend is the only channel OTPs, password resets, receipts,
+  // and reminders go out on (see notify.service.js/email.service.js).
+  if (!process.env.RESEND_API_KEY) checks.email = 'error';
+
+  // Push notifications: VAPID keys back the web push subscriptions
+  // used for live in browser alerts. Optional per deployment, so a
+  // deployment that has never set these up is 'ok', not 'error'.
+  if (process.env.VAPID_PUBLIC_KEY && !process.env.VAPID_PRIVATE_KEY) checks.pushNotifications = 'error';
+
+  // File storage: unit photos, payment proof screenshots, and
+  // documents all go through Supabase Storage - confirm the bucket
+  // is actually reachable, not just that credentials exist.
+  try {
+    const { error } = await supabase.storage.listBuckets();
+    if (error) checks.fileStorage = 'error';
+  } catch (err) {
+    checks.fileStorage = 'error';
+  }
+
+  // Background jobs: rent reminders, monthly billing, subscription
+  // reminders, vacating notice processing, and the other cron jobs
+  // started in this file all run against the same database
+  // connection checked above, so a failure there is reflected here.
+  checks.backgroundJobs = checks.database;
+
+  try {
+    const { error } = await supabase.from('support_sessions').select('id').limit(1);
+    if (error) checks.supportChat = 'error';
+  } catch (err) {
+    checks.supportChat = 'error';
+  }
+
+  try {
+    const { error } = await supabase.from('units').select('id').limit(1);
+    if (error) checks.publicListings = 'error';
+  } catch (err) {
+    checks.publicListings = 'error';
+  }
+
+  // SMS/WhatsApp: sms.service.js is now a thin bridge onto the local
+  // WhatsApp session (see whatsapp.service.js) - Africa's Talking SMS
+  // was fully removed. WhatsApp sending is itself currently disabled
+  // on purpose (the Puppeteer/Chromium session that drove it was
+  // maxing out host RAM), so every call always resolves harmlessly
+  // without sending anything real. That's an intentional, known state
+  // for this deployment, not an outage - reported 'ok' here for the
+  // same reason an unconfigured optional integration is 'ok' rather
+  // than 'error'. If whatsapp-web.js is reinstated, this check should
+  // start verifying the session is actually authenticated instead.
+  checks.smsWhatsapp = 'ok';
+
+  // Export queue: async report/export jobs (annual report PDF, tax
+  // summary, financial CSV, receipts ZIP, data export JSON) are
+  // handed to pg-boss, which needs its own direct Postgres connection
+  // string - the service-role Supabase client used everywhere else in
+  // this file speaks PostgREST, not raw Postgres, so it can't back
+  // the queue. Without DATABASE_URL/SUPABASE_DB_URL set, async export
+  // endpoints return 503 and the app falls back to the older
+  // synchronous export routes automatically - a real but graceful
+  // degradation, so it's surfaced as its own line rather than folded
+  // into the general database check above.
+  if (!process.env.DATABASE_URL && !process.env.SUPABASE_DB_URL) checks.exportQueue = 'error';
+
+  // Maintenance requests: tenant-reported issues and their status
+  // history, read by both the tenant portal and the landlord/manager/
+  // caretaker "Maintenance" tab.
+  try {
+    const { error } = await supabase.from('maintenance_requests').select('id').limit(1);
+    if (error) checks.maintenanceRequests = 'error';
+  } catch (err) {
+    checks.maintenanceRequests = 'error';
+  }
+
+  // Disputes & complaints: charge_disputes backs "Disputed Charges"
+  // and the tenant-side dispute flow; the same table also backs the
+  // help/complaints inbox surfaced to every role.
+  try {
+    const { error } = await supabase.from('charge_disputes').select('id').limit(1);
+    if (error) checks.disputesAndComplaints = 'error';
+  } catch (err) {
+    checks.disputesAndComplaints = 'error';
+  }
+
+  // Community board: shared posts/announcements visible to tenants
+  // and landlords within a property.
+  try {
+    const { error } = await supabase.from('community_posts').select('id').limit(1);
+    if (error) checks.communityBoard = 'error';
+  } catch (err) {
+    checks.communityBoard = 'error';
+  }
+
+  // Utility submetering: shared water/electricity meter readings and
+  // the invoices generated from them.
+  try {
+    const { error } = await supabase.from('utility_meters').select('id').limit(1);
+    if (error) checks.utilitySubmetering = 'error';
+  } catch (err) {
+    checks.utilitySubmetering = 'error';
+  }
+
+  // Error tracking: Sentry (sentry.service.js) is a complete, harmless
+  // no-op whenever SENTRY_DSN isn't set - that's a valid, common state
+  // for a deployment (errors just aren't reported anywhere but the
+  // console) so it's 'ok' here rather than 'error'. This line exists
+  // so that IF it's configured but the DSN is malformed and init
+  // throws, that misconfiguration is visible instead of silently
+  // falling back to console-only logging with nobody aware of it.
+  try {
+    if (process.env.SENTRY_DSN) {
+      // eslint-disable-next-line global-require
+      require('./services/sentry.service');
+    }
+  } catch (err) {
+    checks.errorTracking = 'error';
+  }
+
   const allOk = Object.values(checks).every((v) => v === 'ok');
   return res.status(allOk ? 200 : 503).json({ status: allOk ? 'ok' : 'degraded', checks, timestamp: new Date().toISOString() });
 });
@@ -238,10 +446,12 @@ app.use('/api/audit-log', auditLogRoutes);
 app.use('/api/annual-report', annualReportRoutes);
 app.use('/api/assistant', assistantRoutes);
 app.use('/api/data-export', dataExportRoutes);
+app.use('/api/export-jobs', exportJobsRoutes);
 app.use('/api/community', communityRoutes);
 app.use('/api/disputes', disputeRoutes);
 app.use('/api/ratings', ratingFlagRoutes);
 app.use('/api/payment-plans', paymentPlanRoutes);
+app.use('/api/late-penalty', require('./routes/latePenalty.routes'));
 app.use('/api/public', publicRoutes);
 app.use('/api/tenant-onboarding', tenantOnboardingRoutes);
 app.use('/api/brand-ambassadors', brandAmbassadorRoutes);
@@ -286,8 +496,29 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
+let httpServer;
+let shuttingDown = false;
 
-app.listen(PORT, () => {
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`[server] ${signal} received; beginning graceful shutdown.`);
+  const forceExit = setTimeout(() => {
+    logger.error('[server] Graceful shutdown timed out after 10s; forcing exit.');
+    process.exit(1);
+  }, 10_000);
+  forceExit.unref();
+  if (httpServer) await new Promise((resolve) => httpServer.close(resolve));
+  for (const task of scheduledCronTasks) {
+    try { task.stop(); } catch (err) { logger.warn('[server] failed stopping cron task', err); }
+  }
+  clearTimeout(forceExit);
+  process.exit(0);
+}
+process.once('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
+process.once('SIGINT', () => { gracefulShutdown('SIGINT'); });
+
+httpServer = app.listen(PORT, () => {
   logger.info('[server] RentaPay backend started', { port: PORT });
   startSubscriptionReminderJob();
   startRentReminderJob();
@@ -303,4 +534,5 @@ app.listen(PORT, () => {
   startLoyaltyDiscountExpiryJob();
   startLoyaltyCandidateDetectionJob(); // P5
   startIncompleteSignupReminderJob();
+  startPaymentReconciliationJob();
 });

@@ -157,6 +157,18 @@ const INCOMPLETE_SIGNUP_STEP_LABELS = {
   property: 'Adding first property',
   payment_method: 'Choosing a payment method',
   units: 'Adding units',
+  // BUGFIX (direct report: "landlord completed the signup but data
+  // shown says he has not added units yet, he has"): a landlord whose
+  // completeSetupWizard call failed after they'd already added units
+  // (e.g. the must_change_password/setup_wizard_complete schema-cache
+  // bug - see sql/2026-07-fixes.sql) stays stuck with
+  // setup_wizard_complete = false forever, even though every real
+  // step - property, payment method, AND units - is done. The old
+  // logic inferred the "units" step purely from property + payment
+  // method existing, without ever checking whether units actually
+  // exist, so it kept mislabeling these landlords as "Adding units"
+  // when in fact they'd finished and just failed to persist that.
+  stuck_after_units: 'Finishing setup (units already added)',
 };
 
 async function getIncompleteSignups(req, res) {
@@ -186,6 +198,16 @@ async function getIncompleteSignups(req, res) {
     if (pmErr) throw pmErr;
     const paymentMethodById = new Map((paymentMethods || []).map((l) => [l.id, l.payment_method]));
 
+    // BUGFIX: also check for actual units, not just a property + a
+    // payment method, so a landlord who really did finish adding
+    // units (and only got stuck because completeSetupWizard itself
+    // failed to save) isn't mislabeled as still needing to add units.
+    const { data: unitRows, error: unitErr } = landlordIds.length
+      ? await supabase.from('units').select('landlord_id').in('landlord_id', landlordIds)
+      : { data: [], error: null };
+    if (unitErr) throw unitErr;
+    const landlordIdsWithUnits = new Set((unitRows || []).map((u) => u.landlord_id));
+
     const signups = (landlords || []).map((l) => {
       let step;
       if (!l.email_verified) {
@@ -196,8 +218,15 @@ async function getIncompleteSignups(req, res) {
         step = 'property';
       } else if (!paymentMethodById.get(l.id)) {
         step = 'payment_method';
-      } else {
+      } else if (!landlordIdsWithUnits.has(l.id)) {
         step = 'units';
+      } else {
+        // Property, payment method, AND units all exist, yet
+        // setup_wizard_complete is still false - they finished, the
+        // completion call just never persisted. Surface this
+        // distinctly instead of telling the admin team units are
+        // still missing.
+        step = 'stuck_after_units';
       }
 
       return {

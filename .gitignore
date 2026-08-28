@@ -21,3 +21,4 @@ settings.gradle
 manifest-checksum.txt
 store_icon.png
 twa-manifest.json
+.env.fly

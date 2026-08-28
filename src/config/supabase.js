@@ -9,6 +9,9 @@
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
+const https = require('https');
+const nativeFetch = global.fetch;
+const keepAliveAgent = new https.Agent({ keepAlive: true });
 const logger = require('../utils/logger');
 
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -34,6 +37,11 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey, {
   // this throws unless we explicitly hand it the `ws` package here.
   realtime: {
     transport: ws,
+  },
+  // Reuse TLS connections for bursts of API requests instead of opening a
+  // fresh handshake for every PostgREST call.
+  global: {
+    fetch: (url, options = {}) => nativeFetch(url, { ...options, agent: keepAliveAgent }),
   },
 });
 

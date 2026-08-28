@@ -4,6 +4,9 @@ const rateLimit = require('express-rate-limit');
 const paymentController = require('../controllers/payment.controller');
 const pendingPaymentConfirmationController = require('../controllers/pendingPaymentConfirmation.controller');
 const { verifyToken, requireRole, requireNotCaretaker } = require('../middleware/auth.middleware');
+// Phase 2: shared Zod validation on money inputs.
+const { validate } = require('../middleware/validate.middleware');
+const { paybillSubmitSchema, manualPaymentSchema, manualUtilityPaymentSchema } = require('../validation/schemas');
 
 // HARDENING (2A): dedicated limiter for the manual payment-submission
 // endpoint - additive, doesn't touch the existing /api/auth limiter in
@@ -47,7 +50,7 @@ router.get('/history/:landlordId', requireRole('admin'), paymentController.getLa
 router.post('/stk-push', requireRole('tenant'), paymentController.initiateRentSTKPush);
 router.post('/utility-stk-push', requireRole('tenant'), paymentController.initiateUtilityStkPush);
 router.get('/rent-status/:checkoutRequestId', requireRole('tenant'), paymentController.checkRentPaymentStatus);
-router.post('/paybill-submit', requireRole('tenant'), paybillSubmitLimiter, paymentController.submitPaybillTransaction);
+router.post('/paybill-submit', requireRole('tenant'), paybillSubmitLimiter, validate(paybillSubmitSchema), paymentController.submitPaybillTransaction);
 router.get('/my-latest-confirmation', requireRole('tenant'), paymentController.getMyLatestPaybillConfirmation);
 // Section 6: tenant, landlord, and manager can all manually download a
 // single receipt - the controller itself checks ownership per role.
@@ -59,12 +62,14 @@ router.post(
   '/manual',
   requireRole('landlord', 'manager'),
   requireNotCaretaker('Caretakers cannot record payments. Contact the landlord or property manager.'),
+  validate(manualPaymentSchema),
   paymentController.recordManualPayment
 );
 router.post(
   '/utility-manual',
   requireRole('landlord', 'manager'),
   requireNotCaretaker('Caretakers cannot record payments. Contact the landlord or property manager.'),
+  validate(manualUtilityPaymentSchema),
   paymentController.recordManualUtilityPayment
 );
 router.get(

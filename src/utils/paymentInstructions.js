@@ -131,4 +131,66 @@ function buildPaymentInstructions(landlord, unit, property) {
   };
 }
 
-module.exports = { buildPaymentInstructions };
+// Direct request/bug report: "Pay Water"/"Pay Electricity" was
+// showing the tenant the exact same Paybill/Till/STK details as rent,
+// because nothing ever looked past the landlord/unit/property's RENT
+// payment settings. A landlord/manager can now switch on a dedicated
+// payment method for a specific utility_meters row (see
+// 2026-08-utility-meter-payment-method.sql) - e.g. water goes to the
+// estate's own Paybill, electricity still falls back to the
+// landlord's usual method.
+//
+// Precedence, most specific wins: meter override > unit override >
+// property override > landlord's own general/default payment method.
+// (Meter is more specific than unit/property here because a meter
+// override is a deliberate, per-utility-type choice, not a blanket
+// "everything for this unit/apartment" override the way
+// unit/property overrides are.)
+function buildUtilityPaymentInstructions(meter, landlord, unit, property) {
+  if (meter && meter.payment_override_enabled) {
+    const method = meter.payment_override_method;
+    const paybillNumber = meter.payment_override_paybill_number;
+    const paybillAccountNumber = applyUnitTemplate(meter.payment_override_paybill_account_number, unit);
+    const tillNumber = meter.payment_override_till_number;
+    const stkPhoneNumber = meter.payment_override_stk_phone_number;
+    const description = meter.payment_override_description;
+
+    if (method === 'paybill' && paybillNumber) {
+      return {
+        method: 'paybill',
+        paybillNumber,
+        accountNumber: paybillAccountNumber || (landlord && landlord.full_name) || 'N/A',
+        text: `Pay via M-Pesa Paybill ${paybillNumber}, Account Number: ${paybillAccountNumber || (landlord && landlord.full_name)}`,
+        description: description || null,
+        isOverride: true,
+      };
+    }
+
+    if (method === 'till' && tillNumber) {
+      return {
+        method: 'till',
+        tillNumber,
+        text: `Pay via M-Pesa Buy Goods (Till Number) ${tillNumber}`,
+        description: description || null,
+        isOverride: true,
+      };
+    }
+
+    if (method === 'stk') {
+      return {
+        method: 'stk',
+        stkPhoneNumber: stkPhoneNumber || null,
+        text: stkPhoneNumber ? `Send payment via M-Pesa to ${stkPhoneNumber}.` : 'Contact your landlord for payment details.',
+        description: description || null,
+        isOverride: true,
+      };
+    }
+    // Override enabled but incomplete (e.g. method set but number
+    // missing) - fall through to the normal rent-based instructions
+    // rather than showing a broken/empty payment method.
+  }
+
+  return buildPaymentInstructions(landlord, unit, property);
+}
+
+module.exports = { buildPaymentInstructions, buildUtilityPaymentInstructions };

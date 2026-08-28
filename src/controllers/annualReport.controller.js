@@ -285,4 +285,4 @@ async function getFinancialReportCsv(req, res) {
   }
 }
 
-module.exports = { computeAnnualPortfolioStatistics, getAnnualPortfolioPdf, getTaxSummaryPdf, getFinancialReportCsv };
+module.exports = { computeAnnualPortfolioStatistics, getAnnualPortfolioPdf, getTaxSummaryPdf, getFinancialReportCsv, buildFinancialReportCsv };

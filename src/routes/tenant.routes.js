@@ -2,6 +2,9 @@ const express = require('express');
 const router = express.Router();
 const tenantController = require('../controllers/tenant.controller');
 const { verifyToken, requireRole, requireNotCaretaker } = require('../middleware/auth.middleware');
+// Phase 2: shared Zod validation on write payloads.
+const { validate } = require('../middleware/validate.middleware');
+const { addTenantSchema, editTenantSchema } = require('../validation/schemas');
 
 router.use(verifyToken);
 
@@ -15,7 +18,7 @@ router.use(verifyToken);
 // false 404s) - fixed here proactively for tenants before it bites in
 // the same way.
 // ---------------------------------------------------------------------
-router.post('/', requireRole('landlord', 'manager'), tenantController.addTenant);
+router.post('/', requireRole('landlord', 'manager'), validate(addTenantSchema), tenantController.addTenant);
 router.get('/balance', requireRole('tenant'), tenantController.getBalance);
 router.get('/payment-history', requireRole('tenant'), tenantController.getPaymentHistory);
 router.get('/utility-invoices', requireRole('tenant'), tenantController.getUtilityInvoices);
@@ -66,7 +69,7 @@ router.post('/rating-reminders/:reminderId/snooze', requireRole('landlord', 'man
 
 router.get('/:tenantId', requireRole('landlord', 'manager', 'admin'), tenantController.getTenant);
 router.delete('/:tenantId', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot remove tenants. Contact the landlord or property manager.'), tenantController.deleteTenant);
-router.patch('/:tenantId', requireRole('landlord', 'manager', 'admin'), tenantController.editTenantDetails);
+router.patch('/:tenantId', requireRole('landlord', 'manager', 'admin'), validate(editTenantSchema), tenantController.editTenantDetails);
 router.get('/:tenantId/balance', requireRole('landlord', 'manager', 'admin'), tenantController.getBalance);
 router.get('/utility-invoices/list', requireRole('landlord', 'manager', 'admin'), tenantController.getUtilityInvoices);
 router.patch('/:tenantId/balance', requireRole('landlord', 'manager', 'admin'), requireNotCaretaker('Caretakers cannot edit a tenant\'s balance. Contact the landlord or property manager.'), tenantController.editBalance);

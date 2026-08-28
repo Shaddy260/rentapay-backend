@@ -8,7 +8,22 @@ jest.mock('../../config/supabase', () => ({ from: jest.fn() }));
 
 const supabase = require('../../config/supabase');
 const { setupSupabaseMock } = require('../../test-utils/supabaseMock');
-const { getExpiredPropertyIds } = require('../subscriptionGate');
+const { getExpiredPropertyIds, isLandlordEligibleForPublicListing } = require('../subscriptionGate');
+
+describe('isLandlordEligibleForPublicListing', () => {
+  test('active, warning, and grace landlords stay listed', () => {
+    expect(isLandlordEligibleForPublicListing('active')).toBe(true);
+    expect(isLandlordEligibleForPublicListing('warning')).toBe(true);
+    expect(isLandlordEligibleForPublicListing('grace')).toBe(true);
+  });
+
+  test('expired (past the 4-day grace period), suspended, pending, and unknown statuses are hidden', () => {
+    expect(isLandlordEligibleForPublicListing('expired')).toBe(false);
+    expect(isLandlordEligibleForPublicListing('suspended')).toBe(false);
+    expect(isLandlordEligibleForPublicListing('pending')).toBe(false);
+    expect(isLandlordEligibleForPublicListing(undefined)).toBe(false);
+  });
+});
 
 describe('getExpiredPropertyIds', () => {
   test('returns [] immediately for an empty id list without querying', async () => {

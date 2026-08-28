@@ -9,12 +9,13 @@ const crypto = require('crypto');
 const supabase = require('../config/supabase');
 const { hashPassword, comparePassword, validatePasswordStrength } = require('../utils/password');
 const { generateOTP, getOTPExpiry, getPasswordResetOTPExpiry, getEmailVerificationOTPExpiry, isOTPExpired } = require('../utils/otp');
+const { generateTotpSecret, verifyTotp, buildOtpAuthUrl, generateRecoveryCodes, hashRecoveryCode } = require('../utils/totp');
 const { normalizePhone, normalizePhoneOrThrow } = require('../utils/phone');
 const { isValidEmail } = require('../utils/email');
 const { findPhoneConflict } = require('../utils/phoneUniqueness');
 const { findEmailConflict } = require('../utils/emailUniqueness');
 const { checkAndRecordResend, clearResendAttempts } = require('../utils/resendRateLimit');
-const { signToken, effectiveLandlordId } = require('../middleware/auth.middleware');
+const { signToken, effectiveLandlordId, signDeviceTrustToken, verifyDeviceTrustToken } = require('../middleware/auth.middleware');
 const { calculateSubscriptionCost } = require('../utils/pricing');
 const { initiateSTKPush } = require('../services/daraja.service');
 const { sendEmail, wrapEmailHtml, SUPPORT_EMAIL } = require('../services/email.service');
@@ -1231,7 +1232,88 @@ async function generalManagerLogin(req, res) {
       return res.status(403).json({ error: 'Your access has been removed. Contact RentaPay support for more information.', accountSuspended: true });
     }
 
+    // 2FA IS MANDATORY FOR GENERAL MANAGERS (direct request), same
+    // TOTP mechanism as admin - see the long comment on adminLogin
+    // above for why this is authenticator-app based rather than
+    // emailed, and why that also happens to fix the old admin-OTP
+    // "works once, then always wrong" bug. Password is fully verified
+    // by this point, so it's safe to hand back enough to drive either
+    // the first-time QR setup screen or the "enter your code" screen.
+    if (!manager.totp_secret) {
+      const secret = generateTotpSecret();
+      await supabase.from('general_managers').update({ totp_secret: secret }).eq('id', manager.id);
+      const otpauthUrl = buildOtpAuthUrl(secret, manager.email, 'RentaPay GM');
+      return res.json({
+        needsTotpSetup: true,
+        managerId: manager.id,
+        secret,
+        otpauthUrl,
+        message: 'Password correct. Scan this QR code in an authenticator app, then enter the 6-digit code to finish setup.',
+      });
+    }
+
+    // "Remember this device" - same mechanism as admin/optional-role
+    // logins (see verifyDeviceTrustToken above).
+    const trusted = verifyDeviceTrustToken(req.body.deviceToken, { accountType: 'general_manager', accountId: manager.id });
+    if (trusted) {
+      const token = signToken({ id: manager.id, role: 'general_manager' });
+      logActivity({ actorType: 'general_manager', actorId: manager.id, action: 'general_manager_login_via_trusted_device', ipAddress: req.ip });
+      return res.json({
+        token,
+        role: 'general_manager',
+        fullName: manager.full_name,
+        email: manager.email,
+        mustChangePassword: manager.must_change_password || false,
+        operationsPinSet: !!manager.operations_pin_hash,
+        canGrantLoyaltyDiscounts: !!manager.can_grant_loyalty_discounts,
+        canManageManualPayments: !!manager.can_manage_manual_payments,
+        canManageHelpRequests: !!manager.can_manage_help_requests,
+        canManageHelpContacts: !!manager.can_manage_help_contacts,
+        photoUrl: manager.photo_url || null,
+      });
+    }
+
+    return res.json({ needsTotp: true, managerId: manager.id, message: 'Password correct. Enter the code from your authenticator app.' });
+  } catch (err) {
+    logger.error('[auth] generalManagerLogin error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to log in.' });
+  }
+}
+
+// Shared by both the first-time-setup confirmation AND every regular
+// login's second step - `isFirstTimeSetup` just controls whether a
+// fresh set of recovery codes is generated and returned.
+async function generalManagerVerifyTotp(req, res) {
+  try {
+    const { managerId, code, rememberDevice } = req.body;
+    if (!managerId || !code) return res.status(400).json({ error: 'managerId and code are required.' });
+
+    const { data: manager, error } = await supabase.from('general_managers').select('*').eq('id', managerId).maybeSingle();
+    if (error || !manager) return res.status(401).json({ error: 'Invalid code.' });
+
+    const isFirstTimeSetup = !manager.totp_recovery_codes;
+    const isValidCode = verifyTotp(manager.totp_secret, code);
+    const recoveryHash = hashRecoveryCode(code);
+    const isRecoveryCode = !isFirstTimeSetup && (manager.totp_recovery_codes || []).includes(recoveryHash);
+
+    if (!isValidCode && !isRecoveryCode) {
+      return res.status(400).json({ error: 'Invalid code.' });
+    }
+
+    let recoveryCodesToReturn;
+    if (isFirstTimeSetup) {
+      const recoveryCodes = generateRecoveryCodes();
+      recoveryCodesToReturn = recoveryCodes;
+      await supabase.from('general_managers').update({ totp_recovery_codes: recoveryCodes.map(hashRecoveryCode), totp_enabled: true }).eq('id', manager.id);
+    } else if (isRecoveryCode) {
+      const remaining = (manager.totp_recovery_codes || []).filter((h) => h !== recoveryHash);
+      await supabase.from('general_managers').update({ totp_recovery_codes: remaining }).eq('id', manager.id);
+      logActivity({ actorType: 'general_manager', actorId: manager.id, action: 'general_manager_login_via_recovery_code', ipAddress: req.ip });
+    }
+
     const token = signToken({ id: manager.id, role: 'general_manager' });
+    const deviceToken = rememberDevice ? signDeviceTrustToken({ accountType: 'general_manager', accountId: manager.id }) : undefined;
 
     logActivity({
       actorType: 'general_manager',
@@ -1244,28 +1326,23 @@ async function generalManagerLogin(req, res) {
 
     return res.json({
       token,
+      deviceToken,
       role: 'general_manager',
       fullName: manager.full_name,
       email: manager.email,
-      // Frontend routes to the forced password-change screen first
-      // (same field name/flow as every other role), then - once
-      // that's done - to Operations PIN setup, per Section 4.
       mustChangePassword: manager.must_change_password || false,
       operationsPinSet: !!manager.operations_pin_hash,
-      // FEATURE (direct request) - per-manager toggles set by admin;
-      // the frontend uses these to decide whether to render the
-      // Loyalty Discounts edit controls / show the Landlord Manual
-      // Payments menu item at all for this GM.
       canGrantLoyaltyDiscounts: !!manager.can_grant_loyalty_discounts,
       canManageManualPayments: !!manager.can_manage_manual_payments,
       canManageHelpRequests: !!manager.can_manage_help_requests,
       canManageHelpContacts: !!manager.can_manage_help_contacts,
       photoUrl: manager.photo_url || null,
+      ...(recoveryCodesToReturn ? { recoveryCodes: recoveryCodesToReturn } : {}),
     });
   } catch (err) {
-    logger.error('[auth] generalManagerLogin error:', err.message);
+    logger.error('[auth] generalManagerVerifyTotp error:', err.message);
     captureException(err);
-    return res.status(500).json({ error: 'Failed to log in.' });
+    return res.status(500).json({ error: 'Failed to verify code.' });
   }
 }
 
@@ -1772,6 +1849,38 @@ async function login(req, res) {
     supabase.from(table).update({ failed_login_attempts: 0, locked_until: null }).eq('id', account.id)
       .then(({ error: resetErr }) => { if (resetErr) { logger.error('[auth] login: failed to reset attempt counter (non-fatal):', resetErr.message); captureException(resetErr); } });
 
+    // OPTIONAL 2FA (direct request: mandatory for admin/GM, optional
+    // for everyone else - landlord/tenant/manager/brand_ambassador
+    // turn this on for themselves via twoFactor.controller.js). Only
+    // gated here if the account actually enabled it; nothing changes
+    // for anyone who hasn't. Password is already fully verified at
+    // this point, so it's safe to stop just short of issuing a token.
+    if (account.totp_enabled) {
+      // "Remember this device" (direct request: avoid re-typing a
+      // TOTP code every login on the same phone that already proved
+      // it has the authenticator). If the client sent back a
+      // device-trust token from a previous verifyLoginTotp call, and
+      // it's still valid for THIS exact account, skip straight past
+      // the code prompt - otherwise fall through to needsTotp as
+      // normal. A missing/expired/mismatched token is just treated as
+      // "not trusted", never as an error.
+      // The frontend doesn't always know which role it's logging into
+      // ahead of time (e.g. the account-picker flow), so it may send
+      // every device-trust token it's holding rather than a single
+      // guess - check all of them for one that matches this account.
+      const candidateTokens = [req.body.deviceToken, ...(Array.isArray(req.body.deviceTokens) ? req.body.deviceTokens : [])].filter(Boolean);
+      const trusted = candidateTokens.some((t) => verifyDeviceTrustToken(t, { accountType, accountId: account.id }));
+      if (!trusted) {
+        return res.status(200).json({
+          needsTotp: true,
+          accountType,
+          accountId: account.id,
+          message: 'Enter the code from your authenticator app.',
+        });
+      }
+      logActivity({ actorType: accountType, actorId: account.id, action: 'login_via_trusted_device', ipAddress: req.ip });
+    }
+
     const token = signToken(
       accountType === 'manager'
         ? { id: account.id, role: accountType, landlordId: account.landlord_id, roleLevel: account.role_level || 'manager' }
@@ -1798,6 +1907,93 @@ async function login(req, res) {
     logger.error('[auth] login error:', err.message);
     captureException(err);
     return res.status(500).json({ error: 'Failed to log in.' });
+  }
+}
+
+// Second step for the OPTIONAL per-account 2FA toggle (landlord/
+// tenant/manager/brand_ambassador - see twoFactor.controller.js for
+// how it gets turned on). login() above already fully verified the
+// password and stopped short of issuing a token when it saw
+// totp_enabled; this finishes that login using only accountId/
+// accountType/code, exactly like the admin and GM flows above reuse
+// their own account lockout counters (locked_until/
+// failed_login_attempts) rather than a separate OTP-attempt counter,
+// since a wrong TOTP code here is functionally the same failure mode
+// as a wrong password and should count toward the same lockout.
+async function verifyLoginTotp(req, res) {
+  try {
+    const { accountType, accountId, code, rememberDevice } = req.body;
+    if (!accountType || !accountId || !code) {
+      return res.status(400).json({ error: 'accountType, accountId, and code are required.' });
+    }
+    if (!ALL_ACCOUNT_TYPES.includes(accountType) && accountType !== 'brand_ambassador') {
+      return res.status(400).json({ error: 'Invalid accountType.' });
+    }
+
+    const { table, phoneField } = accountTable(accountType);
+    const { data: account, error } = await supabase.from(table).select('*').eq('id', accountId).maybeSingle();
+    if (error || !account || !account.totp_enabled) {
+      return res.status(401).json({ error: 'Invalid code.' });
+    }
+
+    if (account.locked_until && new Date(account.locked_until) > new Date()) {
+      return res.status(423).json({ error: 'Account temporarily locked due to repeated failed attempts.', lockedUntil: account.locked_until });
+    }
+
+    const isValidCode = verifyTotp(account.totp_secret, code);
+    const recoveryHash = hashRecoveryCode(code);
+    const isRecoveryCode = (account.totp_recovery_codes || []).includes(recoveryHash);
+
+    if (!isValidCode && !isRecoveryCode) {
+      const newAttempts = (account.failed_login_attempts || 0) + 1;
+      const updateFields = { failed_login_attempts: newAttempts };
+      if (newAttempts >= MAX_LOGIN_ATTEMPTS) {
+        const lockUntil = new Date();
+        lockUntil.setMinutes(lockUntil.getMinutes() + LOCKOUT_MINUTES);
+        updateFields.locked_until = lockUntil.toISOString();
+      }
+      await supabase.from(table).update(updateFields).eq('id', account.id);
+      return res.status(400).json({ error: 'Invalid code.' });
+    }
+
+    const updateFields = { failed_login_attempts: 0, locked_until: null };
+    if (isRecoveryCode) {
+      updateFields.totp_recovery_codes = (account.totp_recovery_codes || []).filter((h) => h !== recoveryHash);
+      logActivity({ actorType: accountType, actorId: account.id, action: 'login_via_recovery_code', ipAddress: req.ip });
+    }
+    await supabase.from(table).update(updateFields).eq('id', account.id);
+
+    const token = signToken(
+      accountType === 'manager'
+        ? { id: account.id, role: accountType, landlordId: account.landlord_id, roleLevel: account.role_level || 'manager' }
+        : { id: account.id, role: accountType }
+    );
+
+    const resume = accountType === 'landlord' ? await computeLandlordResumeStep(account) : null;
+    const subscriptionExpired = accountType === 'landlord' && account.subscription_status === 'expired';
+
+    // Only issued when the person explicitly checked "remember this
+    // device" - never silently. The frontend stores this and sends it
+    // back on future login() calls so the TOTP prompt can be skipped
+    // on that same browser/device (see login() above).
+    const deviceToken = rememberDevice ? signDeviceTrustToken({ accountType, accountId: account.id }) : undefined;
+
+    return res.json({
+      token,
+      deviceToken,
+      mustChangePassword: account.must_change_password || false,
+      setupWizardComplete: accountType === 'landlord' ? account.setup_wizard_complete : undefined,
+      setupWizardStep: resume?.step,
+      setupWizardPropertyId: resume?.defaultPropertyId,
+      role: accountType,
+      roleLevel: accountType === 'manager' ? account.role_level || 'manager' : undefined,
+      subscriptionExpired,
+      phone: account[phoneField],
+    });
+  } catch (err) {
+    logger.error('[auth] verifyLoginTotp error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to verify code.' });
   }
 }
 
@@ -2037,7 +2233,7 @@ async function adminLogin(req, res) {
     // var keeps working exactly as it always has.
     const { data: settings } = await supabase
       .from('platform_settings')
-      .select('admin_password_hash')
+      .select('admin_password_hash, admin_totp_secret')
       .eq('id', 1)
       .maybeSingle();
     const adminPasswordHash = settings?.admin_password_hash || process.env.SUPER_ADMIN_PASSWORD_HASH;
@@ -2058,36 +2254,51 @@ async function adminLogin(req, res) {
       return res.status(401).json({ error: 'Invalid password.' });
     }
 
-    // DIRECT REQUEST: communications (SMS/email) aren't fully set up
-    // yet, so the admin OTP step is disabled for now via env flag -
-    // set SUPER_ADMIN_OTP_ENABLED=true in .env whenever ready to turn
-    // 2FA back on for production, no code change needed either way.
-    const otpEnabled = String(process.env.SUPER_ADMIN_OTP_ENABLED || '').toLowerCase() === 'true';
-    if (!otpEnabled) {
+    // 2FA IS MANDATORY FOR ADMIN (direct request), and uses an
+    // authenticator app (TOTP, RFC 6238) instead of an emailed code.
+    //
+    // FIX for "first login's OTP worked, every one after says wrong
+    // OTP even with a fresh code": the old flow stored the OTP in
+    // `global.__adminOtpStore` - a plain in-memory variable on ONE
+    // Node process. Any host running more than one worker/instance
+    // (or that restarts between requests) could route the verify call
+    // to a different process than the one that generated the code,
+    // which had nothing in memory to compare against - always
+    // "Invalid OTP", regardless of what was typed. TOTP has nothing
+    // to lose between requests: the secret lives in platform_settings
+    // and the code is recomputed fresh from secret + current time on
+    // whichever process handles the request, so this can't happen.
+    // See src/utils/totp.js for more detail.
+    if (!settings?.admin_totp_secret) {
+      // First time through: no authenticator app has been linked yet.
+      // Generate and store a secret now (not enabled/required for a
+      // *second* factor until confirmAdminTotpSetup below actually
+      // verifies a live code from it), and hand back enough for the
+      // frontend to render a QR code.
+      const secret = generateTotpSecret();
+      await supabase.from('platform_settings').update({ admin_totp_secret: secret }).eq('id', 1);
+      const otpauthUrl = buildOtpAuthUrl(secret, adminEmail, 'RentaPay Admin');
+      logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'admin_totp_setup_started', ipAddress: req.ip });
+      return res.json({
+        needsTotpSetup: true,
+        secret,
+        otpauthUrl,
+        message: 'Password correct. Scan this QR code in an authenticator app, then enter the 6-digit code to finish setup.',
+      });
+    }
+
+    // "Remember this device" - same mechanism as the optional-role
+    // flow (see login()/verifyDeviceTrustToken above). Admin is a
+    // single fixed account ('super-admin'), so accountId is a
+    // constant rather than a row id.
+    const trusted = verifyDeviceTrustToken(req.body.deviceToken, { accountType: 'admin', accountId: 'super-admin' });
+    if (trusted) {
       const token = signToken({ id: 'super-admin', role: 'admin' });
-      logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'admin_login', metadata: { otpSkipped: true }, ipAddress: req.ip });
-      return res.json({ token, role: 'admin', otpSkipped: true, message: 'Password correct. OTP is currently disabled - logged in directly.' });
+      logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'admin_login_via_trusted_device', ipAddress: req.ip });
+      return res.json({ token, role: 'admin' });
     }
 
-    // Issue a short-lived OTP for 2FA (blueprint 13.3: expires in 5 minutes)
-    const otp = generateOTP();
-    global.__adminOtpStore = { otp, expiresAt: Date.now() + 5 * 60 * 1000 };
-
-    try {
-      await sendEmail(adminEmail, 'Your RentaPay admin verification code', wrapEmailHtml(templates.adminOtpMessage(otp)));
-    } catch (emailErr) {
-      // Without this catch, any email failure (unverified Resend
-      // domain, network issue, etc) would 500 the whole request and
-      // the OTP - which WAS generated and stored above - would never
-      // be shown to the admin anywhere, leaving them stuck with no
-      // way to get in. Log it loudly since this IS the actual
-      // delivery mechanism for the OTP; the admin needs another way
-      // to see it when email is broken.
-      logger.error('[auth] adminLogin: OTP email failed to send. OTP is still valid - check here:', otp, '| Error:', emailErr.message);
-      captureException(emailErr);
-    }
-
-    return res.json({ message: 'Password correct. OTP sent to admin email, expires in 5 minutes.' });
+    return res.json({ needsTotp: true, message: 'Password correct. Enter the code from your authenticator app.' });
   } catch (err) {
     logger.error('[auth] adminLogin error:', err.message);
     captureException(err);
@@ -2095,28 +2306,75 @@ async function adminLogin(req, res) {
   }
 }
 
+// Finishes first-time TOTP enrollment: proves the admin actually
+// scanned the QR code by requiring one live, valid code before the
+// secret becomes the real second factor going forward.
+async function confirmAdminTotpSetup(req, res) {
+  try {
+    const { code, rememberDevice } = req.body;
+    const { data: settings } = await supabase.from('platform_settings').select('admin_totp_secret').eq('id', 1).maybeSingle();
+    if (!settings?.admin_totp_secret) {
+      return res.status(400).json({ error: 'No pending 2FA setup found. Log in again to start setup.' });
+    }
+    if (!verifyTotp(settings.admin_totp_secret, code)) {
+      return res.status(400).json({ error: 'Incorrect code. Check the time on your device and try again.' });
+    }
+
+    const recoveryCodes = generateRecoveryCodes();
+    await supabase.from('platform_settings').update({ admin_totp_recovery_codes: recoveryCodes.map(hashRecoveryCode) }).eq('id', 1);
+
+    const token = signToken({ id: 'super-admin', role: 'admin' });
+    const deviceToken = rememberDevice ? signDeviceTrustToken({ accountType: 'admin', accountId: 'super-admin' }) : undefined;
+    logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'admin_totp_setup_completed', ipAddress: req.ip });
+
+    return res.json({
+      token,
+      deviceToken,
+      role: 'admin',
+      recoveryCodes, // shown once, plaintext - save them now
+      message: 'Two-factor authentication is set up. Save these recovery codes somewhere safe.',
+    });
+  } catch (err) {
+    logger.error('[auth] confirmAdminTotpSetup error:', err.message);
+    captureException(err);
+    return res.status(500).json({ error: 'Failed to complete 2FA setup.' });
+  }
+}
+
 async function adminVerifyOTP(req, res) {
   try {
-    const { otp } = req.body;
-    const store = global.__adminOtpStore;
+    const { otp, code, rememberDevice } = req.body;
+    const submitted = code || otp; // `otp` kept for backward compatibility with older clients
+    const { data: settings } = await supabase.from('platform_settings').select('admin_totp_secret, admin_totp_recovery_codes').eq('id', 1).maybeSingle();
 
-    if (!store || store.otp !== otp) {
-      return res.status(400).json({ error: 'Invalid OTP.' });
-    }
-    if (Date.now() > store.expiresAt) {
-      return res.status(400).json({ error: 'OTP expired. Please log in again.' });
+    if (!settings?.admin_totp_secret) {
+      return res.status(400).json({ error: '2FA is not set up yet. Log in with your password again to start setup.' });
     }
 
-    global.__adminOtpStore = null;
+    const isValidCode = verifyTotp(settings.admin_totp_secret, submitted);
+    const recoveryHash = hashRecoveryCode(submitted || '');
+    const isRecoveryCode = (settings.admin_totp_recovery_codes || []).includes(recoveryHash);
+
+    if (!isValidCode && !isRecoveryCode) {
+      return res.status(400).json({ error: 'Invalid code.' });
+    }
+
+    if (isRecoveryCode) {
+      // Recovery codes are single-use - burn it the moment it's spent.
+      const remaining = (settings.admin_totp_recovery_codes || []).filter((h) => h !== recoveryHash);
+      await supabase.from('platform_settings').update({ admin_totp_recovery_codes: remaining }).eq('id', 1);
+      logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'admin_login_via_recovery_code', ipAddress: req.ip });
+    }
+
     const token = signToken({ id: 'super-admin', role: 'admin' });
-
+    const deviceToken = rememberDevice ? signDeviceTrustToken({ accountType: 'admin', accountId: 'super-admin' }) : undefined;
     logActivity({ actorType: 'admin', actorId: 'super-admin', action: 'admin_login', ipAddress: req.ip });
 
-    return res.json({ token, role: 'admin' });
+    return res.json({ token, deviceToken, role: 'admin' });
   } catch (err) {
     logger.error('[auth] adminVerifyOTP error:', err.message);
     captureException(err);
-    return res.status(500).json({ error: 'Failed to verify admin OTP.' });
+    return res.status(500).json({ error: 'Failed to verify admin code.' });
   }
 }
 
@@ -3192,10 +3450,13 @@ module.exports = {
   login,
   loginWithGoogle,
   generalManagerLogin,
+  verifyLoginTotp,
   generalManagerForgotPassword,
   generalManagerResetPassword,
   adminLogin,
   adminVerifyOTP,
+  confirmAdminTotpSetup,
+  generalManagerVerifyTotp,
   adminForgotPassword,
   adminResetPassword,
   changeAdminPassword,

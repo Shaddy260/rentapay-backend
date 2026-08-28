@@ -28,7 +28,7 @@ const templates = require('../services/notificationTemplates');
 const { getActiveDiscountRecordForLandlord, consumeLoyaltyDiscount } = require('../services/landlordLoyalty.service');
 const { calculateSubscriptionCost } = require('../utils/pricing');
 const { createCoveragePeriod, computeRenewalStartDate } = require('../services/coveragePeriod.service');
-const { PLATFORM_PAYBILL_NUMBER, PLATFORM_PAYBILL_ACCOUNT_NUMBER } = require('../constants/platformPaybill');
+const platformPaymentSettingsService = require('../services/platformPaymentSettings.service');
 const { captureException } = require('../services/sentry.service');
 const logger = require('../utils/logger');
 
@@ -201,6 +201,12 @@ async function submitManualSubscriptionPayment(req, res) {
       { category: 'account', title: 'Manual Payment Submitted' }
     ).catch((notifyErr) => { logger.warn('[landlordManualSubscriptionPayment] admin notify failed:', notifyErr.message); captureException(notifyErr); });
 
+    // Admin-editable now (see platformPaymentSettings.service.js) -
+    // read the live value rather than the old hardcoded constant, so
+    // this echo always matches whatever the landlord was actually
+    // shown on PaymentDetailsCard.jsx.
+    const platformPaymentSettings = await platformPaymentSettingsService.getCurrentPaymentSettings();
+
     return res.status(201).json({
       message: existingConfirmed
         ? 'This transaction code was already used for a previous confirmed payment and cannot be reused. This has been flagged for the admin to review - please contact support if you believe this is a mistake.'
@@ -209,8 +215,8 @@ async function submitManualSubscriptionPayment(req, res) {
       confirmation: record,
       expectedAmount,
       amountMismatch: isAmountMismatch(validatedAmount, expectedAmount),
-      paybillNumber: PLATFORM_PAYBILL_NUMBER,
-      accountNumber: PLATFORM_PAYBILL_ACCOUNT_NUMBER,
+      paybillNumber: platformPaymentSettings.paybill_number,
+      accountNumber: platformPaymentSettings.account_number,
     });
   } catch (err) {
     logger.error('[landlordManualSubscriptionPayment] submit error:', err.message);

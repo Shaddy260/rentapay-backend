@@ -194,6 +194,22 @@ async function confirmPendingPayment(req, res) {
     if (record.status !== 'pending') {
       return res.status(409).json({ error: 'This submission has already been actioned.' });
     }
+    // FIX (direct request: "made the payment be confirmed multiple
+    // times, so billing issue"): submitPaybillTransaction flags a
+    // submission as a likely duplicate (same M-Pesa transaction code
+    // as an already-confirmed record) via `duplicate_of`, but that
+    // was only ever enforced in the frontend - PendingPaymentConfirmations.jsx
+    // simply hides the Confirm button when duplicate_of is set. The
+    // backend itself had no matching check, so it would happily
+    // confirm a flagged duplicate (and credit the tenant's balance a
+    // second time for the same real payment) via any direct API call,
+    // a stale/replayed request, or a future UI bug - server-side
+    // authorization can't rely on a button being hidden client-side.
+    // Same reasoning as the pending-status guard right above: this
+    // needs to be true at the source of truth, not just in the UI.
+    if (record.duplicate_of) {
+      return res.status(409).json({ error: 'This looks like a duplicate of a payment already confirmed. Contact the tenant to verify before confirming, or reject/delete it if it was submitted in error.' });
+    }
     if (await blockIfSubscriptionExpired(req, res, record.landlord_id, record.property_id)) return;
 
     const nowIso = new Date().toISOString();

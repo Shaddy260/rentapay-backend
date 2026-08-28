@@ -24,6 +24,45 @@ function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
+const DEVICE_TRUST_EXPIRES_IN = process.env.DEVICE_TRUST_EXPIRES_IN || '30d';
+
+// "Remember this device" for 2FA (direct request: avoid typing a TOTP
+// code on every login on the same phone that already proved it has
+// the authenticator). This is a SEPARATE, narrowly-scoped JWT - never
+// a stand-in for the real session token. It only ever proves "this
+// browser already completed a TOTP challenge for this account
+// recently", nothing else:
+//   - `purpose: 'device_trust'` so verifyToken (below) refuses to
+//     accept it as a Bearer session token even if someone tries -
+//     without this, a leaked device-trust token would be a full
+//     account takeover instead of just a 2FA skip.
+//   - No role-shaped {id, role} payload, so it can't accidentally
+//     satisfy requireRole() checks either.
+//   - Short-ish expiry (30d default) and re-issued fresh each time it
+//     is used, not indefinitely renewable off a single enrollment.
+function signDeviceTrustToken({ accountType, accountId }) {
+  return jwt.sign({ purpose: 'device_trust', accountType, accountId }, JWT_SECRET, {
+    expiresIn: DEVICE_TRUST_EXPIRES_IN,
+  });
+}
+
+// Returns { accountType, accountId } if the token is a valid,
+// unexpired device-trust token for that exact account, else null.
+// Never throws - callers treat a bad/missing token as "not trusted",
+// not as an error worth surfacing to the user.
+function verifyDeviceTrustToken(token, { accountType, accountId } = {}) {
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.purpose !== 'device_trust') return null;
+    if (accountType && decoded.accountType !== accountType) return null;
+    if (accountId && String(decoded.accountId) !== String(accountId)) return null;
+    return { accountType: decoded.accountType, accountId: decoded.accountId };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Returns the landlord_id a request should be scoped to, regardless of
  * whether the caller is the landlord themself or a property manager
@@ -206,6 +245,12 @@ async function verifyToken(req, res, next) {
   const token = header.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    // A device-trust token (see signDeviceTrustToken above) must never
+    // work as a session token - it proves "2FA was solved recently on
+    // this device", not "this is a valid logged-in session".
+    if (decoded.purpose === 'device_trust') {
+      return res.status(401).json({ error: 'Invalid or expired token.' });
+    }
     req.user = decoded; // { id, role }
 
     // Tag every subsequent log line for this request with who's making
@@ -617,6 +662,8 @@ function requireGmPermission(column) {
 
 module.exports = {
   signToken,
+  signDeviceTrustToken,
+  verifyDeviceTrustToken,
   verifyToken,
   optionalAuth,
   requireRole,

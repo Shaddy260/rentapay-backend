@@ -3,6 +3,7 @@ const express = require('express');
 const { verifyToken, requireRole, requireGmPermission, requireOperationsPinConfirmation } = require('../middleware/auth.middleware');
 const ctrl = require('../controllers/settings.controller');
 const pricingCtrl = require('../controllers/subscriptionPricing.controller');
+const platformPaymentCtrl = require('../controllers/platformPaymentSettings.controller');
 
 // Public router - mount at /api/settings (no auth). Read by every
 // portal's Help modal, including the logged-out login screen.
@@ -14,6 +15,12 @@ publicRouter.get('/public/help-contacts', ctrl.getPublicHelpContacts);
 // a brand-new landlord's first subscription correctly. Read-only,
 // no loyalty/history data exposed.
 publicRouter.get('/public/subscription-pricing', pricingCtrl.getPublicSubscriptionPricing);
+
+// Live Paybill/Till a landlord/manager/caretaker should send their
+// manual subscription payment to (see PaymentDetailsCard.jsx). Any
+// logged-in payer can read this - it's not admin-only to VIEW, only
+// to change (see adminRouter below).
+publicRouter.get('/platform-payment', verifyToken, platformPaymentCtrl.getPayerFacingPaymentSettings);
 
 // Admin router - mount at /api/admin/settings.
 const adminRouter = express.Router();
@@ -44,6 +51,15 @@ adminRouter.delete('/help-contacts/numbers/:id', verifyToken, requireRole('admin
 // role at the API level.
 adminRouter.get('/subscription-pricing', verifyToken, requireRole('admin', 'general_manager'), pricingCtrl.getSubscriptionPricing);
 adminRouter.patch('/subscription-pricing', verifyToken, requireRole('admin'), pricingCtrl.updateSubscriptionPricing);
+
+// Platform's OWN receiving Paybill/Till for landlord subscription
+// payments (the "pay manually" fallback destination) - direct
+// request: "strictly admin only". Unlike subscription-pricing above,
+// a General Manager gets no access here at all, view or edit - this
+// controls where landlords' money is actually sent, so it stays
+// admin-only at the API level, not just hidden in the UI.
+adminRouter.get('/platform-payment', verifyToken, requireRole('admin'), platformPaymentCtrl.getPlatformPaymentSettings);
+adminRouter.patch('/platform-payment', verifyToken, requireRole('admin'), platformPaymentCtrl.updatePlatformPaymentSettings);
 
 // Loyalty discounts for landlords who've subscribed consecutively.
 // FEATURE (direct request): a General Manager can always VIEW these

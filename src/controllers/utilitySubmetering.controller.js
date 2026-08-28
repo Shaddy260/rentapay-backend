@@ -39,12 +39,57 @@ function currentActor(req) {
 // object every reading hangs off of).
 // ---------------------------------------------------------------------
 
+// Direct request: a landlord/manager may give a meter its own,
+// dedicated payment method (e.g. the estate's separate water Paybill)
+// instead of tenants being told to pay water/electricity to the same
+// account as rent. See paymentInstructions.js buildUtilityPaymentInstructions
+// for how this is resolved, and 2026-08-utility-meter-payment-method.sql
+// for the columns. Shared across createMeter/bulkCreateMeters/updateMeter.
+function extractPaymentOverrideFields(body) {
+  const {
+    paymentOverrideEnabled,
+    paymentOverrideMethod,
+    paymentOverridePaybillNumber,
+    paymentOverridePaybillAccountNumber,
+    paymentOverrideTillNumber,
+    paymentOverrideStkPhoneNumber,
+    paymentOverrideDescription,
+  } = body || {};
+  if (paymentOverrideEnabled == null) return null; // caller didn't touch payment settings at all
+
+  if (paymentOverrideEnabled) {
+    if (!['stk', 'paybill', 'till'].includes(paymentOverrideMethod)) {
+      return { error: "paymentOverrideMethod must be 'stk', 'paybill', or 'till' when paymentOverrideEnabled is true." };
+    }
+    if (paymentOverrideMethod === 'paybill' && !paymentOverridePaybillNumber) {
+      return { error: 'paymentOverridePaybillNumber is required for the paybill method.' };
+    }
+    if (paymentOverrideMethod === 'till' && !paymentOverrideTillNumber) {
+      return { error: 'paymentOverrideTillNumber is required for the till method.' };
+    }
+  }
+
+  return {
+    fields: {
+      payment_override_enabled: !!paymentOverrideEnabled,
+      payment_override_method: paymentOverrideEnabled ? paymentOverrideMethod : null,
+      payment_override_paybill_number: paymentOverrideEnabled ? paymentOverridePaybillNumber || null : null,
+      payment_override_paybill_account_number: paymentOverrideEnabled ? paymentOverridePaybillAccountNumber || null : null,
+      payment_override_till_number: paymentOverrideEnabled ? paymentOverrideTillNumber || null : null,
+      payment_override_stk_phone_number: paymentOverrideEnabled ? paymentOverrideStkPhoneNumber || null : null,
+      payment_override_description: paymentOverrideEnabled ? paymentOverrideDescription || null : null,
+    },
+  };
+}
+
 async function createMeter(req, res) {
   try {
     const { propertyId, label, utilityType, isShared, ratePerUnit, unitIds } = req.body;
     if (!label || !utilityType || !['water', 'electricity'].includes(utilityType)) {
       return res.status(400).json({ error: "label and a valid utilityType ('water' or 'electricity') are required." });
     }
+    const paymentOverride = extractPaymentOverrideFields(req.body);
+    if (paymentOverride?.error) return res.status(400).json({ error: paymentOverride.error });
     if (ratePerUnit == null || Number(ratePerUnit) <= 0) {
       return res.status(400).json({ error: 'ratePerUnit must be a positive number.' });
     }
@@ -94,6 +139,7 @@ async function createMeter(req, res) {
         rate_per_unit: Number(ratePerUnit),
         created_by_role: role,
         created_by_id: id,
+        ...(paymentOverride?.fields || {}),
       })
       .select()
       .single();
@@ -243,6 +289,8 @@ async function updateMeter(req, res) {
     if (ratePerUnit != null && Number(ratePerUnit) <= 0) {
       return res.status(400).json({ error: 'ratePerUnit must be a positive number.' });
     }
+    const paymentOverride = extractPaymentOverrideFields(req.body);
+    if (paymentOverride?.error) return res.status(400).json({ error: paymentOverride.error });
 
     const nextIsShared = isShared != null ? !!isShared : meter.is_shared;
     if (unitIds != null) {
@@ -266,6 +314,7 @@ async function updateMeter(req, res) {
     if (ratePerUnit != null) patch.rate_per_unit = Number(ratePerUnit);
     if (utilityType != null) patch.utility_type = utilityType;
     if (isShared != null) patch.is_shared = !!isShared;
+    if (paymentOverride?.fields) Object.assign(patch, paymentOverride.fields);
 
     if (Object.keys(patch).length > 0) {
       const { error } = await supabase.from('utility_meters').update(patch).eq('id', meterId);
@@ -894,12 +943,32 @@ async function getOrCreateBillingRun(reading, meter) {
     runUnits = svc.splitSharedUsage(totalUsage, meter.rate_per_unit, occupied);
   }
 
+  // BUG FIX (direct request: "Failed to load review"): the review
+  // screen's GET can land twice in quick succession (e.g. a
+  // double-fetch from the client), and up to here this function only
+  // checked for an existing run with a plain SELECT - two concurrent
+  // calls can both see "no run yet" and both attempt this INSERT,
+  // and the loser collides with the unique constraint on reading_id
+  // and 500s. Insert defensively: on a unique-violation (Postgres
+  // code 23505) here, someone else just created the run we were
+  // about to create, so fetch and return that one instead of failing.
   const { data: run, error } = await supabase
     .from('utility_billing_runs')
     .insert({ reading_id: reading.id, meter_id: meter.id, month_key: reading.month_key, total_usage: totalUsage, status: 'draft' })
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    if (error.code === '23505') {
+      const { data: raceWinner, error: refetchErr } = await supabase
+        .from('utility_billing_runs')
+        .select('*, utility_billing_run_units(*, units(unit_name))')
+        .eq('reading_id', reading.id)
+        .maybeSingle();
+      if (refetchErr) throw refetchErr;
+      if (raceWinner) return raceWinner;
+    }
+    throw error;
+  }
 
   const { error: unitsErr } = await supabase.from('utility_billing_run_units').insert(
     runUnits.map((u) => ({
@@ -1054,9 +1123,14 @@ async function finalizeRun(req, res) {
       // `.maybeSingle()` fixes the root cause; the result screen
       // itself is also being made impossible to miss when this
       // happens (see UtilityReviewScreen.jsx).
+      // BUG FIX: tenants has no `phone` column (only primary_phone /
+      // secondary_phone / emergency_contact_phone - see schema.sql).
+      // Selecting `phone` here threw "column tenants.phone does not
+      // exist" and aborted finalize entirely before any invoice was
+      // created or tenant notified.
       const { data: tenants, error: tenantErr } = await supabase
         .from('tenants')
-        .select('id, full_name, balance_due, phone, primary_phone')
+        .select('id, full_name, balance_due, primary_phone, secondary_phone')
         .eq('unit_id', row.unit_id)
         .eq('is_active', true)
         .order('created_at', { ascending: false })
@@ -1099,7 +1173,7 @@ async function finalizeRun(req, res) {
       if (invoiceErr) throw invoiceErr;
 
       try {
-        await notify('tenant', tenant.id, tenant.primary_phone || tenant.phone, `Your ${meter.utility_type} bill for ${run.month_key} is KES ${Number(row.final_amount).toLocaleString()}. It's been added to your RentaPay account as a separate invoice from rent - open the app to view and pay it.`);
+        await notify('tenant', tenant.id, tenant.primary_phone || tenant.secondary_phone, `Your ${meter.utility_type} bill for ${run.month_key} is KES ${Number(row.final_amount).toLocaleString()}. It's been added to your RentaPay account as a separate invoice from rent - open the app to view and pay it.`);
       } catch (notifyErr) {
         logger.error('[utilitySubmetering] finalizeRun: notify failed for tenant', tenant.id, notifyErr.message);
       }

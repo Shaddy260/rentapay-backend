@@ -117,4 +117,29 @@ async function getExpiredPropertyIds(landlordId, propertyIds) {
   return expired;
 }
 
-module.exports = { isSubscriptionExpiredFor, blockIfSubscriptionExpired, getExpiredPropertyIds };
+// DIRECT REQUEST: public listings must only show units belonging to
+// an "active" landlord - subscribed and not expired - and be hidden
+// the moment that stops being true (suspended by admin, or the
+// subscription has fully lapsed). 'active'/'warning' both mean a
+// currently-paid-up subscription (warning is just the <=14-day
+// reminder window, nothing has lapsed yet). 'grace' is the 4-day
+// window after expiry (see subscriptionReminders.job.js) where the
+// landlord can still fully use the platform while they renew - the
+// direct request was explicit that listings only come down once the
+// grace period itself runs out, not the moment the clock hits zero -
+// so 'grace' is still public-listing-eligible. Only once the grace
+// period elapses (status flips to 'expired'), or an admin suspends
+// the account, or the account was never activated ('pending'), does
+// the landlord's inventory disappear from public listings.
+const PUBLIC_LISTING_ELIGIBLE_STATUSES = new Set(['active', 'warning', 'grace']);
+
+function isLandlordEligibleForPublicListing(subscriptionStatus) {
+  return PUBLIC_LISTING_ELIGIBLE_STATUSES.has(subscriptionStatus);
+}
+
+module.exports = {
+  isSubscriptionExpiredFor,
+  blockIfSubscriptionExpired,
+  getExpiredPropertyIds,
+  isLandlordEligibleForPublicListing,
+};

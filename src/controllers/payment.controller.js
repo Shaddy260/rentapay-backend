@@ -14,7 +14,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { activateLandlordAfterPayment } = require('./auth.controller');
 const { signToken } = require('../middleware/auth.middleware');
 const { blockIfSubscriptionExpired } = require('../utils/subscriptionGate');
-const { buildPaymentInstructions } = require('../utils/paymentInstructions');
+const { buildPaymentInstructions, buildUtilityPaymentInstructions } = require('../utils/paymentInstructions');
 
 // PERMANENT FIX (direct request: "landlord has to go through signup
 // TWICE before reaching the dashboard - this keeps coming back, fix
@@ -96,6 +96,7 @@ async function initiateRentSTKPush(req, res) {
         unit_id: tenant.unit_id,
         landlord_id: tenant.landlord_id,
         amount: validatedAmount,
+        mpesa_phone: tenant.primary_phone,
         payment_method: 'stk_push',
         mpesa_checkout_request_id: stkResponse.CheckoutRequestID,
         status: 'pending',
@@ -389,12 +390,30 @@ function extractMetadataValue(callbackMetadata, name) {
   return item ? item.Value : null;
 }
 
+function reconcileCallback(payment, callbackMetadata, expectedAmount, expectedPhone) {
+  const receivedAmount = extractMetadataValue(callbackMetadata, 'Amount');
+  const receivedPhone = extractMetadataValue(callbackMetadata, 'PhoneNumber');
+  if (receivedAmount != null && Math.abs(Number(receivedAmount) - Number(expectedAmount)) > 0.01) {
+    logger.error('[payment] Callback amount mismatch; refusing to mark payment paid', { paymentId: payment.id, expectedAmount, receivedAmount });
+    return false;
+  }
+  if (receivedPhone && expectedPhone && normalizePhone(receivedPhone) !== normalizePhone(expectedPhone)) {
+    logger.error('[payment] Callback phone mismatch; refusing to mark payment paid', { paymentId: payment.id });
+    return false;
+  }
+  return true;
+}
+
 async function processRentPaymentCallback(payment, resultCode, callbackMetadata) {
   if (resultCode !== 0) {
     await supabase.from('payments').update({ status: 'failed' }).eq('id', payment.id);
     return;
   }
 
+  if (!reconcileCallback(payment, callbackMetadata, payment.amount, payment.mpesa_phone || payment.tenants?.primary_phone)) {
+    await supabase.from('payments').update({ status: 'failed' }).eq('id', payment.id);
+    return;
+  }
   const mpesaReceiptNumber = extractMetadataValue(callbackMetadata, 'MpesaReceiptNumber');
   const transactionDate = extractMetadataValue(callbackMetadata, 'TransactionDate');
   const phoneNumber = extractMetadataValue(callbackMetadata, 'PhoneNumber') || payment.mpesa_phone || payment.tenants?.primary_phone;
@@ -544,6 +563,10 @@ async function processSubscriptionPaymentCallback(subPayment, resultCode, callba
     return;
   }
 
+  if (!reconcileCallback(subPayment, callbackMetadata, subPayment.amount, subPayment.mpesa_phone || subPayment.landlords?.phone)) {
+    await supabase.from('subscription_payments').update({ status: 'failed' }).eq('id', subPayment.id);
+    return;
+  }
   const mpesaReceiptNumber = extractMetadataValue(callbackMetadata, 'MpesaReceiptNumber');
   const phoneNumber = extractMetadataValue(callbackMetadata, 'PhoneNumber');
   const paidAtIso = new Date().toISOString();
@@ -738,10 +761,11 @@ async function submitPaybillTransaction(req, res) {
     // rather than rent, confirm the invoice is really this tenant's
     // and still owed before anything is created against it.
     let targetType = 'rent';
+    let targetInvoiceMeterId = null;
     if (targetInvoiceId) {
       const { data: invoice, error: invErr } = await supabase
         .from('utility_invoices')
-        .select('id, tenant_id, status')
+        .select('id, tenant_id, status, meter_id')
         .eq('id', targetInvoiceId)
         .maybeSingle();
       if (invErr) throw invErr;
@@ -752,6 +776,7 @@ async function submitPaybillTransaction(req, res) {
         return res.status(409).json({ error: 'This bill has already been marked paid.' });
       }
       targetType = 'utility';
+      targetInvoiceMeterId = invoice.meter_id || null;
     }
 
     // Normalize the same way the landlord will see it, so a duplicate
@@ -796,7 +821,7 @@ async function submitPaybillTransaction(req, res) {
     // pendingPaymentConfirmation.controller.js).
     let paymentInstructionsSnapshot = null;
     try {
-      const [{ data: snapshotLandlord }, { data: snapshotUnit }] = await Promise.all([
+      const [{ data: snapshotLandlord }, { data: snapshotUnit }, { data: snapshotMeter }] = await Promise.all([
         supabase
           .from('landlords')
           .select('full_name, payment_method, paybill_number, paybill_account_number, till_number, stk_phone_number, payment_description')
@@ -807,8 +832,21 @@ async function submitPaybillTransaction(req, res) {
           .select('unit_name, unit_number, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description, properties(payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description)')
           .eq('id', tenant.unit_id)
           .maybeSingle(),
+        // Utility payments (water/electricity) may have their own
+        // dedicated payment method set on the meter itself - see
+        // buildUtilityPaymentInstructions. Rent payments have no
+        // meter, so this is skipped (targetInvoiceMeterId is null).
+        targetInvoiceMeterId
+          ? supabase
+              .from('utility_meters')
+              .select('id, payment_override_enabled, payment_override_method, payment_override_paybill_number, payment_override_paybill_account_number, payment_override_till_number, payment_override_stk_phone_number, payment_override_description')
+              .eq('id', targetInvoiceMeterId)
+              .maybeSingle()
+          : Promise.resolve({ data: null }),
       ]);
-      paymentInstructionsSnapshot = buildPaymentInstructions(snapshotLandlord, snapshotUnit, snapshotUnit?.properties);
+      paymentInstructionsSnapshot = targetType === 'utility'
+        ? buildUtilityPaymentInstructions(snapshotMeter, snapshotLandlord, snapshotUnit, snapshotUnit?.properties)
+        : buildPaymentInstructions(snapshotLandlord, snapshotUnit, snapshotUnit?.properties);
     } catch (snapshotErr) {
       // Non-fatal: worst case this record falls back to the live
       // computation, same behavior as before this fix existed.
@@ -910,14 +948,41 @@ async function submitPaybillTransaction(req, res) {
 // nothing changed. This returns the tenant's own most recent
 // submission with its real status, so the portal can show a proper
 // rejection banner (with reason + resubmit) the moment it happens.
+//
+// FIX ("submitting a utility payment just silently disappears - it
+// should behave like rent, showing a pending confirmation state"):
+// this used to always return the tenant's single most-recent
+// submission across BOTH rent and every utility bill combined, and
+// only the rent card ever called it - so a water/electricity
+// submission had nowhere to show its pending/rejected status at all,
+// and (worse) a water submission made after a pending rent one would
+// have silently overwritten what the rent card displayed too, since
+// both looked at the same unscoped "most recent" row.
+//
+// Now scoped: pass ?targetInvoiceId=<utility_invoices.id> to get that
+// SPECIFIC utility bill's latest submission (so each utility card can
+// show its own independent pending/rejected banner, same UX as rent).
+// With no params, defaults to the tenant's latest RENT submission
+// only (target_type='rent'), preserving exactly what the rent card
+// already relied on.
 // ---------------------------------------------------------------------
 async function getMyLatestPaybillConfirmation(req, res) {
   try {
     const tenantId = req.user.id;
-    const { data, error } = await supabase
+    const { targetInvoiceId } = req.query;
+
+    let query = supabase
       .from('pending_payment_confirmations')
       .select('*')
-      .eq('tenant_id', tenantId)
+      .eq('tenant_id', tenantId);
+
+    if (targetInvoiceId) {
+      query = query.eq('target_invoice_id', targetInvoiceId);
+    } else {
+      query = query.eq('target_type', 'rent');
+    }
+
+    const { data, error } = await query
       .order('submitted_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -1441,4 +1506,6 @@ module.exports = {
   deletePayment,
   downloadReceiptPdf,
   downloadAllReceiptsZip,
+  processRentPaymentCallback,
+  processSubscriptionPaymentCallback,
 };

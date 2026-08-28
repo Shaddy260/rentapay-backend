@@ -25,6 +25,7 @@ const {
   removeVacancyAlertSubscription,
 } = require('../services/vacancyAlertPush.service');
 const { captureException } = require('../services/sentry.service');
+const { isLandlordEligibleForPublicListing } = require('../utils/subscriptionGate');
 const logger = require('../utils/logger');
 
 function toWhatsAppLink(number, unitName) {
@@ -66,10 +67,14 @@ async function listVacantUnits(req, res) {
     if (error) throw error;
 
     let units = data || [];
-    // BUG FIX: a suspended/inactive landlord's vacant units must not stay
-    // discoverable on the public listings page - filtered server-side
-    // (never trust the frontend) same as the other hard-locks above.
-    units = units.filter((u) => u.landlords?.subscription_status !== 'suspended');
+    // DIRECT REQUEST: a landlord's vacant units must only stay
+    // discoverable on the public listings page while the landlord is
+    // "active" - subscribed and not expired (including the 4-day
+    // grace window) - and disappear the moment that stops being true
+    // (suspended by admin, never activated, or fully expired past
+    // grace). Filtered server-side (never trust the frontend), same
+    // as the other hard-locks on this endpoint.
+    units = units.filter((u) => isLandlordEligibleForPublicListing(u.landlords?.subscription_status));
     units = units.map(({ landlords, ...u }) => u); // internal-only field, not part of the public response shape
     // county/constituency/location live on `properties`, not `units`
     // directly (units with no property_id are ungrouped and have no
@@ -219,9 +224,10 @@ async function getUnitContact(req, res) {
     // Same opt-out respected here as in listVacantUnits/listSearchableAreas
     // above - someone guessing/bookmarking a unitId directly shouldn't be
     // able to reach the contact link for a unit its owner took private.
-    // Also blocks a suspended landlord's unit, same as listVacantUnits -
-    // a direct/bookmarked link shouldn't outlive the public listing itself.
-    if (!unit || unit.status !== 'vacant' || !unit.is_publicly_listed || unit.landlords?.subscription_status === 'suspended') {
+    // Also blocks a unit whose landlord isn't currently public-listing-
+    // eligible, same as listVacantUnits - a direct/bookmarked link
+    // shouldn't outlive the public listing itself.
+    if (!unit || unit.status !== 'vacant' || !unit.is_publicly_listed || !isLandlordEligibleForPublicListing(unit.landlords?.subscription_status)) {
       return res.status(404).json({ error: 'This unit is no longer available.' });
     }
 
@@ -453,7 +459,7 @@ async function getToastVacancy(req, res) {
     const { data, error } = await query;
     if (error) throw error;
 
-    let units = (data || []).filter((u) => u.landlords?.subscription_status !== 'suspended');
+    let units = (data || []).filter((u) => isLandlordEligibleForPublicListing(u.landlords?.subscription_status));
     const matched = county ? units.filter((u) => u.properties?.county?.toLowerCase() === county.toLowerCase()) : [];
     // No match in-county (or no county known yet) - fall back to any
     // recent vacancy so the toast still has something real to show

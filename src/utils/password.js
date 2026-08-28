@@ -1,9 +1,10 @@
 // src/utils/password.js
 //
-// Password rules (relaxed per request):
-//   - Min 6 characters
-//   - Letters and/or digits, user's choice - no forced uppercase,
-//     number, or special character requirement
+// Shared password policy: all account creation and password-change paths
+// use this validator. A password must be at least 6 characters long.
+// No character-class requirements (numbers-only and letters-only
+// passwords are both accepted) - direct request to relax the earlier
+// 10-char/mixed-class policy.
 
 const bcrypt = require('bcrypt');
 
